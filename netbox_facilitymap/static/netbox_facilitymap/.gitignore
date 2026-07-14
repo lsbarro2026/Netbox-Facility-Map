@@ -1,0 +1,6 @@
+# This directory holds ONLY the framework-free frontend (JS/CSS/fonts) — it is packaged
+# and read-only at runtime. Facility data (uploaded PDFs, rendered images, manifest.json,
+# import-map.json) is NOT stored here: it is written at runtime under
+# <MEDIA_ROOT>/netbox_facilitymap/ and served through authenticated endpoints (see
+# storage.py / imports.py). Nothing facility-specific should ever land in this folder.
+*.bak

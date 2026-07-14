@@ -1,0 +1,106 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netbox-facilitymap"
+# Version is the single `__version__` in netbox_facilitymap/__init__.py — see [tool.setuptools.dynamic]
+# below. A release bumps that one line; setuptools reads it here at build time.
+dynamic = ["version"]
+description = "Facility map plugin for NetBox — siteplan → building → floor → room, linked to Locations"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Liam Sbarro", email = "ljs.social2005@gmail.com" }]
+classifiers = [
+    "Framework :: Django",
+    "Environment :: Plugins",
+    "Environment :: Web Environment",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: System Administrators",
+    "Topic :: System :: Networking",
+]
+# PDF import runs in-plugin: PDFs are rasterized to floor images by `preprocess.py`.
+# pypdfium2 embeds Google's PDFium (the renderer Chrome uses) as a self-contained wheel
+# — no system Ghostscript/poppler. It is invoked as a *subprocess* (see imports.py), so
+# this native code never loads into a long-lived NetBox worker; these are still declared
+# runtime deps because the subprocess shares the NetBox virtualenv. The floors track the
+# APIs this code uses: pypdfium2 4.0 introduced the `render().to_pil()` v4 API used in
+# preprocess.py (4.x/5.x both satisfy it); Pillow 10 is a safe modern baseline.
+#
+# The BASE install is lean — pypdfium2 + Pillow only (coding-standard #3). That enables the
+# common siteplan formats: PDF plus the Pillow rasters (PNG/JPEG/GIF/TIFF/BMP/WebP). Every
+# advanced format is opt-in via a category extra below, gated at runtime by the `drawing_formats`
+# registry (PKG-1): an uninstalled format isn't offered, and uploading one names the extra to add.
+dependencies = [
+    "pypdfium2>=4.0.0",
+    "Pillow>=10.0.0",
+]
+
+# Optional format packages. Install the ones you need (`pip install netbox-facilitymap[svg,gis]`),
+# or `[all]` for everything. Each decoder is pure-Python / self-contained and lazy-imported only in
+# the render subprocess; absent, its format simply isn't offered (upload names the extra to add).
+#   `svg` — SVG vector floor plans (`.svg`), rasterized by cairosvg. cairosvg dlopen's the system
+#           `libcairo` at import time (e.g. `apt install libcairo2`); `pip install` still succeeds
+#           without it and SVG then degrades gracefully at render time.
+#   `cad` — AutoCAD DXF 2D CAD drawings (`.dxf`) as a base raster. ezdxf (pure-Python, no Matplotlib)
+#           renders the modelspace to an SVG which cairosvg rasterizes, so `[cad]` bundles BOTH ezdxf
+#           and cairosvg and also needs the same system `libcairo`.
+#   `gis` — GIS overlays: Shapefile (`.shp` + siblings) via pyshp (pure-Python, no GDAL/native deps),
+#           and GeoJSON (`.geojson`, stdlib parser — no decoder, but shipped in this package as a
+#           geospatial input). Both light up together when `[gis]` is installed.
+#   `all` — every optional decoder above, for a single "give me everything" install.
+# Visio (`.vsdx/.vsd`) is NOT a pip extra: it needs the external LibreOffice `soffice` binary on
+# PATH (e.g. `apt install libreoffice`), gated the same way at runtime.
+# `dev` is the test runner: `pip install -e '.[dev]'` into the NetBox venv; the tests hook NetBox's
+# Django settings via pytest-django (see the [tool.pytest.ini_options] block and README
+# "Running the tests"). Not needed at runtime.
+[project.optional-dependencies]
+svg = [
+    "cairosvg>=2.5.0",
+]
+cad = [
+    "ezdxf>=1.1",
+    "cairosvg>=2.5.0",
+]
+gis = [
+    "pyshp>=2.3",
+]
+all = [
+    "cairosvg>=2.5.0",
+    "ezdxf>=1.1",
+    "pyshp>=2.3",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-django>=4.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/lsbarro2026/Netbox-Facility-Map"
+Source = "https://github.com/lsbarro2026/Netbox-Facility-Map"
+Issues = "https://github.com/lsbarro2026/Netbox-Facility-Map/issues"
+
+# Resolves the `dynamic = ["version"]` declared above. setuptools reads the literal via AST
+# (no import of the module, whose `from netbox.plugins import …` isn't available at build time).
+[tool.setuptools.dynamic]
+version = { attr = "netbox_facilitymap.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["netbox_facilitymap*"]
+
+[tool.setuptools.package-data]
+netbox_facilitymap = ["templates/**/*", "static/**/*"]
+
+# `tests/` is a sibling of the package (not under netbox_facilitymap*), so the packages-find
+# above already excludes it from the wheel. `DJANGO_SETTINGS_MODULE` names NetBox's settings;
+# the machine-specific PYTHONPATH pointing at the NetBox source tree is passed on the CLI, not
+# committed here (see README "Running the tests").
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "netbox.settings"
+testpaths = ["tests"]
+python_files = ["test_*.py"]

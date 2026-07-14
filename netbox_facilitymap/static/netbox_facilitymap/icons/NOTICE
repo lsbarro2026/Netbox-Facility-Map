@@ -1,0 +1,34 @@
+Vendored UI icons — Lucide (https://lucide.dev, https://github.com/lucide-icons/lucide)
+
+These SVGs are copied unmodified from the Lucide icon set and bundled here so the
+plugin ships fully offline (no CDN, no npm/build step — see CLAUDE.md coding
+standard #3). Lucide is ISC-licensed; some glyphs derive from Feather (MIT). The
+full upstream license text is vendored alongside as ./LICENSE.
+
+The frontend does NOT load these files at runtime. Their path bodies are inlined
+verbatim into the `Icons` static class (static/netbox_facilitymap/lib.js), which
+returns each glyph as an SVG string on Lucide's native 24×24 viewBox. These files
+are the auditable source of truth for those inlined paths — regenerate the getter
+after replacing an icon here. Keep this map in sync with `Icons`:
+
+  Icons getter   Lucide source file
+  ------------   ------------------
+  edit           pencil.svg
+  draw           pen-tool.svg
+  rect           square.svg
+  undo           undo-2.svg
+  snap           magnet.svg
+  grid           grid-3x3.svg
+  move           move.svg
+  arrange        layout-grid.svg
+  dup            copy.svg
+  check          check.svg
+  rack           server.svg          (closest fit for a rack)
+  settings       settings.svg
+  rightangle     triangle-right.svg  (right-angled triangle → 90° snap toggle)
+  arrow          arrow-up-right.svg
+  layers         layers.svg
+  link           link.svg
+  download       download.svg
+  print          printer.svg
+  info           info.svg

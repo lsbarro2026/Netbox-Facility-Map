@@ -1,0 +1,86 @@
+{% load static %}{% comment %}
+  Facility-map room overlay injected on a floor's Location page (Phase 4).
+  Self-contained: presentation is inline so it needs none of the plugin stylesheet,
+  which isn't loaded on dcim pages.
+{% endcomment %}
+<div class="card">
+  {% comment %}
+    Title links into the facility map tool, deep-linked to this floor. Inline-styled (no
+    plugin stylesheet on dcim pages); plain text when no map URL resolved. On the cropped
+    single-room embed, the header carries an image-export control on the right — Bootstrap
+    utility/button classes are safe here (this is native NetBox card chrome; only the SVG body
+    below lacks plugin CSS). The buttons are wired by `embed-export.js` (loaded at the end).
+  {% endcomment %}
+  <h5 class="card-header d-flex justify-content-between align-items-center">
+    <span>{% if map_url %}<a href="{{ map_url }}" target="_blank" style="color:inherit;text-decoration:none" title="Open in facility map">{{ panel_title }}</a>{% else %}{{ panel_title }}{% endif %}</span>
+    {% if export_enabled %}<span class="btn-group btn-group-sm" role="group" aria-label="Export map image" data-fm-export data-fm-name="{{ export_name }}">
+      <button type="button" class="btn btn-outline-secondary" data-fm-fmt="png" title="Download this map view as a PNG image">PNG</button>
+      <button type="button" class="btn btn-outline-secondary" data-fm-fmt="svg" title="Download this map view as an SVG image">SVG</button>
+    </span>{% endif %}
+  </h5>
+  <div class="card-body">
+    {% comment %}
+      `viewbox` (set for a single bound room) crops to that room; otherwise show the whole floor.
+      On the cropped room embed, `embed_aspect`/`embed_size` (operator settings) wrap the SVG in a
+      box: `embed_size` caps its width (% of the column, the "footprint" knob) and `embed_aspect`
+      fixes the box aspect (the orientation knob). The crop's viewBox is reshaped to the same
+      aspect server-side, so `meet` fills the box with real floor (no letterbox). Both are unset on
+      the whole-floor view, which keeps the plain `width:100%;height:auto` markup. Inline only —
+      no plugin stylesheet on dcim pages.
+    {% endcomment %}
+    {% if embed_aspect %}<div style="max-width:{{ embed_size }}%;margin-inline:auto;aspect-ratio:{{ embed_aspect|floatformat:4 }}">{% endif %}
+    <svg viewBox="{% if viewbox %}{{ viewbox }}{% else %}0 0 {{ vw }} {{ vh }}{% endif %}"
+         preserveAspectRatio="xMidYMid meet"
+         style="{% if embed_aspect %}display:block;width:100%;height:100%{% else %}width:100%;height:auto{% endif %};border:1px solid #ccc;background:#f4f5f7">
+      {% include 'netbox_facilitymap/inc/floor_sheets.html' %}
+      {% comment %}
+        Spotlight: on the cropped single-room embed, dim the floor outside the room's own
+        polygon so it's unambiguous which room you're on (the zoomed crop shows neighbouring
+        rooms in the raster image). A full-canvas dark rect, masked to a hole the shape of the
+        room. Only `spotlight` (the scaled room points) is set when cropping; the whole-floor
+        view never dims. Drawn over the sheets but under the green highlight + markers.
+      {% endcomment %}
+      {% if spotlight %}
+        <defs>
+          <mask id="room-spotlight">
+            <rect x="0" y="0" width="{{ vw }}" height="{{ vh }}" fill="#fff"/>
+            <polygon points="{{ spotlight }}" fill="#000"/>
+          </mask>
+        </defs>
+        <rect x="0" y="0" width="{{ vw }}" height="{{ vh }}"
+              fill="#000" opacity="0.45" mask="url(#room-spotlight)"/>
+      {% endif %}
+      {% for s in shapes %}
+        {% if s.url %}<a href="{{ s.url }}" target="_blank">{% endif %}
+        <polygon points="{{ s.points }}"
+                 fill="#2fa84f22" stroke="#2fa84f"
+                 stroke-width="2" vector-effect="non-scaling-stroke">
+          <title>{{ s.label }}</title>
+        </polygon>
+        {% if s.url %}</a>{% endif %}
+      {% endfor %}
+      {% include 'netbox_facilitymap/inc/placement_markers.html' %}
+      {% comment %}
+        Wayfinding route arrows that *end* in this room (set only on the cropped per-room
+        embed). Mirrors the editor's arrow: a coloured polyline (non-scaling stroke so width
+        survives the zoom crop) plus a filled arrowhead at the destination. Inline-styled from
+        the arrow's own colour — the plugin's `.arrow`/`.arrow-head` CSS isn't loaded here.
+        Most routes start outside the crop and are clipped by the viewBox; the visible tail +
+        head still read cleanly. Drawn last so arrows sit above the sheets/spotlight/rooms.
+      {% endcomment %}
+      {% for a in arrows %}
+        <polyline points="{{ a.line }}" fill="none" stroke="{{ a.color }}"
+                  stroke-width="3" stroke-linecap="round" stroke-linejoin="round"
+                  vector-effect="non-scaling-stroke"/>
+        <polygon points="{{ a.head }}" style="fill:{{ a.color }};stroke:none"/>
+      {% endfor %}
+    </svg>
+    {% if embed_aspect %}</div>{% endif %}
+  </div>
+</div>
+{% comment %}
+  Export wiring for the header's PNG/SVG buttons. This is the ONLY plugin JS on a stock dcim
+  page (self-contained, no SPA globals), loaded only on the cropped single-room embed where the
+  export control exists.
+{% endcomment %}
+{% if export_enabled %}<script src="{% static 'netbox_facilitymap/embed-export.js' %}"></script>{% endif %}

@@ -1,0 +1,32 @@
+Bundled web fonts — licensing & provenance
+===========================================
+
+These font files are bundled locally so the annotation tool needs no network
+access (no Google Fonts CDN). Both families are licensed under the SIL Open Font
+License, Version 1.1, which permits bundling and redistribution.
+
+Public Sans
+  public-sans.woff2          (variable, normal, weight axis 100–900)
+  public-sans-italic.woff2   (variable, italic, weight axis 100–900)
+  © Copyright USWDS / U.S. General Services Administration.
+  Project: https://github.com/uswds/public-sans
+  License: SIL OFL 1.1 — https://github.com/uswds/public-sans/blob/develop/LICENSE.md
+
+IBM Plex Mono
+  ibm-plex-mono-400.woff2 / -500.woff2 / -600.woff2  (static)
+  © Copyright IBM Corp.
+  Project: https://github.com/IBM/plex
+  License: SIL OFL 1.1 — https://github.com/IBM/plex/blob/master/LICENSE.txt
+
+The latin subset (U+0000–00FF + common punctuation) of each face was retrieved
+from the Google Fonts woff2 endpoint (fonts.gstatic.com). The full OFL text and
+copyright notices are available at the project links above.
+
+SIL OPEN FONT LICENSE Version 1.1 — summary of terms
+  - The fonts may be used, studied, modified and redistributed freely as long as
+    they are not sold by themselves.
+  - The fonts, including any derivative works, can be bundled, embedded,
+    redistributed and/or sold with any software provided that any reserved names
+    are not used by derivative works.
+  - The fonts and derivatives cannot be released under any other type of license.
+  Full text: https://openfontlicense.org/

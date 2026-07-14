@@ -1,0 +1,9 @@
+{% comment %}
+  Tiled floor-plan sheet images (one <image> per grid cell), shared by floor_rooms.html.
+  Expects `sheets` (from previews.floor_sheets): each has a pre-computed authenticated `url`
+  plus `x`/`y`/`w`/`h` in combined-canvas px. Renders the whole multi-sheet plan; a
+  single-sheet floor is just one image at the origin.
+{% endcomment %}
+{% for s in sheets %}
+  {% if s.url %}<image href="{{ s.url }}" x="{{ s.x }}" y="{{ s.y }}" width="{{ s.w }}" height="{{ s.h }}"/>{% endif %}
+{% endfor %}

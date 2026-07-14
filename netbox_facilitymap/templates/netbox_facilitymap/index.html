@@ -1,0 +1,121 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Facility Map</title>
+<link rel="preload" href="{% static 'netbox_facilitymap/fonts/public-sans.woff2' %}" as="font" type="font/woff2" crossorigin/>
+<link rel="preload" href="{% static 'netbox_facilitymap/fonts/ibm-plex-mono-400.woff2' %}" as="font" type="font/woff2" crossorigin/>
+<link rel="stylesheet" href="{% static 'netbox_facilitymap/style.css' %}"/>
+{% if embed %}{% comment %}
+   Embedded in a dashboard-widget iframe: a chrome-free map that fills the card.
+   Hide the chrome and let the stage fill. Pan/zoom is JS-gated (window.MAP.interactive) — not
+   CSS, since the .catcher sets inline pointer-events:all — and the legend is hidden unless the
+   widget opts in.
+{% endcomment %}<style>#topbar,#panel,#toast{display:none!important}#stage{position:absolute;inset:0}{% if not legend %}.legend{display:none!important}{% endif %}</style>{% endif %}
+</head>
+<body>
+
+<!-- Mount-aware config: the frontend resolves /api/* and asset paths against these.
+     api    -> /plugins/facilitymap/api/   (Django reverses the plugin page mount)
+     media  -> /plugins/facilitymap/api/media/  (authenticated floor images / thumbnails)
+     static -> /static/netbox_facilitymap/  (framework-free JS/CSS/fonts)
+     csrf   -> session token threaded into Api.post so saves don't 403.
+     version-> plugin version; App.ensureScripts stamps it as ?v= on the lazily-loaded editor/
+               import bundles so a browser can't run a stale one against fresh core scripts.
+     embed  -> true in the dashboard-widget iframe (?embed=1): chrome-free; a building click
+               opens the full map in the top window (no in-card breadcrumbs to return through).
+     interactive -> embed pan/zoom opt-in (?interactive=1); false ⇒ App skips interaction wiring.
+     canImport -> holds import_facilitymapblob: may run the import wizard (else it's not offered).
+     canReset -> superuser: may reset/wipe the import (else the "Start over" control is hidden).
+     drawingExts -> accepted import file extensions, from the server's drawing_formats registry
+                    (so the import wizard doesn't hand-maintain its own copy).
+     companionExts -> a drawing's sibling files (a shapefile's .shx/.dbf/.prj/.cpg) — uploaded
+                    with the drawing but not themselves drawings.
+     capabilities -> the enabled optional capabilities (keys), from the server's capability
+                    registry (the add-on framework); App.hasCapability(key) gates a capability's
+                    tool on its presence, the same detect-and-enable model as drawingExts.
+     floorLabelField -> the NetBox Location field ('name'/'slug'/'description') the import
+                    wizard defaults its floor-label picker to, from the `floor_label_field`
+                    PLUGINS_CONFIG setting; the wizard lets the user override it per import.
+     defaultFacility -> the operator-pinned facility slug the SPA boots into when the URL hash
+                    names none ('' = the default facility); App.init resolves it, the in-app
+                    Settings page pins it (facilities.default_facility, SET-2). -->
+<script>
+  window.MAP = {
+    api:    "{% url 'plugins:netbox_facilitymap:map' %}api/",
+    media:  "{% url 'plugins:netbox_facilitymap:map' %}api/media/",
+    static: "{% static 'netbox_facilitymap/' %}",
+    version: "{{ version }}",
+    csrf:   "{{ csrf_token }}",
+    embed:  {% if embed %}true{% else %}false{% endif %},
+    interactive: {% if interactive %}true{% else %}false{% endif %},
+    canImport: {% if can_import %}true{% else %}false{% endif %},   {# holds import_facilitymapblob — may run the import wizard #}
+    canReset: {% if can_reset %}true{% else %}false{% endif %},     {# superuser — may reset (wipe) the import #}
+    canCreateLocation: {% if can_create_location %}true{% else %}false{% endif %},   {# holds dcim.add_location — may create a Location inline (LOC-1); the install-wide gate is the 'location-create' capability #}
+    drawingExts: {{ drawing_exts|safe }},   {# accepted import extensions, from the server's drawing_formats registry #}
+    companionExts: {{ companion_exts|safe }},   {# sibling files (shapefile set) accepted with a drawing #}
+    capabilities: {{ capabilities|safe }},   {# enabled optional capabilities (keys), from the server's capability registry #}
+    floorLabelField: "{{ floor_label_field }}",   {# default Location field for a floor's label #}
+    defaultFacility: "{{ default_facility }}"   {# pinned boot facility ('' = default facility), SET-2 #}
+  };
+</script>
+
+<header id="topbar">
+  <a id="home-link" href="{% url 'home' %}" title="Back to NetBox">&larr; NetBox</a>
+  <nav id="crumbs"></nav>
+  <!-- The flexible zone between the breadcrumb and the settings gear. It is an inline-size
+       container-query context, so the toolbar's tool labels reveal/collapse on the room actually
+       left in the bar (shrinks as the breadcrumb grows or the window narrows), not viewport width. -->
+  <div id="toolbar-region">
+    <div id="toolbar"></div>
+  </div>
+  <!-- Facility picker (multi-facility installs): App populates it from /api/netbox/facilities and
+       switches the active facility on change. Empty on single-facility installs. -->
+  <div id="facility-picker"></div>
+  <button id="settings-gear" title="Settings"></button>
+</header>
+
+{% if has_orphaned_data and can_import and not embed %}
+{# Read-only pointer (HEALTH-1): the install holds map data parked under a facility no Site resolves
+   to — usually a facility-grouping change that re-scoped the Sites. Without this the map just reads
+   as empty. The reassignment itself is the IMPORT_PERM-gated Settings action this links to. #}
+<div id="orphan-banner" style="padding:.6rem 1rem;background:#fff3cd;color:#664d03;border-bottom:1px solid #ffe69c;font-size:.9rem">
+  Some map data isn&rsquo;t assigned to a facility and won&rsquo;t show until you reassign it. This
+  usually follows a facility-grouping change.
+  <a href="{% url 'plugins:netbox_facilitymap:settings' %}">Reassign it in Settings</a>.
+</div>
+{% endif %}
+
+<main id="stage">
+  <!-- Siteplan / building / floor views render here -->
+</main>
+
+<aside id="panel" class="hidden">
+  <div id="panel-head">
+    <span id="panel-title">Rooms</span>
+    <button id="panel-close" title="Close">&times;</button>
+  </div>
+  <div id="panel-body"></div>
+</aside>
+
+<div id="toast"></div>
+
+<!-- Loaded in dependency order; all classes are globals (no build step). The siteplan
+     first-paint classes ship eagerly (settings-page.js rides along — it's tiny and the
+     #/settings route is directly deep-linkable); the floor editor (device-shapes.js,
+     floor-editor.js) and the import flows (import-preview.js, import-uploader.js, import-flow.js,
+     fresh-import-flow.js, edit-import-flow.js) are fetched on first navigation by
+     App.ensureScripts. -->
+<script src="{% static 'netbox_facilitymap/lib.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/netbox.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/store.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/grid.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/panzoom.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/undo-stack.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/editor.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/siteplan-editor.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/settings-page.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/app.js' %}"></script>
+</body>
+</html>

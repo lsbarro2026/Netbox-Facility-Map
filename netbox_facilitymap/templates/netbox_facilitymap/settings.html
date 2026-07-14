@@ -1,0 +1,206 @@
+{% extends 'base/layout.html' %}
+{% comment %}
+  Facility Map plugin settings (NetBox → Plugins → Facility Map → Settings).
+  A standard chrome'd NetBox page (unlike the full-bleed map at index.html). The form
+  POSTs back to this same view, which validates/clamps and upserts the `settings` blob.
+  Writes are gated on `import_facilitymapblob` by the view + the nav entry (PERM-1).
+  This page owns only the NetBox-interaction settings (the room-embed controls; facility
+  grouping is set from the map's facility picker). The map's own in-app #/settings page owns
+  everything else, e.g. the floor label field (SET-1).
+{% endcomment %}
+
+{% block title %}Facility Map: Settings{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-8 col-lg-6">
+    <form action="" method="post">
+      {% csrf_token %}
+      <div class="card">
+        <h2 class="card-header">Settings</h2>
+        <div class="card-body">
+
+          <div class="mb-3">
+            <label for="id_room_embed_zoom" class="form-label">Room embed zoom</label>
+            <input type="number" name="room_embed_zoom" id="id_room_embed_zoom"
+                   class="form-control" style="max-width:10rem"
+                   value="{{ room_embed_zoom }}"
+                   min="{{ zoom_min }}" max="{{ zoom_max }}" step="0.1" required>
+            <div class="form-text">
+              How far the per-room map embed (shown on a room's Location page) zooms in.
+              <strong>{{ zoom_min }}</strong> = a tight crop to the room itself;
+              higher values pull more of the surrounding floor into view.
+              Range {{ zoom_min }}–{{ zoom_max }}; default {{ zoom_default }}.
+              Only affects the cropped room embed, not whole-floor views.
+            </div>
+          </div>
+
+          <div class="mb-3">
+            <label for="id_room_embed_size" class="form-label">Room embed size</label>
+            <input type="number" name="room_embed_size" id="id_room_embed_size"
+                   class="form-control" style="max-width:10rem"
+                   value="{{ room_embed_size }}"
+                   min="{{ size_min }}" max="{{ size_max }}" step="5" required>
+            <div class="form-text">
+              How much page width the per-room embed takes up, as a percent of its column. This
+              sets the widget's <em>footprint</em>, independent of zoom (magnification is unchanged).
+              Range {{ size_min }}–{{ size_max }}%; default {{ size_default }}%.
+              Only affects the cropped room embed, not whole-floor views.
+            </div>
+          </div>
+
+          <div class="mb-3">
+            <label for="id_room_embed_orientation" class="form-label">Room embed orientation</label>
+            <select name="room_embed_orientation" id="id_room_embed_orientation"
+                    class="form-control" style="max-width:10rem">
+              {% for value, label in orientations %}
+                <option value="{{ value }}"{% if value == room_embed_orientation %} selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+            <div class="form-text">
+              The shape of the per-room embed box. <strong>Vertical</strong> is a taller box;
+              <strong>landscape</strong> is a short, wide box. Either way the crop is reshaped to
+              fill the box with surrounding floor, keeping the room centred and fully visible.
+              Default {{ orientation_default }}. Only affects the cropped room embed.
+            </div>
+          </div>
+
+        </div>
+        <div class="card-footer text-end">
+          <button type="submit" class="btn btn-primary">Save</button>
+        </div>
+      </div>
+    </form>
+
+    {% comment %}
+      Unassigned map data (HEALTH-1). Changing the facility grouping — or giving a Site a
+      SiteGroup/Region — re-scopes which facility each Site resolves to, but nothing re-keys existing
+      rows, so their editor blobs strand under the old facility key and the map reads as empty though
+      the data is intact. Unlike the read-only consistency report below, this is recoverable in-app:
+      each row reassigns to a live facility (re-keys the blobs + moves the rendered floor images).
+      Each row is its own POST form (`action=reassign`) so it can't nest in the settings form above.
+    {% endcomment %}
+    {% if health.orphaned_facilities %}
+    <div class="card">
+      <h2 class="card-header text-warning">Unassigned map data ({{ health.orphaned_facilities|length }})</h2>
+      <div class="card-body">
+        <p class="text-muted">
+          This map data is stored under a facility that no current Site resolves to, usually after a
+          facility grouping change. It won&rsquo;t appear on the map until you reassign it. Reassigning
+          re-keys the data <strong>and moves its rendered floor images</strong> to the facility you
+          choose; room polygons follow automatically. The data is intact and nothing was deleted.
+        </p>
+        {% for row in health.orphaned_facilities %}
+          <form action="" method="post" class="d-flex flex-wrap align-items-center gap-2 mb-2">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="reassign">
+            <input type="hidden" name="old" value="{{ row.facility }}">
+            <span>
+              <code>{{ row.facility|default:"(default facility)" }}</code>
+              <span class="text-muted">({{ row.blob_kinds|join:", " }})</span>
+            </span>
+            <span>&rarr;</span>
+            <select name="new" class="form-select" style="max-width:16rem;width:auto">
+              {% for target in reassign_targets %}
+                <option value="{{ target.slug }}"{% if target.slug == row.suggested %} selected{% endif %}>
+                  {{ target.name }}{% if target.slug == row.suggested %} (suggested){% endif %}
+                </option>
+              {% endfor %}
+            </select>
+            <button type="submit" class="btn btn-warning btn-sm">Reassign</button>
+          </form>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    {% comment %}
+      Read-only consistency report (health.run_checks, scoped to the requesting user). Surfaces
+      broken slug/Location bindings an admin should fix by hand — the map binds geometry to
+      NetBox by slug, not FK, so a Site/Location rename silently orphans floors and rooms. No
+      action buttons: renames are legitimate and the fix is human judgement (a guided remap is a
+      later, separate feature). Same report as `manage.py facilitymap_check`.
+    {% endcomment %}
+    <div class="card">
+      <h2 class="card-header">Consistency check</h2>
+      <div class="card-body">
+        <p class="text-muted">
+          Read-only diagnostic for broken slug/Location bindings. Renaming a Site or floor Location
+          in NetBox moves its slug, but the map's floor keys don't follow, so floors and rooms are
+          silently orphaned. Fix these by hand in NetBox; nothing here changes your data.
+          The same report is available from the shell as
+          <code>manage.py facilitymap_check</code>.
+        </p>
+
+        {% if not health.has_drift %}
+          <p class="text-success mb-0"><i class="mdi mdi-check-circle"></i> No consistency issues found.</p>
+        {% else %}
+
+          {% if health.unresolved_floor_keys %}
+            <h5 class="text-warning">Unresolved floor keys ({{ health.unresolved_floor_keys|length }})</h5>
+            <p class="form-text mt-0">
+              A floor's <code>&lt;site&gt;/&lt;floor&gt;</code> key no longer matches a Site plus a
+              child Location, usually after a rename. Rooms on it won't render on any Location page.
+            </p>
+            <table class="table table-sm">
+              <thead><tr><th>Floor key</th><th>Rooms</th><th>In manifest</th><th>Reason</th></tr></thead>
+              <tbody>
+                {% for row in health.unresolved_floor_keys %}
+                  <tr>
+                    <td><code>{{ row.floor_key }}</code></td>
+                    <td>{{ row.room_count }}</td>
+                    <td>{{ row.in_manifest|yesno }}</td>
+                    <td>{{ row.reason }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          {% endif %}
+
+          {% if health.unbound_rooms %}
+            <h5 class="text-warning">Unbound rooms ({{ health.unbound_rooms|length }})</h5>
+            <p class="form-text mt-0">
+              Rooms with geometry but no Location binding. They were never bound, or their bound
+              Location was deleted. Re-bind them in the map editor.
+            </p>
+            <table class="table table-sm">
+              <thead><tr><th>Floor key</th><th>Room id</th><th>Label</th></tr></thead>
+              <tbody>
+                {% for row in health.unbound_rooms %}
+                  <tr>
+                    <td><code>{{ row.floor_key }}</code></td>
+                    <td><code>{{ row.room_id }}</code></td>
+                    <td>{{ row.label|default:"—" }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          {% endif %}
+
+          {% if health.stale_placements %}
+            <h5 class="text-warning">Stale placements ({{ health.stale_placements|length }})</h5>
+            <p class="form-text mt-0">
+              Map markers whose rack or device no longer exists in NetBox (dead links). Remove them
+              in the map editor's placement mode.
+            </p>
+            <table class="table table-sm">
+              <thead><tr><th>Floor key</th><th>Kind</th><th>Object id</th><th>Label</th></tr></thead>
+              <tbody>
+                {% for row in health.stale_placements %}
+                  <tr>
+                    <td><code>{{ row.floor_key }}</code></td>
+                    <td>{{ row.kind }}</td>
+                    <td>{{ row.object_id }}</td>
+                    <td>{{ row.label|default:"—" }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          {% endif %}
+
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

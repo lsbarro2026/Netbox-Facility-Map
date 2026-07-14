@@ -1,0 +1,36 @@
+{% comment %}
+  Facility-map floor picker injected on a Site's detail page.
+  Mirrors the SPA building view (App.renderBuilding): a grid of floor cards, one per
+  rendered floor of the building(s) whose `siteSlug` matches this Site's slug. Each card
+  links to that floor's NetBox Location page.
+  Self-contained: presentation is inline so it needs none of the plugin stylesheet, which
+  isn't loaded on dcim pages.
+{% endcomment %}
+<div class="card">
+  <h5 class="card-header">Facility Map: Floors</h5>
+  <div class="card-body">
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px">
+      {% for c in cards %}
+        {% if c.url %}<a href="{{ c.url }}" style="text-decoration:none;color:inherit">{% endif %}
+        <div style="border:1px solid #ccc;border-radius:6px;overflow:hidden;background:#f4f5f7;height:100%">
+          {% if c.image %}
+            <img src="{{ c.image }}" loading="lazy"
+                 style="display:block;width:100%;height:140px;object-fit:contain;background:#fff">
+          {% endif %}
+          <div style="padding:6px 8px">
+            <div style="font-weight:600;margin-bottom:4px">{{ c.label }}</div>
+            <span style="display:inline-block;padding:1px 6px;border-radius:8px;font-size:11px;
+                         {% if c.rooms %}background:#2fa84f22;color:#1f7a37{% else %}background:#e0e0e0;color:#666{% endif %}">
+              {% if c.rooms %}{{ c.rooms }} room{{ c.rooms|pluralize }}{% else %}unmapped{% endif %}
+            </span>
+            {% if c.sheets > 1 %}
+              <span style="display:inline-block;padding:1px 6px;border-radius:8px;font-size:11px;
+                           background:#e6effa;color:#2c5f9e">{{ c.sheets }} sheets</span>
+            {% endif %}
+          </div>
+        </div>
+        {% if c.url %}</a>{% endif %}
+      {% endfor %}
+    </div>
+  </div>
+</div>

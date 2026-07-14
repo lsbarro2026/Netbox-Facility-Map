@@ -1,0 +1,21 @@
+{% comment %}
+  Rack/device placement markers (MVP boxes), included by floor_rooms.html.
+  Expects `markers` (from previews.placement_markers): pre-computed transform + centered
+  rect attrs + label + a permission-scoped `url` to the rack/device's NetBox page (empty
+  when it didn't resolve). When `m.url` is set the marker links to that page (mirroring how
+  room polygons wrap on `s.url` in floor_rooms.html); otherwise it's a plain, link-less box.
+  Styling is inline because the host page doesn't load the plugin CSS.
+{% endcomment %}
+{% for m in markers %}
+  {% if m.url %}<a href="{{ m.url }}" target="_blank">{% endif %}
+  <g transform="{{ m.transform }}">
+    <rect x="{{ m.x }}" y="{{ m.y }}" width="{{ m.w }}" height="{{ m.h }}" rx="2"
+          vector-effect="non-scaling-stroke"
+          style="{% if m.is_rack %}fill:#cfd6e0;stroke:#57606a{% else %}fill:#ddf4ff;stroke:#0969da{% endif %};stroke-width:1.5"/>
+    {% if m.label %}
+      <text x="0" y="{{ m.label_y }}" text-anchor="middle"
+            style="font:600 11px sans-serif;paint-order:stroke;stroke:#fff;stroke-width:3px;fill:#1a1a1a">{{ m.label }}</text>
+    {% endif %}
+  </g>
+  {% if m.url %}</a>{% endif %}
+{% endfor %}
