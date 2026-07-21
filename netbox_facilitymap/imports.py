@@ -55,10 +55,11 @@ from django.views import View
 from netbox.plugins import get_plugin_config
 
 from .access import IMPORT_PERM, MapReadAccessMixin, reads_scoped_to_sites
-from .backup import create_backup, restore_backup
+from .backup import RestoreUnresolvedError, create_backup, restore_backup
 from .drawing_formats import (COMPANION_EXTS, DRAWING_EXTS, install_hint_for,
                               sniff as _sniff, sniff_companion as _sniff_companion)
 from .facilities import facility_site_slugs
+from .previews import render_hq_enabled
 from .storage import (EMPTY_MANIFEST, MANIFEST_NAME, SERVE_ROOTS, SITEPLAN_DIRNAME, safe_path,
                       valid_facility, work_dir)
 
@@ -160,6 +161,14 @@ class RenderRunner:
     LOCK_NAME = '.import.lock'
     SCRIPT = 'preprocess.py'
 
+    # Render-quality multiplier handed to `preprocess.py --scale` when the operator has switched
+    # `render_hq` on (READ-1). 1.5 lifts PdfFormat.RENDER_SCALE 2.0 -> 3.0 (~144 -> ~216 DPI), so
+    # the room names printed in a plan stay legible when it is displayed below 1:1. It costs
+    # roughly the SQUARE of that in pixels — hence the opt-in + the Settings-page warning — but it
+    # cannot run the child out of address space: the renderer derives each page's scale from its
+    # point size and clamps to PdfFormat.MAX_IMAGE_PX.
+    HQ_SCALE = 1.5
+
     def __init__(self, facility=''):
         self.facility = facility
 
@@ -235,16 +244,54 @@ class RenderRunner:
                 resource.setrlimit(resource.RLIMIT_AS, (nbytes, nbytes))
         return apply
 
+    def _is_hq_build(self, mode):
+        """True when this run is a **build** with high-quality rendering on — the only run whose
+        failure/quality-loss is worth explaining in terms of the render memory budget (HEALTH-3).
+        `scan`/`preview` never carry `--scale`, so a resource failure there isn't an HQ one."""
+        return mode == 'build' and render_hq_enabled()
+
+    def _mem_hint(self):
+        """An actionable remedy for an HQ render the render memory budget just defeated, naming the
+        **effective** (post-headroom-clamp) ceiling so the operator sees the number actually in
+        force, not the raw `render_mem_mb` the auto-clamp may have lowered."""
+        eff = self._effective_mem_mb(_cfg('render_mem_mb'))
+        return ('High-quality rendering was stopped, most likely by exceeding the render memory '
+                'budget (render_mem_mb=%s MB in effect). Raise render_mem_mb, or turn off '
+                '“High quality floor plans” in Settings, then rebuild.' % eff)
+
+    @staticmethod
+    def _parse_summary(stderr):
+        """The render diagnostics `preprocess.build` prints as its final `RENDER-SUMMARY {json}`
+        line, as a dict — or `{}` when absent (an older child, or a non-build mode) or unparseable.
+        Reads the **untruncated** stderr (the summary is the last line, past the 2000-char log cap)
+        and scans from the end so only the current build's summary is read."""
+        for line in reversed((stderr or '').splitlines()):
+            marker = 'RENDER-SUMMARY '
+            if line.startswith(marker):
+                try:
+                    return json.loads(line[len(marker):])
+                except json.JSONDecodeError:
+                    return {}
+        return {}
+
     def run(self, mode, extra=None):
         """Spawn `preprocess.py <mode> --base <workdir> [extra...]` and shape its result. Invoked
         by file path (not `-m`) so the child stays minimal/isolated — no Django in-process. The
         render relies on this isolation: the `render_timeout_s` timeout plus POSIX CPU/address-space
         rlimits cap a runaway or malicious child. `extra` carries mode-specific argv (e.g.
         `--pdf`/`--out` for `preview`). `scan` reads the child's stdout as the JSON inventory;
-        every other mode returns stderr as a log."""
+        every other mode returns stderr as a log.
+
+        A `build` additionally picks up the operator's `render_hq` setting as `--scale`, resolved
+        here rather than by the callers so no build path can forget it — and scoped to `build`
+        because that is the mode whose output the map actually serves. `scan` thumbnails and the
+        wizard's on-demand `preview` stay at standard scale on purpose: they exist to *identify* a
+        plan, and `preview` is an interactive request that shouldn't spike memory."""
         base = work_dir(self.facility)
         base.mkdir(parents=True, exist_ok=True)
         script = str(Path(__file__).resolve().parent / self.SCRIPT)
+        if mode == 'build' and render_hq_enabled():
+            extra = [*(extra or []), '--scale', str(self.HQ_SCALE)]
         timeout = _cfg('render_timeout_s')
         kwargs = {}
         if os.name == 'posix':
@@ -255,16 +302,42 @@ class RenderRunner:
                 [sys.executable, script, mode, '--base', str(base), *(extra or [])],
                 capture_output=True, text=True, cwd=str(base), timeout=timeout, **kwargs)
         except subprocess.TimeoutExpired:
-            return {'ok': False, 'error': '%s timed out after %ss' % (mode, timeout)}
+            result = {'ok': False, 'error': '%s timed out after %ss' % (mode, timeout)}
+            if self._is_hq_build(mode):
+                result['hint'] = ('The render timed out (render_timeout_s=%ss). High-quality '
+                                  'rendering is slower and heavier — raise render_timeout_s, or '
+                                  'turn off “High quality floor plans” in Settings, then rebuild.'
+                                  % timeout)
+            return result
         if proc.returncode != 0:
-            return {'ok': False,
-                    'error': (proc.stderr or proc.stdout).strip()[:2000] or (mode + ' failed')}
+            result = {'ok': False,
+                      'error': (proc.stderr or proc.stdout).strip()[:2000] or (mode + ' failed')}
+            # A negative return code means the child was killed by signal `-returncode` — an OOM
+            # kill, a CPU-rlimit SIGXCPU, or a C-level allocation crash, all consistent with the
+            # render outgrowing its limits. When it was an HQ build, say so and point at the fix
+            # instead of surfacing a truncated, opaque traceback (HEALTH-3).
+            if proc.returncode < 0:
+                result['signal'] = -proc.returncode
+                if self._is_hq_build(mode):
+                    result['hq_mem'] = True
+                    result['hint'] = self._mem_hint()
+            return result
         if mode == 'scan':
             try:
                 return {'ok': True, **json.loads(proc.stdout or '{}')}
             except json.JSONDecodeError:
                 return {'ok': False, 'error': (proc.stderr or proc.stdout)[:1000]}
-        return {'ok': True, 'log': proc.stderr.strip()[:2000]}
+        result = {'ok': True, 'log': proc.stderr.strip()[:2000]}
+        # Surface the build's render diagnostics (HEALTH-3): sheets that couldn't render, and HQ
+        # sheets the size cap clamped below full quality — a *successful* build that quietly lost
+        # content/quality, which the frontend turns into a non-blocking heads-up. Only >0 counts
+        # ride along, so an all-clean build's result is byte-identical to before.
+        if mode == 'build':
+            summary = self._parse_summary(proc.stderr)
+            for k in ('hq_clamped', 'unrendered'):
+                if summary.get(k):
+                    result[k] = summary[k]
+        return result
 
     def ensure_preview(self, src_rel, page=0, angle=0):
         """Ensure the full-scale PNG for an uploaded drawing exists (rendering it via
@@ -655,7 +728,12 @@ class RestoreArchiveView(_ImportView):
     the `ResetView` tier. The uploaded archive is untrusted: it is size- and magic-validated here,
     and `restore_backup` traversal-guards every member (`_check_safe_members`) before extracting —
     that guard is not loosened. The archive is streamed to a temp file (no in-memory cap) and
-    removed afterwards; the working dir is only touched by `restore_backup`'s atomic swap."""
+    removed afterwards; the working dir is only touched by `restore_backup`'s atomic swap.
+
+    Restore re-links rooms to Locations by portable **slug** (BAK-1), so a backup can be restored to
+    a *new* instance. This web path is **strict** (no `allow_unresolved`): if a binding can't be
+    re-resolved here the restore aborts **without changing anything** and returns the unresolved
+    list (400) so the operator can recreate the missing Sites/Locations before retrying."""
 
     def has_permission(self):
         # `super()` enforces IMPORT_PERM; the superuser check is the extra restore-only tier.
@@ -680,7 +758,14 @@ class RestoreArchiveView(_ImportView):
                 tmp.write(chunk)
             tmp_path = tmp.name
         try:
+            # Strict on the web path (no allow_unresolved): the most destructive action in the
+            # plugin aborts + reports rather than silently dropping bindings.
             result = restore_backup(tmp_path)
+        except RestoreUnresolvedError as e:
+            # Bindings didn't resolve on this instance — nothing was changed. Surface the list so
+            # the operator sees exactly which Sites/Locations to recreate before retrying.
+            return JsonResponse({'ok': False, 'error': str(e), 'unresolved': e.unresolved},
+                                status=400)
         except (ValueError, tarfile.TarError, FileNotFoundError) as e:
             return JsonResponse({'ok': False, 'error': str(e)}, status=400)
         finally:

@@ -100,6 +100,41 @@ def read_manifest(facility=''):
     return data
 
 
+def write_manifest(facility, data):
+    """Atomically rewrite a facility's ``manifest.json`` (``.part`` + atomic replace) — the
+    **Django-side** counterpart to ``preprocess.write_manifest`` (which stays Django-free). Used only
+    by the rename-remap signals (HEALTH-4) to re-key floor bindings *in place* after a Site/Location
+    slug change, never by the render path. Creates the working dir if needed. The new mtime/size busts
+    ``read_manifest``'s memo automatically, so the next read returns the re-keyed manifest."""
+    base = work_dir(facility)
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / MANIFEST_NAME
+    part = base / (MANIFEST_NAME + '.part')
+    part.write_text(json.dumps(data))
+    part.replace(path)
+
+
+def rename_image_subdir(facility, old_rel, new_rel):
+    """Move ``images/<old_rel>`` → ``images/<new_rel>`` within a facility's working dir; return True
+    when the source existed and was moved, False when it was absent (a no-op).
+
+    The filesystem half of the HEALTH-4 rename remap, run **after** the DB/manifest re-key (mirroring
+    `facilities.reassign_facility`'s DB-then-disk order). A Site rename moves ``images/<siteSlug>`` and
+    a building-Location rename moves the nested ``images/<siteSlug>/<buildingSlug>`` — one directory
+    move carries every floor image beneath it. Traversal-guarded via ``safe_path`` (so a hostile slug
+    can't escape ``images/``) and collision-guarded like `move_facility`: raises ``ValueError`` when
+    the destination already exists (a re-key would otherwise clobber it)."""
+    src = safe_path('images/%s' % old_rel, facility)
+    dst = safe_path('images/%s' % new_rel, facility)
+    if not src.exists():
+        return False
+    if dst.exists():
+        raise ValueError('target image directory already exists')
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+    return True
+
+
 def move_facility(old, new):
     """Move a facility's rendered artifacts (``manifest.json`` + ``images/`` + ``uploads/``) from
     ``old``'s working dir into ``new``'s, and return the list of names actually moved.

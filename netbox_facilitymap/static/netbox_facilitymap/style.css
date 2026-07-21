@@ -115,6 +115,10 @@ body {
    Done lands exactly where Edit was (NAV-1). */
 #toolbar button.mode { min-width: 76px; flex: 0 0 auto; }
 #settings-gear { padding: 0 9px; flex: 0 0 auto; }
+/* Buildings-panel show/hide toggle (NAV-8) — a gear-sized sibling; the accent `.active` tint
+   (panel showing) comes from the shared `button.active` rule. Hidden off the siteplan view. */
+#panel-toggle { padding: 0 9px; flex: 0 0 auto; }
+#panel-toggle[hidden] { display: none; }
 
 button {
   display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
@@ -200,22 +204,54 @@ svg.panning { cursor: grabbing; }
   padding: 4px 12px; background: rgba(255,255,255,.92);
 }
 
+/* A 404'd sheet (HEALTH-9: a Site/floor rename that left the manifest pointing at a missing
+   image) keeps its layout box (left/top/width/height are set inline per-cell) but is hidden
+   rather than showing the browser's broken-image glyph; the plan-unavailable card below
+   explains why. */
+.map-wrap img.sheet.sheet-broken { visibility: hidden; }
+/* Non-alarming "plan unavailable" overlay, pinned to the viewport like .sheet-mark so pan/zoom
+   (a transform on .map-wrap) never moves it. Mirrors floor_unresolved.html's server-side card. */
+.plan-unavailable { position: absolute; inset: 0; z-index: 5; display: flex;
+  align-items: flex-start; justify-content: center; padding: 40px 20px; pointer-events: none; }
+.plan-unavailable[hidden] { display: none; }
+.plan-unavailable-card {
+  display: flex; gap: 10px; max-width: 420px; background: var(--panel);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card); padding: 14px 16px;
+}
+.plan-unavailable-icon { flex: 0 0 auto; color: var(--warn); }
+.plan-unavailable-title { margin: 0 0 4px; font-weight: 700; color: var(--text); font-size: 13px; }
+.plan-unavailable-card p:last-child { margin: 0; color: var(--text2); font-size: 12.5px; line-height: 1.5; }
+
 /* siteplan layout: map + building index (fills the stage; the map column clips
    its own pan/zoom viewport while the index stays put beside it) */
 .siteplan-view { position: absolute; inset: 0;
-  display: flex; gap: 16px; align-items: flex-start; padding: 16px; }
+  display: flex; gap: 0; align-items: flex-start; padding: 16px; }
 .siteplan-view .map-viewport { flex: 1 1 auto; min-width: 0; align-self: stretch; }
 .legend {
-  flex: 0 0 250px; background: var(--panel); border: 1px solid var(--line);
+  flex: 0 0 auto; width: 250px; background: var(--panel); border: 1px solid var(--line);
   border-radius: var(--radius-lg); padding: 6px; box-shadow: var(--shadow);
   max-height: calc(100vh - 90px); overflow: auto; position: sticky; top: 0;
 }
+.legend[hidden] { display: none; }
+
+/* drag handle between the map and the building index — resize by dragging, collapse
+   by dragging past the min width or double-clicking (NAV-7) */
+.legend-resize { flex: 0 0 14px; align-self: stretch; cursor: ew-resize;
+  position: relative; touch-action: none; }
+.legend-resize[hidden] { display: none; }
+.legend-resize::before { content: ''; position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%, -50%); width: 2px; height: 34px; border-radius: 2px;
+  background: var(--border-strong); transition: background .12s, height .12s; }
+.legend-resize:hover::before, .legend-resize.dragging::before {
+  background: var(--accent); height: 52px; }
+.legend-resize.will-collapse::before { background: var(--danger); }
+
 .legend-head { font-weight: 700; font-size: 14px; padding: 8px 10px 10px; }
 .legend-search { width: 100%; height: 32px; padding: 0 10px; margin: 0 0 6px;
   background: var(--panel); border: 1px solid var(--border-strong);
   border-radius: var(--radius); color: var(--text); font-family: inherit; font-size: 13px; }
 .legend-search:focus { outline: none; border-color: var(--accent); }
-.legend-empty { color: var(--muted); font-size: 12.5px; padding: 8px 10px; }
 .legend-group { color: var(--faint); font-size: 11px; font-weight: 600;
   text-transform: uppercase; letter-spacing: .08em; padding: 12px 10px 4px; }
 .legend-row { display: flex; gap: 12px; align-items: baseline; padding: 8px 10px;
@@ -231,18 +267,369 @@ svg.panning { cursor: grabbing; }
 .finder { padding: 2px 0 6px; margin-bottom: 6px; border-bottom: 1px solid var(--line); }
 .finder-results:not(:empty) { margin-top: 2px; }
 .finder-empty { color: var(--muted); font-size: 12.5px; padding: 6px 10px; }
-.finder-row { display: flex; gap: 8px; align-items: baseline; padding: 7px 10px;
+.finder-row { display: flex; gap: 8px; align-items: flex-start; padding: 7px 10px;
   border-radius: 6px; cursor: pointer; }
 .finder-row:hover { background: #f6f9fc; }
 .finder-tag { flex: 0 0 auto; font-size: 10px; font-weight: 700; text-transform: uppercase;
   letter-spacing: .04em; padding: 1px 6px; border-radius: 999px; color: var(--accent);
   background: var(--accent-tint); }
 .finder-tag.rack, .finder-tag.device { color: #7a4bd0; background: #efe8fb; }
+/* Building tag — green, matching the green building hotspots on the map. */
+.finder-tag.building { color: var(--success); background: var(--success-bg); }
+/* min-width:0 lets the flex child shrink; the text below wraps rather than truncating
+   (FMT-3) so long room/rack/device names stay fully readable. overflow-wrap:anywhere
+   breaks unbroken tokens (long slugs) so they can't overflow the row. */
 .finder-main { min-width: 0; }
 .finder-nm { font-size: 12.5px; font-weight: 600; color: var(--text2);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.finder-sl { font-size: 11px; color: var(--muted);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  overflow-wrap: anywhere; }
+.finder-sl { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+/* Unplaced-item note (NAV-3): a room/rack/device found in NetBox but not on the map. */
+.finder-un { font-size: 10.5px; font-weight: 600; color: var(--faint);
+  overflow-wrap: anywhere; }
+/* A result whose floor has no map: shown for discoverability but there's nowhere to jump. */
+.finder-row.disabled { cursor: default; opacity: .6; }
+.finder-row.disabled:hover { background: none; }
+
+/* Floor to-do list (ADDON-1; redesigned TASK-3) — a resizable/hideable panel beside the floor map,
+   laid out in the same flex row as the siteplan index and driven by the shared `.legend-resize` drag
+   handle. Unlike the boxed siteplan legend, the floor panel is flush against the stage edge so the
+   dense floor map keeps full height.
+
+   The panel is one **flat prioritized list** for the whole floor (no per-room folders — most rooms
+   have no work, and folders buried the live to-dos), so each row carries its own room chip. Header
+   / filters / composer are fixed; only `.todo-list` scrolls. The `.todo-*` selectors are shared with
+   the composer (`.todo-c-*`) and the facility-wide to-do page (`.todo-pg-*`, TASK-5) — a row, chip,
+   pill or avatar is styled once here and reads identically on both surfaces. */
+.floor-view { position: absolute; inset: 0; display: flex; align-items: stretch; }
+.floor-view .map-viewport { flex: 1 1 auto; min-width: 0; align-self: stretch; }
+.todo-panel { flex: 0 0 auto; width: 320px; background: var(--panel);
+  border-left: 1px solid var(--line); display: flex; flex-direction: column; overflow: hidden; }
+.todo-panel[hidden] { display: none; }
+
+.todo-head { display: flex; align-items: center; gap: 8px; padding: 12px 10px 10px;
+  font-weight: 700; font-size: 14px; border-bottom: 1px solid var(--line); }
+.todo-head-ico { display: inline-flex; color: var(--accent); }
+.todo-head-title { flex: 0 0 auto; }
+/* The live open count sits between the title and + New, taking the slack so both stay put. */
+.todo-open-count { flex: 1 1 auto; min-width: 0; font-size: 11.5px; font-weight: 600;
+  color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todo-new { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; padding: 4px 9px;
+  border: 1px solid var(--accent); border-radius: 999px; background: var(--accent); color: #fff;
+  font-family: inherit; font-size: 11.5px; font-weight: 600; cursor: pointer; }
+.todo-new:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+.todo-filters { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 10px;
+  border-bottom: 1px solid var(--line2); }
+.todo-filter { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px;
+  border: 1px solid var(--border-strong); border-radius: 999px; background: var(--panel);
+  color: var(--text2); font-family: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
+.todo-filter:hover { border-color: var(--accent); color: var(--accent); }
+.todo-filter.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.todo-filter-n { font-size: 10px; opacity: .75; }
+
+.todo-list { flex: 1 1 auto; overflow: auto; padding: 8px; }
+.todo-empty { color: var(--muted); font-size: 12.5px; line-height: 1.5; padding: 14px 10px;
+  text-align: center; }
+
+/* ---- one to-do row ---- */
+.todo-item { padding: 7px 8px; margin-bottom: 6px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--panel); }
+.todo-item.status-in_progress { border-left: 3px solid var(--accent); }
+/* Assigned to the viewer — the rows the sort already floats to the top; the tint is what makes that
+   ordering legible instead of looking arbitrary. */
+.todo-item.mine { background: var(--accent-tint); border-color: var(--accent-tint-border); }
+.todo-item.status-completed { opacity: .72; }
+.todo-item-top { display: flex; align-items: flex-start; gap: 6px; }
+.todo-item-text { flex: 1 1 auto; min-width: 0; font-size: 12.5px; color: var(--text);
+  overflow-wrap: anywhere; }
+.todo-item.status-completed .todo-item-text { text-decoration: line-through; color: var(--muted); }
+/* The row's own controls: ✕ beside pencil, one quiet row — side by side so this column's height
+   never exceeds the single-line title next to it (a stacked pair used to force the row taller). */
+.todo-item-acts { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; }
+/* Small and quiet by design: the destructive control must not compete with the status pills. */
+.todo-del { flex: 0 0 auto; padding: 0 3px; border: none; background: none; color: var(--faint);
+  font-family: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; }
+.todo-del:hover { color: var(--danger); }
+/* Same quiet weight as the ✕ beside it — but it opens the row rather than destroying it, so it
+   warms to the accent, not to danger. */
+.todo-edit { flex: 0 0 auto; display: flex; padding: 0 3px; border: none; background: none;
+  color: var(--faint); line-height: 1; cursor: pointer; }
+.todo-edit:hover { color: var(--accent); }
+/* The edit form standing in for a row (UX-9): it takes the row's own footprint, tinted like `.mine`
+   so it reads as *this* to-do opened up rather than a second create form. The composer's own
+   bottom rule is for sitting under a panel header — inside a row it would just cut the card. */
+.todo-edit-host { margin-bottom: 6px; border: 1px solid var(--accent-tint-border);
+  border-radius: 6px; overflow: hidden; }
+.todo-edit-host .todo-composer { border-bottom: none; }
+
+.todo-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin-top: 5px; }
+.todo-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 6px;
+  border-radius: 999px; background: var(--bg); color: var(--text2); font-size: 10.5px;
+  font-weight: 600; max-width: 100%; }
+.todo-room-chip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todo-room-dot { flex: 0 0 auto; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+.todo-due.overdue { background: rgba(224,83,61,.12); color: var(--danger); }
+
+/* Priority is a dot + word, not a filled chip: it appears on every row, and three saturated pills
+   per row would drown the status pills that actually drive the workflow. */
+.todo-prio { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px;
+  font-weight: 600; color: var(--muted); }
+.todo-prio-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.todo-prio.prio-high { color: var(--danger); }
+.todo-prio.prio-med { color: var(--warn); }
+.todo-prio.prio-low { color: var(--faint); }
+
+.todo-avatars { display: inline-flex; align-items: center; }
+.todo-avatar { display: inline-flex; align-items: center; justify-content: center; width: 18px;
+  height: 18px; border-radius: 50%; border: 1px solid var(--panel); background: var(--accent);
+  background-clip: padding-box; color: #fff; font-size: 8.5px; font-weight: 700;
+  letter-spacing: .2px; cursor: default; }
+.todo-avatar + .todo-avatar { margin-left: -5px; }   /* overlap, so a pair reads as one cluster */
+.todo-avatar-more { background: var(--faint); }
+
+.todo-notes { margin-top: 5px; color: var(--muted); font-size: 11.5px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+
+.todo-pills { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.todo-pill { font-size: 10.5px; font-weight: 600; padding: 2px 7px; border-radius: 10px;
+  border: 1px solid var(--border-strong); background: var(--panel); color: var(--text2);
+  font-family: inherit; cursor: pointer; }
+.todo-pill:hover { border-color: var(--accent); color: var(--accent); }
+.todo-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; cursor: default; }
+
+/* ---- the completed group (room-subgrouped archive) ---- */
+.todo-count { flex: 0 0 auto; font-size: 11px; font-weight: 700; color: var(--muted);
+  background: var(--bg); border-radius: 10px; padding: 0 7px; min-width: 18px; text-align: center; }
+.todo-count:empty { display: none; }
+.todo-caret { display: inline-flex; flex: 0 0 auto; color: var(--faint); transition: transform .12s; }
+.todo-done-head.open .todo-caret { transform: rotate(90deg); }
+
+.todo-done { margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.todo-done-head { display: flex; align-items: center; gap: 6px; padding: 5px 6px;
+  border-radius: 6px; cursor: pointer; font-size: 11.5px; font-weight: 600; color: var(--faint); }
+.todo-done-head:hover { background: var(--panel2); }
+.todo-done-title { flex: 0 0 auto; }
+.todo-done-body { padding-top: 6px; }
+.todo-done-body[hidden] { display: none; }
+/* Both "clear" scopes: floor-wide in the group header, per-room on each subheading. Quiet until
+   hovered — they hard-delete, so they shouldn't invite an idle click. */
+.todo-clear-all { margin-left: auto; }
+.todo-clear-all, .todo-clear-room { flex: 0 0 auto; padding: 1px 6px; border: 1px solid transparent;
+  border-radius: 999px; background: none; color: var(--faint); font-family: inherit; font-size: 10.5px;
+  font-weight: 600; cursor: pointer; }
+.todo-clear-all:hover, .todo-clear-room:hover { border-color: var(--danger); color: var(--danger); }
+
+.todo-group { margin-bottom: 8px; }
+.todo-group-head { display: flex; align-items: center; gap: 6px; padding: 3px 6px;
+  font-size: 11px; font-weight: 700; color: var(--text2); }
+.todo-group-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+
+/* ---- the create form (TodoComposer) ---- */
+.todo-composer-host:empty { display: none; }
+.todo-composer { display: flex; flex-direction: column; gap: 7px; padding: 10px;
+  border-bottom: 1px solid var(--line); background: var(--panel2); }
+.todo-c-field { display: flex; flex-direction: column; gap: 3px; }
+.todo-c-label { font-size: 10.5px; font-weight: 700; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .3px; }
+.todo-c-input { width: 100%; min-width: 0; padding: 5px 7px; border: 1px solid var(--border-strong);
+  border-radius: var(--radius); background: var(--panel); color: var(--text); font-family: inherit;
+  font-size: 12px; }
+.todo-c-input:focus { outline: none; border-color: var(--accent); }
+select.todo-c-input { height: 28px; cursor: pointer; }
+textarea.todo-c-notes { resize: vertical; min-height: 34px; }
+
+.todo-c-prios { display: flex; gap: 4px; }
+.todo-c-prio { flex: 1 1 0; padding: 3px 8px; text-align: center; border: 1px solid var(--border-strong);
+  border-radius: var(--radius); background: var(--panel); color: var(--text2); font-family: inherit;
+  font-size: 11px; font-weight: 600; cursor: pointer; }
+.todo-c-prio:hover { border-color: var(--accent); color: var(--accent); }
+.todo-c-prio.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.todo-c-assignees { display: flex; flex-direction: column; gap: 4px; }
+.todo-c-assignees .fm-combo, .todo-c-assignees .fm-combo-input { width: 100%; }
+.todo-c-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.todo-c-chips:empty { display: none; }
+.todo-c-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 4px 1px 7px;
+  border-radius: 999px; background: var(--accent-tint); border: 1px solid var(--accent-tint-border);
+  color: var(--text2); font-size: 10.5px; font-weight: 600; }
+.todo-c-chip-x { border: none; background: none; padding: 0 2px; color: var(--faint);
+  font-family: inherit; font-size: 10px; cursor: pointer; }
+.todo-c-chip-x:hover { color: var(--danger); }
+
+.todo-c-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 1px; }
+.todo-c-actions button { padding: 4px 10px; border: 1px solid var(--border-strong);
+  border-radius: var(--radius); background: var(--panel); color: var(--text2); font-family: inherit;
+  font-size: 11.5px; font-weight: 600; cursor: pointer; }
+.todo-c-actions button:hover { border-color: var(--accent); color: var(--accent); }
+.todo-c-actions button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.todo-c-actions button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.todo-c-actions button.primary:disabled { background: var(--accent-tint-border);
+  border-color: var(--accent-tint-border); color: var(--panel); cursor: not-allowed; }
+
+/* ---- Facility-wide to-do page (TodoPage, TASK-5; design passes UX-3, UX-6) ---- */
+/* The `#/todo` route's own stage: a centred column, scrolling as one page (unlike the floor panel,
+   where only the list scrolls — this surface has no map beside it to hold still for). Rows, chips,
+   pills and avatars are the `.todo-*` selectors above, unchanged; only the page's own furniture —
+   the toolbar, the building/floor tree, the progress bars — is styled here.
+
+   Where the page needs a **shared** selector to read differently, it is overridden `.todo-page`-scoped
+   in this block (`.todo-page .todo-count`, `.todo-page .todo-filter`) — never by retuning the shared
+   rule above, which the floor panel reads too and must not move with the page. */
+.todo-page { --pg-gap: 14px; height: 100%; overflow: auto; padding: 18px 20px 32px; }
+/* The column's rhythm, set once rather than as a bottom margin per block. `* + *` and not a flex
+   `gap`, deliberately: `.todo-pg-composer-host:empty` is `display:none`, and the sibling rule keeps
+   spacing the list correctly whether or not the composer is open. */
+.todo-page > * { max-width: 940px; margin-left: auto; margin-right: auto; }
+.todo-page > * + * { margin-top: var(--pg-gap); }
+
+.todo-pg-blank { padding: 40px 10px; text-align: center; color: var(--muted); }
+.todo-pg-blank h2 { margin: 0 0 6px; font-size: 15px; color: var(--text2); }
+
+/* ---- the toolbar: the page's one control surface (UX-6) ---- */
+/* One card, not the head + stat-tiles + controls stack this replaced. The tiles were a subset of
+   these pills by key, counted from the same `TODO_PG_FILTERS` predicates and likewise buttons that
+   applied their own filter — three stacked surfaces to say four numbers twice. The pills absorbed
+   them; the page title went too (the NetBox page chrome around this stage already names it).
+   `--bg` on `--panel` here is the inverse of the invariant below: these chips read against the
+   card, not against `#stage`, so the fill that would be invisible out on the page defines them. */
+.todo-pg-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 9px 10px; border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel); }
+.todo-pg-toolbar .todo-filters { flex: 1 1 auto; padding: 0; border: none; gap: 5px; }
+/* The pills carry the tiles' job now, so they read a size up from the floor panel's — and their
+   count is the number the tiles used to hold: mono, so a row of them aligns as figures rather than
+   drifting with the label beside it. Page-scoped, never a retune of the shared rule (§10 To-do). */
+.todo-page .todo-filter { padding: 5px 10px; gap: 6px; font-size: 11.5px; background: var(--bg); }
+.todo-page .todo-filter.active { background: var(--accent); }
+.todo-page .todo-filter-n { font-family: var(--mono); font-size: 11px; font-weight: 700;
+  opacity: 1; color: var(--text2); }
+/* The one thing the tiles genuinely contributed: facility health, at a glance, in colour. Qualified
+   base+modifier (`.todo-pg-pill.pill-*`), the same shape as `.todo-prio.prio-*` above — the page's
+   own hook, so these can't reach a `.todo-filter` in the floor panel. */
+.todo-pg-pill.pill-in_progress .todo-filter-n { color: var(--accent); }
+.todo-pg-pill.pill-overdue .todo-filter-n { color: var(--danger); }
+.todo-pg-pill.pill-completed .todo-filter-n { color: var(--success); }
+/* Zero beats the semantic colour (equal specificity, later wins); active beats both (one class
+   more) — an accent-filled pill must carry its count in white whatever the count says. */
+.todo-page .todo-filter-n.zero { color: var(--faint); }
+.todo-page .todo-filter.active .todo-filter-n { color: #fff; opacity: .85; }
+
+/* Explicitly styled, never left to the host: a bare input inside a NetBox page inherits NetBox's
+   global form-control CSS (§10 Theming). `appearance:none` also drops Safari's search decorations. */
+.todo-pg-search { flex: 1 1 auto; min-width: 0; width: 220px; appearance: none; padding: 5px 10px;
+  border: 1px solid var(--border-strong); border-radius: 999px; background: var(--bg);
+  color: var(--text); font-family: inherit; font-size: 12px; }
+.todo-pg-search:focus { outline: none; border-color: var(--accent); background: var(--panel); }
+/* The tools travel together, so the toolbar's only break point is pills | tools. */
+.todo-pg-tools { flex: 0 1 auto; display: flex; align-items: center; gap: 8px; min-width: 0; }
+.todo-pg-tools .todo-new { flex: 0 0 auto; padding: 5px 11px; font-size: 11.5px; }
+/* The Display popover trigger (TASK-7) sits with search + New; size it to match them. It opens the
+   shared `.view-menu*` popover (reused as-is from the building page's View menu). */
+.todo-pg-view { flex: 0 0 auto; padding: 5px 10px; font-size: 11.5px; }
+
+.todo-pg-composer-host:empty { display: none; }
+.todo-pg-composer-host { border: 1px solid var(--line); border-radius: var(--radius);
+  overflow: hidden; }
+/* Building + Floor sit above the composer's own fields as one continuous form, so the scope reads
+   as part of the same act as picking the room. Side by side: they're a pair. */
+.todo-pg-scope { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; padding: 10px 10px 0;
+  background: var(--panel2); }
+.todo-pg-composer-host .todo-composer { border-bottom: none; }
+
+/* ---- the building -> floor tree ---- */
+/* Three levels, three weights: the building is the section heading, the floor its subheading (quiet
+   — `--text2`, so the rows beneath it read as the content), and a row is a card on the page's grey.
+   Building and floor were both 700/`--text` a half-pixel apart, which is no hierarchy at all. */
+.todo-pg-bld { margin-bottom: 16px; }
+.todo-pg-bld:last-child { margin-bottom: 0; }
+.todo-pg-bld-head { display: flex; align-items: center; gap: 8px; padding: 0 2px 6px;
+  border-bottom: 1px solid var(--line); margin-bottom: 6px; }
+.todo-pg-bld-name { flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 700;
+  color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.todo-pg-floor { margin-bottom: 4px; }
+.todo-pg-floor-head { display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+  border-radius: var(--radius); cursor: pointer; }
+.todo-pg-floor-head:hover { background: var(--panel); }
+.todo-pg-floor-head.open .todo-caret { transform: rotate(90deg); }
+/* The floor you were last viewing this session (TASK-5): a quiet "you were here" anchor, not a
+   status badge — a soft left accent + faint tint the eye settles on without reading a label. The
+   inset bar persists through the header's :hover background swap. */
+.todo-pg-floor-head.current { background: var(--accent-tint);
+  box-shadow: inset 3px 0 0 var(--accent); }
+.todo-pg-floor-name { flex: 0 1 auto; min-width: 0; font-size: 12.5px; font-weight: 600;
+  color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Rows hang under the floor **name**, not under its caret: the head's 8px padding + the 12px
+   `Icons.chevron` + the head's own 8px gap. The body owns the row spacing (`gap`), so the shared
+   `.todo-item` bottom margin is zeroed for page rows below rather than doubling up with it. */
+.todo-pg-floor-body { display: flex; flex-direction: column; gap: 6px;
+  padding: 4px 8px 10px 28px; }
+.todo-pg-floor-body[hidden] { display: none; }
+
+/* ---- single-level buckets (Assignee / Priority / Status grouping) and the flat list (TASK-7) ---- */
+/* A non-location view is one level, not two, so its heading is lighter than the building heading and
+   there is no floor sub-header. `.todo-pg-flat` (the `None` view) has no heading at all — just rows.
+   Both bodies own their row spacing via `gap`, matching `.todo-pg-floor-body`. */
+.todo-pg-group { margin-bottom: 14px; }
+.todo-pg-group:last-child, .todo-pg-flat:last-child { margin-bottom: 0; }
+.todo-pg-group-head { display: flex; align-items: center; gap: 8px; padding: 0 2px 6px;
+  border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+.todo-pg-group-name { flex: 1 1 auto; min-width: 0; font-size: 13px; font-weight: 700;
+  color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todo-pg-group-body, .todo-pg-flat { display: flex; flex-direction: column; gap: 6px; }
+/* The leading "Building · Floor" chip a row carries when the list isn't grouped by location, so it
+   still says where the work is. `--text2` keeps it quieter than the room chip it precedes. */
+.todo-page .todo-pg-place { color: var(--text2); }
+
+/* One badge shape for the floor header's pills — the overdue count and the shared `.todo-count`
+   sit in a single row and used to disagree on radius, padding and size. `.todo-count` is
+   page-scoped here so the floor panel's own count keeps its shared styling. (The current-floor
+   cue is no longer a pill — it's the soft header anchor above.) */
+.todo-pg-overdue, .todo-page .todo-count {
+  flex: 0 0 auto; padding: 1px 7px; border: 1px solid transparent; border-radius: 999px;
+  font-size: 10.5px; font-weight: 700; line-height: 1.5; }
+.todo-pg-overdue { background: rgba(224,83,61,.12); color: var(--danger); }
+/* A white pill with a border, not the shared `--bg` fill: on this page `--bg` IS the backdrop
+   (`#stage`), so the shared fill would render the count as bare text. */
+.todo-page .todo-count { background: var(--panel); border-color: var(--line); color: var(--muted);
+  min-width: 0; text-align: center; }
+
+.todo-pg-open { flex: 0 0 auto; padding: 2px 8px; border: 1px solid var(--border-strong);
+  border-radius: 999px; background: var(--panel); color: var(--text2); font-family: inherit;
+  font-size: 10.5px; font-weight: 600; cursor: pointer; }
+.todo-pg-open:hover { border-color: var(--accent); color: var(--accent); }
+
+/* A page row navigates rather than being worked in place (the pills live on the floor panel), so it
+   reads as a target: pointer, hover lift, and a real focus ring for the keyboard path. Its own
+   spacing comes from `.todo-pg-floor-body`'s gap, so the shared row margin is dropped here. */
+.todo-pg-item { display: block; width: 100%; margin-bottom: 0; text-align: left; cursor: pointer; }
+.todo-pg-item:hover { border-color: var(--accent); background: var(--accent-tint); }
+
+/* One focus treatment for everything actionable on the page. The rows already had a ring; the
+   filter pills, New to-do and Open plan were reachable by keyboard with nothing to show for it. */
+.todo-pg-item:focus-visible, .todo-pg-open:focus-visible,
+.todo-page .todo-filter:focus-visible, .todo-page .todo-new:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px; }
+
+@media (max-width: 720px) {
+  /* Once the tools have a line to themselves, the search takes the slack the pills were holding. */
+  .todo-pg-tools { flex: 1 1 100%; }
+  .todo-pg-scope { grid-template-columns: 1fr; }
+}
+
+/* Search-only dashboard embed (FacilitySearchWidget, NAV-15): the wayfinding finder alone,
+   filling the card (embed `#stage` is absolute inset:0), the results list scrolling within it.
+   No legend around it, so drop the finder's legend-context divider/margins. */
+.finder-only { height: 100%; overflow: auto; padding: 12px; background: var(--panel); }
+.finder-only .finder { padding: 0; margin: 0; border-bottom: none; }
+
+/* Building-directory home (IMPORT-8): shown when the facility has no overall siteplan image, so
+   there is no map to dock the index beside. The same `.legend` index/finder, centered full-stage
+   as the primary content — width auto (not the fixed 250px side-panel), capped for readability. */
+.siteplan-directory { position: absolute; inset: 0; overflow: auto; padding: 24px 16px; }
+.siteplan-directory .legend { width: auto; max-width: 520px; margin: 0 auto;
+  position: static; max-height: none; }
 
 /* siteplan hotspots — blue = PDF/source, green = user-drawn */
 .hotspot { fill: rgba(6,111,209,.10); stroke: var(--accent); stroke-width: 1.5;
@@ -268,8 +655,13 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
 
 /* room polygons — green = bound */
 .room { fill: rgba(47,168,79,.16); stroke: var(--success); stroke-width: 2;
-  cursor: pointer; }
-.room:hover { fill: rgba(47,168,79,.36); }
+  cursor: pointer;
+  transition: fill .12s ease-out, stroke .12s ease-out, stroke-width .12s ease-out; }
+/* Hover is outline-first: the fill lifts only a whisper and the stroke carries the signal, so the
+   visual delta scales with a room's PERIMETER rather than its area. A hall-sized room used to flood
+   the viewport just because the pointer crossed it on the way to a room nested inside it. Rooms with
+   their own fill (`.selected`/`.unbound`, below) keep it on hover and pick up the stroke weight. */
+.room:hover { fill: rgba(47,168,79,.22); stroke-width: 3.5; }
 .room.selected { stroke: var(--warn); fill: rgba(224,169,61,.30); }
 .room.unbound { stroke: var(--danger); fill: rgba(224,83,61,.18); }
 /* per-sheet header on a multi-page floor (mirrors the PDF sheet label) */
@@ -290,18 +682,52 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
 
 /* rooms holding rack/device markers (highlighted in view mode) — blue accent */
 .room.placed { fill: rgba(6,111,209,.28); stroke: none; }
-.room.placed:hover { fill: rgba(6,111,209,.44); }
+/* Outline-first like `.room:hover` — but `.room.placed` above resets `stroke: none`, so the hover
+   has to hand the stroke back before it can carry the signal. */
+.room.placed:hover { fill: rgba(6,111,209,.34); stroke: var(--accent); stroke-width: 3.5; }
 .room.placed.selected { stroke: var(--warn); }   /* edit-mode selection still outlined */
 
+/* view-mode highlighted rooms (FloorEditor._drawRoom adds `.view` only outside edit mode):
+   a subtle outline — green for a plain highlight, blue for a room holding markers. Kept off
+   edit mode (no `.view` there) so the editor's room look is unchanged.
+
+   The outline is drawn ONCE per room as an opaque stroke-only clone inside the
+   `.room-view-outlines` group, whose group-level opacity makes it translucent. Two opaque
+   clones that overlap along a shared wall composite to a single opaque line *inside* the
+   group, so the group's opacity yields one uniform-weight seam instead of two `.55` strokes
+   compounding darker (VIEW-1). The interactive `.room.view` shape (a `<polygon>`, or an evenodd
+   `<path>` when the room is holed or contains a smaller room — these rules are class-keyed, so they
+   apply to either) therefore carries fill only at rest — its resting stroke lives in the group —
+   while hover and click stay on it. */
+.room.view, .room.placed.view { stroke: none; }
+/* Outline-first hover needs the stroke back that the rule above dropped (hence the extra class of
+   specificity, and the position after it). Reusing the outline group's exact hues is what keeps the
+   two from fighting: the group paints AFTER every fill, so its resting line lands on top of this
+   one — and a .55-opacity line over an opaque line of the SAME colour composites back to that
+   colour, leaving one crisp wider stroke rather than a muddied seam. VIEW-1 stays untouched. */
+.room.view:hover { stroke: var(--success); stroke-width: 3.5; }
+.room.placed.view:hover { stroke: var(--accent); stroke-width: 3.5; }
+.room-view-outlines { opacity: .55; pointer-events: none; }
+.room-view-outlines .room-outline { fill: none; stroke: #2fa84f; stroke-width: 1.5; }
+.room-view-outlines .room-outline.placed { stroke: #066fd1; }
+
 /* focus target — a wayfinding-search jump or a `#/r/` room deep-link — a transient pulse so the
-   found room is unmistakable. Always drawn (see FloorEditor._drawRoom) and cleared after ~3.5s. */
-.room.focus { stroke: var(--warn); stroke-width: 3; animation: room-pulse 1.1s ease-out 3; }
+   found room is unmistakable. Always drawn (see FloorEditor._drawRoom) and cleared after ~3.5s.
+   `.placed.focus` is spelled out so the pulse outranks `.room.placed:hover`'s accent stroke — the
+   keyframes below animate fill/stroke-width but never the stroke COLOUR, so without it hovering a
+   focused device room would repaint the pulse blue. (A focus target never carries `.view` —
+   `_drawRoom` picks one or the other — so the `.view` hover rules can't reach it.) */
+.room.focus, .room.placed.focus {
+  stroke: var(--warn); stroke-width: 3; animation: room-pulse 1.1s ease-out; }
 @keyframes room-pulse {
   0%   { fill: rgba(224,169,61,.55); stroke-width: 5; }
   100% { fill: rgba(224,169,61,.18); stroke-width: 3; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .room.focus { animation: none; fill: rgba(224,169,61,.40); }
+  /* Selector mirrors the pulse rule above: a media query adds no specificity, so `.room.focus`
+     alone would lose to `.room.placed.focus` and keep animating. */
+  .room.focus, .room.placed.focus { animation: none; fill: rgba(224,169,61,.40); }
+  .room { transition: none; }
 }
 
 /* invisible-but-clickable room (default in view mode) */
@@ -341,6 +767,16 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
    box is its backdrop). A moved label drops `.inside` and regains the halo above. */
 .rack-label.inside { fill: #fff; stroke: none; }
 
+/* Every non-rack marker's name gets an opaque chip instead of the halo (READ-1). A halo only
+   outlines the glyphs, so the room name printed in the plan raster still shows through the gaps
+   between them; the chip occludes it outright. The chip is drawn by FloorEditor._chipBackdrop,
+   sized to the text's own bbox, and `.chip` drops the now-redundant halo (which would only fatten
+   the text against its own backdrop). Near-white rather than a theme surface on purpose: the
+   canvas under it is the plan's white paper, and this palette has no dark variant. */
+.rack-label.chip { stroke: none; }
+.label-chip { fill: rgba(255, 255, 255, .92); stroke: var(--line); stroke-width: .5px;
+  pointer-events: none; }
+
 /* label move/rotate/resize handles (shared by both editors) — amber, like the
    rack handles. The label group's <text> is draggable only while being edited
    (pointer-events/cursor set inline by Editor.attachLabel). */
@@ -376,7 +812,7 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
 .swatch.on { outline: 2px solid var(--text); outline-offset: 2px; }
 
 /* Keep stroke weights constant as the viewport zooms (geometry still scales). */
-.grid-line, .room, .hotspot, .draft, .vertex, .snap-cursor,
+.grid-line, .room, .room-view-outlines .room-outline, .hotspot, .draft, .vertex, .snap-cursor,
 .ortho-guide, .ortho-corner, .arrow, .arrow-hit,
 .fm-overlay-point, .fm-overlay-line, .fm-overlay-polygon,
 .rack-marker .dev-body, .rack-marker .dev-line,
@@ -395,6 +831,86 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
 .snap-cursor.k-vertex { r: calc(7px * var(--inv-scale, 1)); }
 .fm-overlay-point     { r: calc(4px * var(--inv-scale, 1)); }
 
+/* Zoomed-out label legibility floor (READ-2). A label (and, for placements, its chip) rides an
+   inner `.label-scale` group; it shrinks with the map like everything else until it would drop
+   below --label-floor px on screen, then holds that size by counter-scaling with --inv-scale.
+   Scaling the whole group about its own centre keeps text + chip locked with no re-measure on
+   zoom. --label-base (the label's own font-size) and --label-floor are unitless so calc() yields
+   a plain number for scale(); Editor.attachLabel sets --label-base per label, and a rack's
+   box-bound `inside` name sets --label-floor:0 to opt out (it would overflow its box). */
+.label-scale {
+  transform-box: fill-box;
+  transform-origin: center;
+  transform: scale(max(1, calc(var(--label-floor, 8) / var(--label-base, 11) * var(--inv-scale, 1))));
+}
+
+/* Deep zoom-out (≈ the overview): the floored labels would pile into an unreadable carpet, so the
+   editor adds `.labels-lod` (below LABEL_LOD_SCALE) to hide them — the plan reads as an overview and
+   the labels return as you zoom into a room. The label being edited keeps drawing (`.lod-keep`). */
+.labels-lod .rack-label,
+.labels-lod .note-label,
+.labels-lod .arrow-label { display: none; }
+.labels-lod .label-grp.lod-keep .rack-label,
+.labels-lod .label-grp.lod-keep .note-label,
+.labels-lod .label-grp.lod-keep .arrow-label { display: inline; }
+
+/* The per-room hover "add a to-do" + (TASK-4, redesigned UX-5; FloorEditor._drawTodoAdd). Three
+   nested groups, one transform each — see `_drawTodoAdd` for why they can't be collapsed.
+   `_todoAddSpot` places and sizes the icon in *unzoomed layout px*, which is what keeps it from
+   drifting as the viewport zooms — see §10 To-do.
+
+   The outer group carries the position (a transform *attribute*) and this fade-in. The delay is
+   the cheap version of a dwell timer: `both` holds the icon invisible through it, so a pointer
+   merely crossing a room on its way somewhere else never flashes a +; it materializes once the
+   pointer settles. No timer state, and the animation restarts naturally because each hover builds
+   a fresh element. */
+.todo-add-anchor { animation: todo-add-in .16s ease-out .05s both; }
+@keyframes todo-add-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* Screen-constant like the node markers above, but a whole group rather than one circle, so it
+   counter-scales with a transform instead of an `r`. Resting opacity keeps it quiet while the eye
+   is scanning the map — it is chrome, not part of the plan — and full opacity is earned by
+   pointing at it. */
+.todo-add {
+  transform: scale(var(--inv-scale, 1));
+  /* Must be explicit. An SVG element's transform-box defaults to `view-box`, so the initial
+     `50% 50%` origin would resolve against the whole floor canvas rather than this group — the
+     icon would be flung across the map instead of scaling about the point it was placed at. */
+  transform-origin: 0 0;
+  cursor: pointer;
+  opacity: .6;
+  transition: opacity .12s ease-out;
+}
+.todo-add:hover { opacity: 1; }
+
+/* Sizing (`--todo-fit`, set inline from `spot.size`) and the grow-on-hover. Kept off the
+   `--inv-scale` group above so this transition fires on hover alone: a zoom moves that group's
+   transform, not this one, so the icon can never lag behind a zoom.
+   The grown icon can exceed the clearance `_todoAddSpot` fitted the resting size against, and may
+   touch a rack it was placed clear of. That is accepted: growth happens only under direct pointer
+   intent, on the one room already lit, and the resting state — the state you actually scan the map
+   in — always honours the clearance. */
+.todo-add-glyph {
+  transform: scale(calc(var(--todo-fit, 1) * var(--todo-grow, 1)));
+  transform-origin: 0 0;   /* same transform-box reason as above */
+  transition: transform .12s ease-out;
+}
+.todo-add:hover .todo-add-glyph { --todo-grow: 1.25; }
+
+/* Stroke widths are on the glyph's own 24-unit design grid, so they land at the familiar ~1.5/1.9
+   screen px once scaled to the resting fit. */
+.todo-add-disc { fill: var(--accent); stroke: #fff; stroke-width: 2; }
+.todo-add-bar { stroke: #fff; stroke-width: 2.5; stroke-linecap: round; pointer-events: none; }
+.todo-add:hover .todo-add-disc { fill: var(--accent-hover); }
+
+@media (prefers-reduced-motion: reduce) {
+  .todo-add-anchor { animation: none; }
+  .todo-add, .todo-add-glyph { transition: none; }
+}
+
 /* drawing aids */
 .grid-line { stroke: rgba(20,30,45,.10); stroke-width: 1; pointer-events: none; }
 .snap-cursor { fill: none; stroke: var(--warn); stroke-width: 2; pointer-events: none; }
@@ -406,20 +922,87 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
 .ortho-corner { stroke: var(--warn); stroke-width: 2; pointer-events: none; }
 
 /* ---- Building floor grid ---- */
+/* The floor-card gallery has two *orthogonal* controls (NAV-14, redesigned NAV-17), and each of the
+   four combinations earns a distinct purpose — all keyed here in CSS:
+     • layout  — grid (a centered multi-column auto-fit gallery) vs list (one full-width column).
+     • orient  — vertical (preview band on top, caption below) vs horizontal (preview left, caption right).
+   grid·vertical  = poster wall (many hero cards; the default) · list·vertical = showcase (one big
+   preview per row) · grid·horizontal = compact landscape cards (most floors on screen at once) ·
+   list·horizontal = scan rows (a large preview left + a compact label right). The View-menu size
+   slider seeds the tunable custom properties — `--floor-card-min` (column floor / preview width),
+   `--floor-card-height` (preview band/row height), plus the per-card `--preview-aspect` and floor
+   count `--n` — and CSS carries all the layout with no relayout logic (NAV-6); the literals below are
+   fallbacks. `min(100%, …)` keeps a single column from overflowing a narrow (mobile) viewport, and
+   `--n` caps the total width via a per-card ceiling (`--floor-card-max`) so a few floors don't stretch
+   to absurd widths on an ultra-wide monitor. In every mode `object-fit: contain` on a white band shows
+   the whole plan at its native aspect — never cropped or distorted — with any letterbox bars falling
+   white-on-white against the plan background, so invisible. */
 .floor-grid {
-  display: grid; gap: 16px; padding: 22px 24px;
-  grid-template-columns: repeat(auto-fill, minmax(236px, 1fr));
+  display: grid; gap: 16px; padding: 22px 24px; margin: 0 auto;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--floor-card-min, 340px)), 1fr));
+  width: var(--floor-grid-fill, 70%);
+  max-width: calc(var(--n, 4) * var(--floor-card-max, 560px));
 }
 .floor-card {
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-lg);
   overflow: hidden; cursor: pointer; transition: border-color .12s, box-shadow .12s;
 }
 .floor-card:hover { border-color: var(--accent); box-shadow: var(--shadow-card); }
-.floor-card img { width: 100%; height: 150px; object-fit: cover; display: block;
+.floor-card .cap { padding: 12px 16px; display: flex; flex-direction: column;
+  gap: 8px; min-width: 0; }
+.floor-card .cap b { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.floor-card .badges { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* Vertical orientation (NAV-13 hero): a full-width preview band on top, caption below, so the preview
+   is the centerpiece. The band height is the slider-driven `--floor-card-height`. Shared by
+   grid·vertical (the poster wall) and list·vertical (the showcase, widened below). */
+.floor-grid.orient-vertical .floor-card { display: flex; flex-direction: column; }
+.floor-grid.orient-vertical .floor-card img {
+  width: 100%; height: var(--floor-card-height, 200px); object-fit: contain; display: block;
   background: #fff; border-bottom: 1px solid var(--line2); }
-.floor-card .cap { padding: 11px 13px; display: flex; justify-content: space-between;
-  align-items: center; gap: 8px; }
-.floor-card .cap b { font-size: 13.5px; font-weight: 600; }
+
+/* Horizontal orientation: preview left, caption right. This is only the shared two-column skeleton +
+   common img chrome; the two `layout-*.orient-horizontal` blocks below tune it to opposite ends — a
+   compact multi-column card in grid, one big preview-left row in list — so the NAV-13 "keep it small"
+   caps now live *only* where density is the point (grid), not where a large preview is (list, NAV-17). */
+.floor-grid.orient-horizontal .floor-card { display: grid; grid-template-columns: auto 1fr; }
+.floor-grid.orient-horizontal .floor-card img {
+  object-fit: contain; display: block; background: #fff; border-right: 1px solid var(--line2); }
+.floor-grid.orient-horizontal .floor-card .cap { justify-content: center; }
+
+/* grid·horizontal — compact cards: short landscape cards packed multi-column, so more floors show at
+   once than the taller vertical hero. The row height rides the size slider but is damped (×0.55) and
+   capped (220px) so cards stay short/dense even at the top of the range (`--fc-h`); the preview width
+   follows that capped height and the plan's aspect, capped at 45% so the caption keeps its share; a
+   fixed 340px column floor keeps the gallery multi-column while the slider scales each card's height. */
+.floor-grid.layout-grid.orient-horizontal {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+}
+.floor-grid.layout-grid.orient-horizontal .floor-card {
+  --fc-h: clamp(88px, calc(var(--floor-card-height, 120px) * 0.55), 220px);
+  min-height: var(--fc-h);
+}
+.floor-grid.layout-grid.orient-horizontal .floor-card img {
+  width: clamp(90px, calc(var(--fc-h) * var(--preview-aspect, 1.4)), 45%);
+  height: var(--fc-h); }
+
+/* List layout: one full-width column instead of the auto-fit multi-column grid. The container just
+   carries the single-column concern + a max-width; each orientation refines it below. */
+.floor-grid.layout-list { grid-template-columns: 1fr; max-width: 720px; }
+/* list·vertical — showcase: a slightly wider column so the now-taller hero band (the slider reaches
+   600px) reads as one big full-width preview per row. */
+.floor-grid.layout-list.orient-vertical { max-width: 860px; }
+/* list·horizontal — scan rows (NAV-17): a **large preview left, compact label right**. The preview
+   takes 55% of the row and sizes to the plan's native aspect (`aspect-ratio`, so no letterbox and no
+   220px cap — the pre-NAV-13 caps are lifted here); the row max-width rides the size slider via
+   `--floor-card-min`, so dragging size up grows the whole row (and its preview) rather than a band. */
+.floor-grid.layout-list.orient-horizontal {
+  max-width: clamp(560px, calc(var(--floor-card-min, 480px) + 220px), 1200px);
+}
+.floor-grid.layout-list.orient-horizontal .floor-card { grid-template-columns: 55% 1fr; }
+.floor-grid.layout-list.orient-horizontal .floor-card img {
+  width: 100%; height: auto; aspect-ratio: var(--preview-aspect, 1.4); }
+
 .cnt { font-family: var(--mono); font-size: 10px; font-weight: 600;
   border-radius: 5px; padding: 2px 7px; }
 .cnt.mapped { color: var(--success); background: var(--success-bg); border: 1px solid var(--success-border); }
@@ -427,24 +1010,160 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
 .cnt.sheets { color: var(--accent); background: var(--accent-bg, rgba(6,111,209,.10)); border: 1px solid var(--accent); }
 .empty { color: var(--muted); padding: 30px; text-align: center; }
 
+/* Preview-off cards drop the preview and become a single info cell — orientation is a no-op with no
+   preview to arrange (FloorViewMenu adds `.no-preview` when the View menu's Floor-previews toggle is
+   off, or by the >15-floor default). With no preview to size around, the card shrinks to its text —
+   the img is hidden — and the grid switches to a centered wrap of content-sized cards
+   (`.no-previews`) instead of the auto-fit columns that would otherwise stretch each card wide. These
+   rules come **last** so they override whichever orientation/layout arrangement is active above. */
+.floor-card.no-preview img { display: none; }
+/* Preview-off horizontal cards collapse the two-column grid to a single info cell and drop any
+   row-height floor, so the card shrinks to its text in either layout. */
+.floor-grid.orient-horizontal .floor-card.no-preview { grid-template-columns: 1fr; min-height: 0; }
+.floor-grid.no-previews:not(.layout-list) {
+  display: flex; flex-wrap: wrap; justify-content: center;
+  grid-template-columns: none; max-width: none;
+}
+
+/* ---- Floor-list View menu (NAV-9) ---- */
+/* A toolbar dropdown of display options for the building floor grid. The button rides in the
+   toolbar; the popover is `position: fixed` (its top/right are computed from the button rect on
+   open) so it escapes the toolbar's `overflow-x: auto` clipping — an absolutely-positioned menu
+   would be cut off below the bar. Shown only while `.open`. */
+.view-menu-wrap { position: relative; display: inline-flex; }
+.view-menu { position: fixed; z-index: 30;
+  display: none; width: 240px; padding: 6px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--radius-lg); box-shadow: var(--shadow-card); }
+.view-menu.open { display: block; }
+.view-row { display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 7px 8px; font-size: 12.5px; color: var(--text); }
+.view-row span { min-width: 0; }
+.view-row input[type="checkbox"] { flex: 0 0 auto; }
+.view-row select { flex: 0 0 auto; background: var(--panel); border: 1px solid var(--border-strong);
+  border-radius: var(--radius); color: var(--text); font-family: inherit; font-size: 12.5px; padding: 3px 6px; }
+/* The "Card size" range slider + its live percent readout, right-aligned like the selects. */
+.view-slider-wrap { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+.view-slider { width: 96px; }
+.view-slider-val { font-family: var(--mono); font-size: 11px; color: var(--text2);
+  min-width: 34px; text-align: right; }
+.view-sep { height: 1px; margin: 6px 4px; background: var(--line2); }
+.view-row-action { justify-content: stretch; }
+.view-reset { flex: 1 1 auto; background: var(--panel); color: var(--text2);
+  border: 1px solid var(--border-strong); border-radius: var(--radius);
+  font-family: inherit; font-size: 12.5px; padding: 6px; cursor: pointer; }
+.view-reset:hover { border-color: var(--accent); color: var(--accent); }
+
 /* ---- Settings view ---- */
 .settings-view { max-width: 640px; margin: 24px auto; padding: 0 16px; }
 .settings-view h2 { font-size: 18px; margin: 0 0 16px; }
 .settings-view .settings-h3 { font-size: 14px; margin: 26px 0 10px;
   padding-top: 18px; border-top: 1px solid var(--line); }
 
+/* Tab strip above the category sections (SET-4): General / Add-ons. The selected tab gets the
+   plugin's shared accent-tint "active" treatment (see `button.active`) plus an accent underline
+   that overdraws the strip's bottom rule (SET-7). Built by SettingsPage from the descriptors'
+   `tab` field; the strip is omitted entirely when only one tab is visible. */
+.settings-tabs { display: flex; gap: 4px; margin: 0 0 4px;
+  border-bottom: 1px solid var(--line); }
+.settings-tab { padding: 8px 12px 6px; margin-bottom: -1px; cursor: pointer;
+  background: none; border: none; border-bottom: 2px solid transparent;
+  border-radius: var(--radius) var(--radius) 0 0;
+  color: var(--faint); font-family: inherit; font-size: 13px; font-weight: 600;
+  transition: background .1s, color .1s; }
+.settings-tab:hover { color: var(--text2); background: var(--panel2); }
+.settings-tab[aria-selected="true"] {
+  color: var(--accent); background: var(--accent-tint); border-bottom-color: var(--accent);
+}
+.settings-tab[aria-selected="true"]:hover { background: var(--accent-tint); }
+.settings-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* A panel's first section header would otherwise draw a second rule directly under the strip (or,
+   on a strip-less single-tab page, under the h2) — the strip already separates them. */
+.settings-panel .settings-h3:first-child { margin-top: 18px; padding-top: 0; border-top: none; }
+
 /* A setting row: label (+ hover-tooltip ⓘ) on the left, its control on the right. Built by
    SettingsPage from the descriptor registry — see settings-page.js. */
 .settings-row { display: flex; align-items: center; justify-content: space-between;
   gap: 16px; padding: 11px 0; border-bottom: 1px solid var(--line2); }
 .settings-row:last-child { border-bottom: none; }
+/* A row whose `enabled` predicate is false (SET-5): it still renders — so the operator sees what the
+   section offers and what to switch on to get it — but reads as unavailable. The controls carry a
+   real `disabled`, so this is only the visual half; the ⓘ tooltip deliberately keeps full contrast,
+   being the one part of a disabled row that still has something to say. */
+.settings-row.is-disabled .settings-label > span:first-child { opacity: .45; }
+.settings-row.is-disabled .settings-control { opacity: .45; }
 .settings-label { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13px; }
-.settings-control { flex: 0 0 auto; }
-/* A `select` descriptor's dropdown — styled to match the toolbar/facility-picker selects. */
-.settings-control .fm-select { height: 32px; padding: 0 8px; cursor: pointer; outline: none;
+/* flex so a `companion` descriptor's control sits beside the main one in the same cell. */
+.settings-control { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+/* A companion hidden by its `visible` predicate (SET-6 — the AP row's Configure button, shown only
+   while the add-on is on). Every control type here sets its own `display` (a button is inline-flex),
+   which beats the UA's `[hidden]` rule, so hiding one takes an explicit opt-out — the same reason
+   #panel-toggle[hidden] exists above. */
+.settings-control > [hidden] { display: none; }
+/* Text input / select box — shared primitives (like .fm-combo below), NOT scoped to
+   .settings-control: the AP-create modal (floor-editor.js) uses .fm-text at top level too, and a
+   bare native input would otherwise inherit NetBox's global form-control CSS instead of this
+   theme (see .fm-combo-input's comment for why that's undesirable). Default width fills the
+   containing .field; .settings-control narrows it to match its fixed-width row layout below. */
+.fm-select { height: 32px; padding: 0 8px; cursor: pointer; outline: none;
   background: var(--panel); color: var(--text2);
   border: 1px solid var(--border-strong); border-radius: var(--radius);
   font-family: inherit; font-size: 12.5px; }
+.fm-text { width: 100%; height: 32px; padding: 0 8px; outline: none;
+  background: var(--panel); color: var(--text2); font-family: inherit; font-size: 12.5px;
+  border: 1px solid var(--border-strong); border-radius: var(--radius); }
+.fm-text:focus { border-color: var(--accent); }
+.fm-select:disabled, .fm-text:disabled { cursor: not-allowed; }
+/* Settings rows mix .fm-select/.fm-text in a fixed-width control cell (see .settings-control
+   above), so both get the same fixed width here instead of the global 100%. Monospace: the AP
+   name template + its counter scope holds a {placeholder} template, not prose. */
+.settings-control .fm-select, .settings-control .fm-text { width: 200px; }
+.settings-control .fm-text { font-family: var(--mono); }
+
+/* Reference list on a settings sub-page (SET-6): term ⟷ explanation, rendered under the rows it
+   documents by ApSettingsPage._sections (the AP name placeholders and counter scopes). This is the
+   content a one-line row tooltip couldn't hold, and having somewhere to put it is why the sub-page
+   exists. A two-column grid keeps the terms a scannable left rail, stacking when the column would
+   crowd the prose. */
+.settings-ref { display: grid; grid-template-columns: max-content 1fr; gap: 9px 14px;
+  margin: 0; font-size: 12.5px; }
+.settings-ref dt { color: var(--text2); font-weight: 600; }
+.settings-ref dt code { font-family: var(--mono); font-size: 12px; }
+.settings-ref dd { margin: 0; color: var(--muted); line-height: 1.5; }
+@media (max-width: 520px) {
+  .settings-ref { grid-template-columns: 1fr; gap: 3px 0; }
+  .settings-ref dd { margin: 0 0 9px; }
+}
+
+/* Searchable single-select (Combo, lib.js): an input plus an absolutely-positioned result list.
+   The wrapper is the positioning context; the list is hidden until JS adds `.open`.
+
+   Deliberately NOT scoped under .settings-control: Combo is a shared primitive, with a second
+   caller coming in the floor editor (DEV-1), so its styling has to travel with it. Its input is fully
+   painted here rather than left native — a bare control inside a NetBox page inherits NetBox's
+   global form-control CSS (§10 theming, IMPORT-7). */
+.fm-combo { position: relative; display: inline-flex; align-items: center; }
+.fm-combo-input { width: 200px; height: 32px; padding: 0 24px 0 8px; outline: none;  /* right pad: room for the ✕ */
+  background: var(--panel); color: var(--text2);
+  border: 1px solid var(--border-strong); border-radius: var(--radius);
+  font-family: inherit; font-size: 12.5px; }
+.fm-combo-input:focus { border-color: var(--accent); }
+.fm-combo-clear { position: absolute; right: 4px; width: 18px; height: 18px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: none; border-radius: 4px; cursor: pointer;
+  color: var(--faint); font-size: 11px; line-height: 1; }
+.fm-combo-clear:hover:not(:disabled) { color: var(--danger); background: rgba(224,83,61,.14); }
+/* Gated-off (Combo.setDisabled, SET-5) — the dimming comes from the row; these only stop the two
+   controls reading as usable. */
+.fm-combo-input:disabled, .fm-combo-clear:disabled { cursor: not-allowed; }
+.fm-combo-list { display: none; position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+  z-index: 40; max-height: 220px; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--border-strong);
+  border-radius: var(--radius); box-shadow: var(--shadow); }
+.fm-combo-list.open { display: block; }
+.fm-combo-opt { padding: 6px 9px; cursor: pointer; font-size: 12.5px; color: var(--text2); }
+.fm-combo-opt:hover, .fm-combo-opt.active { background: var(--accent-tint); }
+.fm-combo-opt.picked { color: var(--accent); font-weight: 600; }
+.fm-combo-empty { padding: 6px 9px; font-size: 12.5px; color: var(--muted); }
 
 /* Info glyph + hover/focus tooltip (replaces the always-on .hint under each control). The
    bubble is placed by the Tooltip helper (lib.js): position:fixed with JS-set left/top so it
@@ -468,13 +1187,17 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
 .fm-switch { position: relative; width: 40px; height: 22px; padding: 0; flex: 0 0 auto;
   background: var(--neutral-bg); border: 1px solid var(--border-strong); border-radius: 999px;
   cursor: pointer; transition: background .15s, border-color .15s; }
-.fm-switch:hover { background: var(--neutral-bg); }
+.fm-switch:hover:not(:disabled) { background: var(--neutral-bg); }
 .fm-switch .fm-switch-knob { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
   background: #fff; border-radius: 50%; box-shadow: var(--shadow); transition: transform .15s; }
 .fm-switch[aria-checked="true"] { background: var(--accent); border-color: var(--accent); }
-.fm-switch[aria-checked="true"]:hover { background: var(--accent-hover); }
+.fm-switch[aria-checked="true"]:hover:not(:disabled) { background: var(--accent-hover); }
 .fm-switch[aria-checked="true"] .fm-switch-knob { transform: translateX(18px); }
 .fm-switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* A gated-off switch (an `enabled`-false row, SET-5). `:hover` still matches a disabled button, so
+   the hover rules above opt out rather than being overridden here. The row's `.is-disabled` supplies
+   the dimming — this only has to stop the control reading as pressable. */
+.fm-switch:disabled { cursor: not-allowed; }
 
 /* Destructive-confirm modal (backup restore) — a compact centered dialog mirroring
    the import lightbox overlay. */
@@ -485,6 +1208,9 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
 .fm-modal-panel h3 { font-size: 16px; margin: 0 0 12px; }
 .fm-modal-panel p { margin: 0 0 12px; font-size: 13px; line-height: 1.5; }
 .fm-modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+/* A rejected submit shown inside the dialog (the AP tool's duplicate name/asset tag), so the
+   form can be corrected in place. Distinct from .hint, which is muted by design. */
+.fm-modal-error { color: var(--danger); font-size: 12px; margin: 8px 0 0; }
 
 /* ---- Side panel ---- */
 #panel {
@@ -524,6 +1250,16 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
   font-size: 14px; line-height: 1; padding: 4px 6px; border-radius: 4px;
 }
 .room-item .ri-remove:hover { color: var(--danger); background: rgba(224,83,61,.14); }
+/* Contextual "create new room" tile in the bind results (LOC-2): a create affordance, not a
+   clickable bind row — a dashed accent border sets it apart, and it holds a name field + button
+   rather than a plain label. Shown when write mode is on and the search found few/no matches. */
+.room-item.create-tile { cursor: default; border-style: dashed; border-color: var(--accent);
+  background: var(--panel); }
+.room-item.create-tile:hover { border-color: var(--accent); }
+.room-item.create-tile .nm { display: flex; align-items: center; gap: 6px; }
+.room-item.create-tile .field { display: flex; gap: 6px; margin: 8px 0 0; }
+.room-item.create-tile .field input { flex: 1; min-width: 0; }
+.room-item.create-tile .field button.wide { width: auto; margin: 0; flex: none; }
 
 /* label-edit panel controls (font/size/rotation/colour) */
 .label-ctl { width: 100%; height: 32px; padding: 0 8px;
@@ -542,6 +1278,11 @@ textarea.label-ctl { height: auto; padding: 8px; line-height: 1.4; resize: verti
 .hint { color: var(--muted); font-size: 12px; margin: 8px 0; }
 .row { display: flex; gap: 8px; }
 .row > * { flex: 1; }
+/* Give a button-row inside a side panel the same 6px bottom rhythm as button.wide, so a
+   .row followed by stacked .wide buttons (e.g. the floor editor's bind-room panel) keeps an
+   even vertical gap instead of butting flush against the first wide button. Scoped to
+   #panel-body so it never touches the Bootstrap .row grid on other NetBox pages. */
+#panel-body .row { margin-bottom: 6px; }
 .check { display: flex; align-items: flex-start; gap: 8px; margin: 12px 0;
   font-size: 13px; cursor: pointer; }
 .check input { margin-top: 2px; }
@@ -645,6 +1386,15 @@ button.wide { width: 100%; margin-bottom: 6px; justify-content: center; }
   text-transform: none; letter-spacing: 0; }
 .imp-field .imp-field-err:empty { display: none; }
 .imp-auto { margin-left: auto; }
+/* Bulk-triage cluster (IMPORT-9): dispatch many floor cards to "(none)" at once. Its own full-width
+   sub-row of the building header so the name/slug fields stay uncrowded; wraps on narrow screens. */
+.imp-bulk { flex-basis: 100%; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding-top: 10px; border-top: 1px dashed var(--line2); }
+.imp-bulk-label { color: var(--muted); font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .05em; }
+.imp-bulk-range { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.imp-bulk-num { width: 4.5em; height: 28px; padding: 0 6px; background: var(--panel); color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: var(--radius); font-family: inherit; font-size: 12.5px; }
 .imp-sizer { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
 .imp-sizer span { color: var(--muted); font-size: 11px; font-weight: 600;
   text-transform: uppercase; letter-spacing: .05em; }
@@ -746,6 +1496,13 @@ button.wide { width: 100%; margin-bottom: 6px; justify-content: center; }
 /* Grouping step (MULTI-3): each option is a clickable .imp-bind card wrapping a radio; the
    chosen one is highlighted like a focused hub row. */
 .imp-grouping-opt { cursor: pointer; }
+/* The bind-step input rule (`:not([type=radio])`) leaves this radio unstyled, so embedded in
+   NetBox it inherits the host's global form-control CSS — which paints a tall bordered box over
+   the native control (IMPORT-7). Restore the native radio, constrain its box, and tint it to the
+   accent so the option cards render cleanly. */
+.imp-grouping-opt input[type=radio] { appearance: auto; -webkit-appearance: radio;
+  flex: 0 0 auto; width: 15px; height: 15px; min-width: 0; min-height: 0; margin: 0; padding: 0;
+  border: none; border-radius: 0; background: none; box-shadow: none; accent-color: var(--accent); }
 .imp-bind.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
 /* Code-region pick: drag a box over the identifying code on a sample drawing. The viewport
    scrolls (scroll to pan) and the −/Fit/+ bar widens the canvas to zoom. */
@@ -778,6 +1535,28 @@ button.wide { width: 100%; margin-bottom: 6px; justify-content: center; }
 .imp-floor.imp-floor-split:hover { color: var(--accent); border-color: var(--accent); }
 .imp-region-count { font-size: 12.5px; }
 .imp-region-count.warn { color: var(--warn); font-weight: 600; }
+/* Align-overlay editor (FMT-6): the floor's combined canvas as one SVG (sheet images + the
+   overlay's features + control-point pins), in the region editors' scrollable/zoomable viewport.
+   Geometry (radii, stroke widths, font size) is set inline in layout units — the canvas can be
+   thousands of px wide, so fixed pixel sizes would vanish; these rules carry colour only. The
+   overlay purple matches the floor view's .fm-overlay-* family so the layer reads as the same
+   data; pins use the accent blue of the region boxes. */
+.imp-align-svg { display: block; width: 100%; height: auto; user-select: none; }
+.imp-align-feat { fill: rgba(124, 92, 255, .16); stroke: #7c5cff; }
+circle.imp-align-feat { fill: #7c5cff; fill-opacity: .85; stroke: none; }
+polyline.imp-align-feat { fill: none; }
+.imp-align-link { stroke: var(--accent, #2f80ed); stroke-dasharray: 4 3; }
+.imp-align-tail { fill: none; stroke: var(--accent, #2f80ed); stroke-width: 2; }
+.imp-align-head { fill: var(--accent, #2f80ed); fill-opacity: .9; stroke: #fff;
+  stroke-width: 2; cursor: grab; }
+.imp-align-num { fill: var(--accent, #2f80ed); font-weight: 700; paint-order: stroke;
+  stroke: #fff; stroke-width: 3px; pointer-events: none; }
+.imp-align-status { font-size: 12.5px; color: var(--muted); margin: 0 0 8px; }
+.imp-align-status.ok { color: var(--success); font-weight: 600; }
+/* Overlay card affordance: placement state + the "Align on plan…" jump. */
+.imp-align-row { display: flex; align-items: center; gap: 10px; }
+.imp-align-state { font-size: 12.5px; color: var(--muted); }
+.imp-align-state.ok { color: var(--success); font-weight: 600; }
 /* A card thumbnail cropped to just the drawing's identifying code (see `_codeCropThumb`). The
    box height follows the crop's aspect ratio (set inline on image load); the <img> is widened
    and translated by inline % styles so the region fills the box. Click opens the full drawing. */

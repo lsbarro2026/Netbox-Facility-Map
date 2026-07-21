@@ -102,6 +102,25 @@ def test_create_room(editor_user):
     assert room.polygon == [[0, 0], [1, 0], [1, 1]]
 
 
+def test_alias_exposed_and_writable(editor_user):
+    # The NAV-18 search-terms field is a durable REST-writable field like `label` — read on detail,
+    # settable via PATCH on an editor-owned room.
+    from netbox_facilitymap.models import Room
+    # A durable REST write targets an editor-drawn room, so it carries a polygon (a blank polygon
+    # trips the serializer's own required-field check on PATCH, independent of alias).
+    room = Room.objects.create(floor_key=FLOOR, room_id='r1', label='IDF-2A', alias='2107',
+                               polygon=[[0, 0], [1, 0], [1, 1]])
+
+    r = _api(editor_user).get(reverse(DETAIL_URL, kwargs={'pk': room.pk}))
+    assert r.status_code == 200 and r.data['alias'] == '2107'
+
+    r = _api(editor_user).patch(reverse(DETAIL_URL, kwargs={'pk': room.pk}),
+                                {'alias': '2107, Old Server Room'}, format='json')
+    assert r.status_code == 200
+    room.refresh_from_db()
+    assert room.alias == '2107, Old Server Room'
+
+
 # ---- permission gate ----
 
 def test_list_denied_without_view_permission(plain_user):

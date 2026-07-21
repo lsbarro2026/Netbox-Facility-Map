@@ -37,26 +37,35 @@
         Spotlight: on the cropped single-room embed, dim the floor outside the room's own
         polygon so it's unambiguous which room you're on (the zoomed crop shows neighbouring
         rooms in the raster image). A full-canvas dark rect, masked to a hole the shape of the
-        room. Only `spotlight` (the scaled room points) is set when cropping; the whole-floor
+        room. Only `spotlight` (the room's scaled path `d`) is set when cropping; the whole-floor
         view never dims. Drawn over the sheets but under the green highlight + markers.
+        The lit hole is an evenodd `<path>` (not a plain polygon): its outer contour is the
+        room, and any smaller room contained within it is punched out as an inner contour — so
+        that contained area stays masked (dimmed), reading as "not part of this room".
       {% endcomment %}
       {% if spotlight %}
         <defs>
           <mask id="room-spotlight">
             <rect x="0" y="0" width="{{ vw }}" height="{{ vh }}" fill="#fff"/>
-            <polygon points="{{ spotlight }}" fill="#000"/>
+            <path d="{{ spotlight }}" fill="#000" fill-rule="evenodd"/>
           </mask>
         </defs>
         <rect x="0" y="0" width="{{ vw }}" height="{{ vh }}"
               fill="#000" opacity="0.45" mask="url(#room-spotlight)"/>
       {% endif %}
+      {% comment %}
+        Each room's highlight is an evenodd `<path>`: outer contour = the room's polygon, inner
+        contour(s) = any contained smaller room, punched out so the larger room's translucent
+        fill doesn't double-paint over it. A room with no contained sibling is a single closed
+        contour — evenodd ≡ nonzero there, so it renders exactly as the old `<polygon>` did.
+      {% endcomment %}
       {% for s in shapes %}
         {% if s.url %}<a href="{{ s.url }}" target="_blank">{% endif %}
-        <polygon points="{{ s.points }}"
-                 fill="#2fa84f22" stroke="#2fa84f"
-                 stroke-width="2" vector-effect="non-scaling-stroke">
+        <path d="{{ s.path }}"
+              fill="#2fa84f22" fill-rule="evenodd" stroke="#2fa84f"
+              stroke-width="2" vector-effect="non-scaling-stroke">
           <title>{{ s.label }}</title>
-        </polygon>
+        </path>
         {% if s.url %}</a>{% endif %}
       {% endfor %}
       {% include 'netbox_facilitymap/inc/placement_markers.html' %}

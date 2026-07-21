@@ -28,7 +28,7 @@ Three modes:
            folders + drawings to stdout (the wizard's mapping step reads this).
   build    read import-map.json, render every mapped PDF to images/<slug>/<id>[-N].webp
            (lossless, plus a card-sized <id>.thumb.webp per floor), and write manifest.json
-           (the default mode).
+           (the default mode). `--scale` raises how finely vector sources rasterize.
   preview  render one named PDF at full scale to --out (the wizard's on-demand high-res
            preview, served from a .thumbs cache).
 
@@ -36,7 +36,7 @@ Rendering needs `pypdfium2` + `Pillow`. The working directory is passed explicit
 data can live under NetBox's MEDIA_ROOT while this script lives in the package:
 
   python3 preprocess.py scan  --base /path/to/workdir
-  python3 preprocess.py build --base /path/to/workdir
+  python3 preprocess.py build --base /path/to/workdir [--scale 1.5]
   python3 preprocess.py preview --base /path/to/workdir --pdf uploads/A/1.pdf --out uploads/.thumbs/A/1.full.png
 """
 
@@ -59,7 +59,12 @@ import drawing_formats  # noqa: E402
 
 class Preprocessor:
     """Renders uploads/ + import-map.json into images/ and manifest.json, all relative
-    to a single working directory (``base_dir``)."""
+    to a single working directory (``base_dir``).
+
+    ``quality`` is the operator's render-quality multiplier (``--scale``, 1.0 = standard). It
+    applies to the **build** only — the artifacts the map actually serves. The wizard's grid
+    thumbnails and its on-demand `preview` deliberately stay at standard scale: they exist to
+    *identify* a plan, and `preview` is an interactive request that shouldn't spike memory."""
 
     THUMBS_DIRNAME = ".thumbs"
     IMAGE_EXT = ".webp"  # build output format: lossless WebP is pixel-identical to PNG at
@@ -67,28 +72,38 @@ class Preprocessor:
                          # first-paint asset). Pre-existing .png renders keep serving — the
                          # manifest stores filenames, so the format only changes on rebuild.
 
-    def __init__(self, base_dir):
+    def __init__(self, base_dir, quality=1.0):
         self.base_dir = base_dir
+        self.quality = quality
         self.source = os.path.join(base_dir, "uploads")
         self.images_dir = os.path.join(base_dir, "images")
         self.manifest_path = os.path.join(base_dir, "manifest.json")
         self.import_map_path = os.path.join(base_dir, "import-map.json")
         self.stub_path = os.path.join(base_dir, "import-map.stub.json")
+        # Per-build render diagnostics, tallied across every sheet and reset at the top of
+        # `build()`: sheets whose render failed outright (dropped), and high-quality sheets whose
+        # scale the pixel cap clamped below the requested quality. `build()` emits them as a
+        # machine-readable RENDER-SUMMARY line so `imports.RenderRunner` can surface HQ memory
+        # constraints to the user (HEALTH-3) instead of losing them in stderr WARN noise.
+        self._unrendered = 0
+        self._hq_clamped = 0
 
     # ---- drawing rendering (dispatched through the drawing_formats registry) ----
     @staticmethod
-    def render_full(path, fmt="WEBP", page=0, angle=0):
+    def render_full(path, fmt="WEBP", page=0, angle=0, quality=1.0):
         """Render a drawing to encoded image bytes at full scale — a given 0-based `page` of a PDF
         (default the first) or the first frame of a raster image, via the format registry. `fmt` is
         the output encoding: WEBP for build artifacts, PNG for the wizard's `.full.png` preview
         cache. `angle` is a clockwise straightening rotation in degrees (0 = as-is), applied as a
         post-render step so every format handler stays angle-unaware — a scanned drawing that
-        arrived rotated is reoriented here before it becomes floor content. Returns (raw, w, h), or
-        None when the format is unknown, the decoder is missing, or the file can't be rendered."""
+        arrived rotated is reoriented here before it becomes floor content. `quality` is the
+        render-quality multiplier from `--scale` (1.0 = standard), honoured by the vector formats
+        and bounded by each handler's own pixel cap. Returns (raw, w, h), or None when the format is
+        unknown, the decoder is missing, or the file can't be rendered."""
         handler = drawing_formats.format_for(path)
         if handler is None or handler.role != drawing_formats.BASE_RASTER:
             return None
-        res = handler.render_full(path, fmt, page=page)
+        res = handler.render_full(path, fmt, page=page, quality=quality)
         if res is None or angle % 360 == 0:
             return res
         return Preprocessor._rotate_encoded(res[0], angle, fmt)
@@ -177,16 +192,39 @@ class Preprocessor:
         return handler is not None and handler.role == drawing_formats.OVERLAY
 
     @staticmethod
-    def extract_overlay(path):
-        """Parse an OVERLAY-role data source into normalized-0..1 features via the format registry
-        — the counterpart to `render_full` for the overlay tier. Returns the feature list, or None
-        when the extension isn't an OVERLAY format, the parser is missing, or the file can't be
-        decoded. Runs only here in the render subprocess (the parser is untrusted-input territory,
-        like the raster decoders)."""
+    def extract_overlay(path, align=None):
+        """Parse an OVERLAY-role data source into its manifest overlay payload via the format
+        registry — the counterpart to `render_full` for the overlay tier. `align` is the layer's
+        optional control-point georeference pairs (the import map's `overlayAlign` entry, FMT-6);
+        without them the layer is placed fit-to-bounds. Returns the handler's
+        `{"features", "georeferenced", "crs", "srcTransform"}` dict, or None when the extension
+        isn't an OVERLAY format, the parser is missing, or the file can't be decoded. Runs only
+        here in the render subprocess (the parser is untrusted-input territory, like the raster
+        decoders)."""
         handler = drawing_formats.format_for(path)
         if handler is None or handler.role != drawing_formats.OVERLAY:
             return None
-        return handler.extract_overlay(path)
+        return handler.extract_overlay(path, align)
+
+    @staticmethod
+    def _hq_constrained(handler, quality, w, h):
+        """True when a high-quality render (``quality`` > 1.0) was clamped by the handler's pixel
+        cap — the sheet was too large to render at the requested quality, so it silently came out
+        *below* it (READ-1 / HEALTH-3). This is the reliable, deterministic "HQ could not be
+        delivered" signal: a per-sheet out-of-memory is by contrast indistinguishable from a
+        corrupt source (both just fail the render), so we never guess at it here.
+
+        Scoped to the PDF handler on purpose. Only a **scale-clamped vector** handler (PDF: scale =
+        ``RENDER_SCALE`` × quality, then lowered to fit ``MAX_IMAGE_PX`` in `PdfFormat._render_scale`)
+        loses quality *to the cap*. A raster ignores ``quality`` entirely — there is no more detail
+        to extract — so a big scan hitting its own downscale cap is not an HQ constraint and must not
+        be counted. ``RENDER_SCALE`` is PdfFormat-only, so it's the gate that tells the two apart."""
+        if not quality or quality <= 1.0:
+            return False
+        cap = getattr(handler, "MAX_IMAGE_PX", None)
+        if not cap or not hasattr(handler, "RENDER_SCALE"):
+            return False
+        return max(w, h) >= cap - 1
 
     @staticmethod
     def _render_hint(path):
@@ -375,6 +413,21 @@ class Preprocessor:
         wizard-resolved ``labels`` entry (see `lmap`) over the ``floor_label(token)`` guess.
         Returns (building, unmapped_stems)."""
         slug, abbr = entry["slug"], entry.get("abbr", "")
+        # Building anchor (MODEL-3): an optional building **Location** slug when this building is a
+        # Location under a campus Site (Site != building), None for the Site-anchored case (today).
+        # Guarded to a strict slug because it becomes a directory-name segment below — a hostile
+        # value can't traverse out of `images/`. When set, the building nests one level deeper:
+        # `rel_dir = "<site slug>/<building slug>"`, which both nests the floor images at
+        # `images/<siteSlug>/<buildingSlug>/…` (so two buildings under one campus never clobber each
+        # other) and — because the manifest `dir` is what the frontend/consumers turn into a
+        # `floor_key` (`"<dir>/<floorId>"`) — makes those keys the 3-segment Location-anchored shape.
+        # `siteSlug` stays the **pure** site slug (the SEC-1 media gate + Site filtering key off it).
+        building_slug = entry.get("buildingSlug") or None
+        if building_slug and not re.fullmatch(r"[-\w]+", building_slug):
+            print("  WARN %s: ignoring invalid buildingSlug %r (not a slug)"
+                  % (folder, building_slug), file=sys.stderr)
+            building_slug = None
+        rel_dir = "%s/%s" % (slug, building_slug) if building_slug else slug
         fmap = entry.get("floors", {})
         # Straightening rotation per drawing, keyed by *page* (bare `stem`, or `stem#pN` for an
         # exploded page). Absent/0 = render as-is, so an old import map (no `angles`) is unchanged.
@@ -387,6 +440,13 @@ class Preprocessor:
         # falls back to `floor_label(token)` as before — an old import map (no `labels`) or a
         # floor-type token (no bound Location) is unaffected.
         lmap = entry.get("labels", {})
+        # Control-point georeference pairs per overlay drawing (FMT-6), keyed by drawing stem.
+        # Absent/empty = every overlay stays fit-to-bounds, so an old import map is unchanged;
+        # a malformed (non-dict) value is ignored the same way (the pairs themselves are
+        # sanitized downstream by OverlayProjector).
+        align_map = entry.get("overlayAlign", {})
+        if not isinstance(align_map, dict):
+            align_map = {}
         groups, index, unmapped, flabel = [], {}, [], {}
         for stem, fname in self.drawing_files(folder):
             entries = self._page_entries(stem, fmap)
@@ -432,12 +492,22 @@ class Preprocessor:
                 key = (fname, page, angle)
                 full = page_cache.get(key)
                 if full is None:
-                    full = self.render_full(os.path.join(self.source, folder, fname),
-                                            page=page, angle=angle)
+                    src = os.path.join(self.source, folder, fname)
+                    full = self.render_full(src, page=page, angle=angle, quality=self.quality)
                     if full is None:
+                        self._unrendered += 1
                         print("  WARN %s %s: %s" % (folder, fname, self._render_hint(fname)),
                               file=sys.stderr)
                         continue
+                    # Tally, once per physical render (never a region-split cache reuse), a
+                    # high-quality sheet the pixel cap clamped below the requested quality — the
+                    # deterministic "HQ couldn't be delivered here" signal build() reports upward.
+                    handler = drawing_formats.format_for(src)
+                    if self._hq_constrained(handler, self.quality, full[1], full[2]):
+                        self._hq_clamped += 1
+                        print("  WARN %s %s: high-quality render clamped to the %dpx size cap "
+                              "(rendered below the requested quality)"
+                              % (folder, fname, handler.MAX_IMAGE_PX), file=sys.stderr)
                     if region is not None:  # only a region-split page is re-used; cache it once
                         page_cache[key] = full
                 if region is None:
@@ -452,7 +522,7 @@ class Preprocessor:
                 if not pages:
                     p0_raw = raw   # first *rendered* page backs the floor's card thumbnail
                 pid = fid if n == 1 else "%s-%d" % (fid, n)
-                sheet = {"image": self.write_image(slug, pid, raw),
+                sheet = {"image": self.write_image(rel_dir, pid, raw),
                          "w": w, "h": h, "caption": None}
                 # Record a non-zero straightening angle so re-opening the wizard can tell a floor
                 # was reoriented (the room-desync guard compares against it); omitted when 0 so
@@ -471,17 +541,25 @@ class Preprocessor:
                 "floorSlug": fid, "image": p0["image"], "w": p0["w"], "h": p0["h"],
                 "pages": pages,
             }
-            thumb = self.write_floor_thumb(slug, fid, p0_raw)
+            thumb = self.write_floor_thumb(rel_dir, fid, p0_raw)
             if thumb:
                 floor["thumb"] = thumb
             overlays = []
             for fname in overlay_fnames:
-                feats = self.extract_overlay(os.path.join(self.source, folder, fname))
-                if feats is None:
+                stem = os.path.splitext(fname)[0]
+                # The extract returns the whole manifest overlay payload: `features` plus
+                # `georeferenced`/`crs`/`srcTransform` (see OverlayProjector). `georeferenced`
+                # is True only when the operator's `overlayAlign` control points (FMT-6) drove
+                # the placement — fit-to-bounds stays False, keeping the frontend's
+                # approximate-alignment warnings; `srcTransform` is what the wizard's align
+                # editor inverts to place those control points.
+                res = self.extract_overlay(os.path.join(self.source, folder, fname),
+                                           align=align_map.get(stem))
+                if res is None:
                     print("  WARN %s %s: %s" % (folder, fname, self._render_hint(fname)),
                           file=sys.stderr)
                     continue
-                overlays.append({"name": os.path.splitext(fname)[0], "features": feats})
+                overlays.append({"name": stem, **res})
             if overlays:
                 floor["overlays"] = overlays
             floors.append(floor)
@@ -489,8 +567,13 @@ class Preprocessor:
         print("%-26s slug=%-12s floors=%s%s" % (
             folder, slug, ",".join(f["id"] for f in floors) or "(none)",
             "  UNMAPPED: " + ",".join(unmapped) if unmapped else ""), file=sys.stderr)
-        return {"code": code, "dir": slug, "name": entry.get("name", folder),
-                "folder": folder, "siteSlug": slug, "floors": floors}, unmapped
+        building = {"code": code, "dir": rel_dir, "name": entry.get("name", folder),
+                    "folder": folder, "siteSlug": slug, "floors": floors}
+        # Record the building-anchor slug only for a Location-anchored building, so Site-anchored
+        # manifests stay byte-identical to older builds (readers treat `buildingSlug` as optional).
+        if building_slug:
+            building["buildingSlug"] = building_slug
+        return building, unmapped
 
     def build_siteplan_from_pdf(self, imap):
         """Render the drawing named in import-map.json's `siteplan` block as the siteplan
@@ -502,11 +585,16 @@ class Preprocessor:
             return None
         src = os.path.join(self.source, sp.get("folder", ""), sp["pdf"])
         angle = sp.get("angle", 0)
-        res = self.render_full(src, angle=angle)
+        res = self.render_full(src, angle=angle, quality=self.quality)
         if res is None:
+            self._unrendered += 1
             print("  WARN could not render siteplan drawing:", src, file=sys.stderr)
             return None
         raw, w, h = res
+        if self._hq_constrained(drawing_formats.format_for(src), self.quality, w, h):
+            self._hq_clamped += 1
+            print("  WARN siteplan %s: high-quality render clamped to the size cap "
+                  "(rendered below the requested quality)" % src, file=sys.stderr)
         image = self.write_image("Siteplan", "siteplan", raw)
         print("siteplan: %dx%d, 0 hotspots (draw building boundaries in the tool)"
               % (w, h), file=sys.stderr)
@@ -562,6 +650,7 @@ class Preprocessor:
         imap = self.load_import_map()
         if not imap:
             sys.exit("No import-map.json — nothing to build.")
+        self._unrendered = self._hq_clamped = 0   # per-build render diagnostics (see RENDER-SUMMARY)
         lookup = self.building_lookup(imap)
         siteplan = self.build_siteplan_from_pdf(imap)
         buildings, unmapped = [], {}
@@ -582,6 +671,15 @@ class Preprocessor:
         print("Wrote %s — buildings: %d, floors: %d"
               % (self.manifest_path, len(buildings),
                  sum(len(b["floors"]) for b in buildings)), file=sys.stderr)
+        # Machine-readable render diagnostics for `imports.RenderRunner` to parse and surface: how
+        # many sheets couldn't render at all, and how many high-quality sheets the size cap clamped
+        # below full quality. On stderr (stdout is scan's inventory channel) as the final line, so a
+        # human log stays readable while the caller keys off the `RENDER-SUMMARY ` prefix (HEALTH-3).
+        print("RENDER-SUMMARY " + json.dumps({
+            "hq": self.quality > 1.0,
+            "unrendered": self._unrendered,
+            "hq_clamped": self._hq_clamped,
+        }), file=sys.stderr)
 
     def write_manifest(self, payload):
         """Write manifest.json atomically (`.part` + `os.replace`), like `preview()`. The plain
@@ -599,7 +697,9 @@ class Preprocessor:
 def _parse_args(argv):
     """Tiny argv parser (argparse-free to keep the child minimal): a bare
     `scan`/`build`/`preview` mode plus an optional `--base <dir>` (falls back to
-    $FACILITYMAP_WORKDIR, then the script's own directory). `preview` also takes
+    $FACILITYMAP_WORKDIR, then the script's own directory). `build` also takes an optional
+    `--scale <multiplier>` (default 1.0 = standard; the `render_hq` setting sends 1.5), which
+    scales how finely vector sources rasterize. `preview` also takes
     `--pdf <uploads-relative.pdf>`, `--out <base-relative.png>`, an optional
     `--page <0-based-index>` (default the first page, for a multi-page PDF), and an optional
     `--angle <clockwise-degrees>` (default 0, straightens a rotated scan)."""
@@ -608,7 +708,7 @@ def _parse_args(argv):
     opts = {}
     i = 0
     while i < len(argv):
-        if argv[i] in ("--base", "--pdf", "--out", "--page", "--angle") and i + 1 < len(argv):
+        if argv[i] in ("--base", "--pdf", "--out", "--page", "--angle", "--scale") and i + 1 < len(argv):
             key = argv[i][2:]
             if key == "base":
                 base = argv[i + 1]
@@ -625,7 +725,13 @@ def _parse_args(argv):
 
 if __name__ == "__main__":
     mode, base, opts = _parse_args(sys.argv[1:])
-    pre = Preprocessor(base)
+    # A malformed/non-positive --scale falls back to standard rather than failing the import: the
+    # value is an operator convenience, not something worth losing a whole build over.
+    try:
+        quality = float(opts.get("scale", 1.0))
+    except ValueError:
+        quality = 1.0
+    pre = Preprocessor(base, quality=quality if quality > 0 else 1.0)
     if mode == "scan":
         pre.scan()
     elif mode == "build":

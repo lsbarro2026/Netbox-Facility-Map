@@ -96,6 +96,79 @@ def test_build_writes_manifest_and_images(tmp_path, make_pdf):
     assert not (tmp_path / 'manifest.json.part').exists()
 
 
+def test_build_location_anchored_building_nests_dir_and_images(tmp_path, make_pdf):
+    """A **Location-anchored** building (Site=campus, building is a Location — MODEL-3) carries a
+    `buildingSlug` in its import-map entry. The build then nests the manifest `dir` and the floor
+    images one level deeper (`<siteSlug>/<buildingSlug>`), so the floor's `floor_key` (== `dir/id`)
+    is the 3-segment Location-anchored shape and two buildings under one campus never collide on
+    disk. `siteSlug` stays the **pure** site slug (the SEC-1 media gate keys off it)."""
+    _write_pdf(tmp_path / 'uploads' / 'AlphaWing' / 'ground.pdf', make_pdf())
+    (tmp_path / 'import-map.json').write_text(json.dumps({
+        'buildings': {
+            'AlphaWing': {'slug': 'campus', 'buildingSlug': 'alpha-bldg', 'name': 'Alpha Wing',
+                          'abbr': 'AB', 'floors': {'ground': 'g'}},
+        },
+    }))
+
+    proc = _run('build', tmp_path)
+    assert proc.returncode == 0, proc.stderr
+
+    (building,) = json.loads((tmp_path / 'manifest.json').read_text())['buildings']
+    # `dir` is compound so `<dir>/<floorId>` is the 3-segment key; `siteSlug` stays the pure site slug.
+    assert building['dir'] == 'campus/alpha-bldg'
+    assert building['siteSlug'] == 'campus'
+    assert building['buildingSlug'] == 'alpha-bldg'
+    (floor,) = building['floors']
+    assert floor['id'] == 'ABg'
+    # Images nest under the building so a same-campus sibling building can't clobber them.
+    assert floor['image'] == 'images/campus/alpha-bldg/ABg.webp'
+    assert (tmp_path / floor['image']).is_file()
+    assert floor['thumb'] == 'images/campus/alpha-bldg/ABg.thumb.webp'
+    assert (tmp_path / floor['thumb']).is_file()
+
+
+def test_build_site_anchored_manifest_omits_building_slug(tmp_path, make_pdf):
+    """Regression: a Site-anchored build (no `buildingSlug`) is byte-identical to before — a flat
+    `dir == siteSlug`, flat `images/<siteSlug>/…`, and NO `buildingSlug` field (readers treat it as
+    optional), so existing installs' manifests don't gain a spurious key."""
+    _write_pdf(tmp_path / 'uploads' / 'AlphaWing' / 'ground.pdf', make_pdf())
+    (tmp_path / 'import-map.json').write_text(json.dumps({
+        'buildings': {
+            'AlphaWing': {'slug': 'alpha', 'name': 'Alpha Wing', 'abbr': 'AB',
+                          'floors': {'ground': 'g'}},
+        },
+    }))
+
+    proc = _run('build', tmp_path)
+    assert proc.returncode == 0, proc.stderr
+
+    (building,) = json.loads((tmp_path / 'manifest.json').read_text())['buildings']
+    assert building['dir'] == 'alpha' and building['siteSlug'] == 'alpha'
+    assert 'buildingSlug' not in building
+    assert building['floors'][0]['image'] == 'images/alpha/ABg.webp'
+
+
+def test_build_ignores_invalid_building_slug(tmp_path, make_pdf):
+    """A `buildingSlug` that isn't a strict slug (defense-in-depth: it becomes a directory-name
+    segment) is ignored with a warning and the build degrades to Site-anchored — a hostile value
+    can never traverse out of `images/`."""
+    _write_pdf(tmp_path / 'uploads' / 'AlphaWing' / 'ground.pdf', make_pdf())
+    (tmp_path / 'import-map.json').write_text(json.dumps({
+        'buildings': {
+            'AlphaWing': {'slug': 'campus', 'buildingSlug': '../escape', 'name': 'Alpha',
+                          'abbr': 'AB', 'floors': {'ground': 'g'}},
+        },
+    }))
+
+    proc = _run('build', tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert 'ignoring invalid buildingSlug' in proc.stderr
+
+    (building,) = json.loads((tmp_path / 'manifest.json').read_text())['buildings']
+    assert building['dir'] == 'campus' and 'buildingSlug' not in building
+    assert building['floors'][0]['image'] == 'images/campus/ABg.webp'
+
+
 def test_scan_reports_page_count(tmp_path, make_pdf, make_multipage_pdf):
     """A multi-page PDF reports its page count in the scan inventory (the wizard explodes it into
     one card per page); every single-page drawing reports 1."""
@@ -835,8 +908,8 @@ def test_shapefile_extract_overlay_projects_features(formats_module, tmp_path):
     w.poly([[[0, 0], [0, 10], [10, 10], [10, 0], [0, 0]]])   # square, north edge at y=10
     w.record('BldgA')
     w.close()
-    feats = formats_module.format_for(str(base)).extract_overlay(str(base))
-    (feat,) = feats
+    res = formats_module.format_for(str(base)).extract_overlay(str(base))
+    (feat,) = res['features']
     assert feat['type'] == 'polygon'
     assert feat['props'] == {'NAME': 'BldgA'}
     # Fit-to-bounds → 0..1, Y flipped: the north edge (source y=10) lands at the top (ny == 0).
@@ -846,6 +919,11 @@ def test_shapefile_extract_overlay_projects_features(formats_module, tmp_path):
     assert (min(ys), max(ys)) == (0.0, 1.0)
     north = feat['coords'][1]            # source (0, 10)
     assert north == pytest.approx([0.0, 0.0])
+    # No .prj sibling → the CRS family is unknown (treated planar) and, with no align pairs,
+    # the placement stays fit-to-bounds — flagged approximate, with the transform recorded.
+    assert res['georeferenced'] is False
+    assert res['crs'] == 'unknown'
+    assert len(res['srcTransform']) == 6
 
 
 def _pyshp_available():
@@ -889,8 +967,11 @@ def _write_geojson(path, obj):
 
 
 def test_geojson_extract_overlay_projects_features(formats_module, tmp_path):
-    # A square polygon (north edge at lat=10) fit to bounds → 0..1, Y flipped so north lands at the
-    # top (ny == 0), mirroring the Shapefile projection test. Attribute props ride along.
+    # A square polygon (north edge at lat=5) fit to bounds → 0..1, Y flipped so north lands at the
+    # top (ny == 0), mirroring the Shapefile projection test. Attribute props ride along. The
+    # square straddles the equator so the geographic equirectangular pre-scale is exactly 1
+    # (cos 0°) and the bounds stay crisp; the off-equator aspect correction has its own test in
+    # the OverlayProjector section.
     src = tmp_path / 'poly.geojson'
     _write_geojson(src, {
         'type': 'FeatureCollection',
@@ -898,19 +979,23 @@ def test_geojson_extract_overlay_projects_features(formats_module, tmp_path):
             'type': 'Feature',
             'properties': {'NAME': 'BldgA'},
             'geometry': {'type': 'Polygon',
-                         'coordinates': [[[0, 0], [0, 10], [10, 10], [10, 0], [0, 0]]]},
+                         'coordinates': [[[0, -5], [0, 5], [10, 5], [10, -5], [0, -5]]]},
         }],
     })
-    feats = formats_module.format_for(str(src)).extract_overlay(str(src))
-    (feat,) = feats
+    res = formats_module.format_for(str(src)).extract_overlay(str(src))
+    (feat,) = res['features']
     assert feat['type'] == 'polygon'
     assert feat['props'] == {'NAME': 'BldgA'}
     xs = [c[0] for c in feat['coords']]
     ys = [c[1] for c in feat['coords']]
     assert (min(xs), max(xs)) == (0.0, 1.0)
-    assert (min(ys), max(ys)) == (0.0, 1.0)
-    north = feat['coords'][1]            # source (0, 10)
+    assert (min(ys), max(ys)) == pytest.approx((0.0, 1.0))
+    north = feat['coords'][1]            # source (0, 5)
     assert north == pytest.approx([0.0, 0.0])
+    # GeoJSON is WGS84 lon/lat by spec → always the geographic CRS family; still fit-to-bounds
+    # (no align pairs), so flagged approximate.
+    assert res['crs'] == 'geographic'
+    assert res['georeferenced'] is False
 
 
 def test_geojson_extract_overlay_all_geometry_types(formats_module, tmp_path):
@@ -941,7 +1026,7 @@ def test_geojson_extract_overlay_all_geometry_types(formats_module, tmp_path):
                  {'type': 'LineString', 'coordinates': [[0, 0], [9, 9]]}]}},
         ],
     })
-    feats = formats_module.format_for(str(src)).extract_overlay(str(src))
+    feats = formats_module.format_for(str(src)).extract_overlay(str(src))['features']
     kinds = [f['type'] for f in feats]
     assert kinds.count('point') == 1 + 2 + 1        # Point + MultiPoint(2) + GC's Point
     assert kinds.count('line') == 1 + 2 + 1         # LineString + MultiLineString(2) + GC's line
@@ -957,12 +1042,12 @@ def test_geojson_extract_overlay_accepts_bare_feature_and_geometry(formats_modul
     feat_src = tmp_path / 'feat.geojson'
     _write_geojson(feat_src, {'type': 'Feature', 'properties': {'id': 7},
                               'geometry': {'type': 'Point', 'coordinates': [1, 1]}})
-    (feat,) = formats_module.format_for(str(feat_src)).extract_overlay(str(feat_src))
+    (feat,) = formats_module.format_for(str(feat_src)).extract_overlay(str(feat_src))['features']
     assert feat['type'] == 'point' and feat['props'] == {'id': 7}
 
     geom_src = tmp_path / 'geom.geojson'
     _write_geojson(geom_src, {'type': 'LineString', 'coordinates': [[0, 0], [1, 1]]})
-    (line,) = formats_module.format_for(str(geom_src)).extract_overlay(str(geom_src))
+    (line,) = formats_module.format_for(str(geom_src)).extract_overlay(str(geom_src))['features']
     assert line['type'] == 'line' and line['props'] == {}
 
 
@@ -990,7 +1075,7 @@ def test_geojson_extract_overlay_caps_feature_count(formats_module, tmp_path):
         'features': [{'type': 'Feature', 'properties': {},
                       'geometry': {'type': 'Point', 'coordinates': [i, i]}} for i in range(n)],
     })
-    feats = gj.extract_overlay(str(src))
+    feats = gj.extract_overlay(str(src))['features']
     assert len(feats) == gj.MAX_FEATURES
 
 
@@ -1038,23 +1123,27 @@ def _kml_doc(placemarks):
 
 
 def test_kml_extract_overlay_projects_features(formats_module, tmp_path):
-    # A square polygon (north edge at lat=10) fit to bounds → 0..1, Y flipped so north lands at the
+    # A square polygon (north edge at lat=5) fit to bounds → 0..1, Y flipped so north lands at the
     # top (ny == 0), mirroring the GeoJSON/Shapefile projection tests. The placemark <name> rides
-    # along as a prop.
+    # along as a prop. Equator-straddling like the GeoJSON test, so the geographic pre-scale is
+    # exactly 1 and the bounds stay crisp.
     src = tmp_path / 'poly.kml'
     src.write_bytes(_kml_doc(
         '<Placemark><name>BldgA</name><Polygon><outerBoundaryIs><LinearRing><coordinates>'
-        '0,0 0,10 10,10 10,0 0,0'
+        '0,-5 0,5 10,5 10,-5 0,-5'
         '</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>'))
-    (feat,) = formats_module.format_for(str(src)).extract_overlay(str(src))
+    res = formats_module.format_for(str(src)).extract_overlay(str(src))
+    (feat,) = res['features']
     assert feat['type'] == 'polygon'
     assert feat['props'] == {'name': 'BldgA'}
     xs = [c[0] for c in feat['coords']]
     ys = [c[1] for c in feat['coords']]
     assert (min(xs), max(xs)) == (0.0, 1.0)
-    assert (min(ys), max(ys)) == (0.0, 1.0)
-    north = feat['coords'][1]            # source (0, 10)
+    assert (min(ys), max(ys)) == pytest.approx((0.0, 1.0))
+    north = feat['coords'][1]            # source (0, 5)
     assert north == pytest.approx([0.0, 0.0])
+    assert res['crs'] == 'geographic'    # KML is WGS84 lon/lat by spec
+    assert res['georeferenced'] is False
 
 
 def test_kml_extract_overlay_all_geometry_types(formats_module, tmp_path):
@@ -1076,7 +1165,7 @@ def test_kml_extract_overlay_all_geometry_types(formats_module, tmp_path):
         '<Point><coordinates>9,9</coordinates></Point>'
         '<LineString><coordinates>0,0 9,9</coordinates></LineString>'
         '</MultiGeometry></Placemark>'))
-    feats = formats_module.format_for(str(src)).extract_overlay(str(src))
+    feats = formats_module.format_for(str(src)).extract_overlay(str(src))['features']
     kinds = [f['type'] for f in feats]
     assert kinds.count('point') == 1 + 1            # standalone Point + MultiGeometry's Point
     assert kinds.count('line') == 1 + 1             # LineString + MultiGeometry's LineString
@@ -1123,7 +1212,7 @@ def test_kml_extract_overlay_caps_feature_count(formats_module, tmp_path):
                   % (i, i) for i in range(n))
     src = tmp_path / 'many.kml'
     src.write_bytes(_kml_doc(pts))
-    assert len(kml.extract_overlay(str(src))) == kml.MAX_FEATURES
+    assert len(kml.extract_overlay(str(src))['features']) == kml.MAX_FEATURES
 
 
 def _write_kmz(path, members):
@@ -1143,7 +1232,7 @@ def test_kmz_extract_overlay_reads_root_kml(formats_module, tmp_path):
                             '</Placemark>'),
         'images/overlay.png': b'\x89PNG\r\n\x1a\n not-a-real-image',
     })
-    (feat,) = formats_module.format_for(str(src)).extract_overlay(str(src))
+    (feat,) = formats_module.format_for(str(src)).extract_overlay(str(src))['features']
     assert feat['type'] == 'line'
     assert feat['props'] == {'name': 'Road'}
 
@@ -1153,7 +1242,7 @@ def test_kmz_extract_overlay_first_kml_when_no_doc_kml(formats_module, tmp_path)
     src = tmp_path / 'nodoc.kmz'
     _write_kmz(src, {'layer.kml': _kml_doc(
         '<Placemark><Point><coordinates>3,4</coordinates></Point></Placemark>')})
-    feats = formats_module.format_for(str(src)).extract_overlay(str(src))
+    feats = formats_module.format_for(str(src)).extract_overlay(str(src))['features']
     assert [f['type'] for f in feats] == ['point']
 
 
@@ -1209,6 +1298,146 @@ def test_unit_projector_empty_is_center(formats_module):
     assert formats_module.unit_projector([])(123, 456) == (0.5, 0.5)
 
 
+# ---- overlay georeference (OverlayProjector — the FMT-6 control-point + CRS seam) ----
+
+def test_overlay_projector_similarity_from_two_pairs(formats_module):
+    # Two pairs pin an exact similarity: (0,0)→(0.25,0.75) and (10,0)→(0.75,0.75) put 10 source
+    # units across half the plan with no rotation. A third source point rides the same transform,
+    # and — the Y-handedness check — a point NORTH of a control point lands ABOVE it (smaller ny),
+    # not mirrored below.
+    p = formats_module.OverlayProjector(
+        [(0, 0), (10, 10)],
+        align=[{'src': [0.0, 0.0], 'dst': [0.25, 0.75]},
+               {'src': [10.0, 0.0], 'dst': [0.75, 0.75]}])
+    assert p.georeferenced is True
+    assert p.project(0, 0) == pytest.approx((0.25, 0.75))
+    assert p.project(10, 0) == pytest.approx((0.75, 0.75))
+    assert p.project(10, 10) == pytest.approx((0.75, 0.25))
+    assert p.project(0, 10) == pytest.approx((0.25, 0.25))
+
+
+def test_overlay_projector_similarity_carries_rotation(formats_module):
+    # (0,0)→(0.5,0.5), (10,0)→(0.5,0.9): source-east points down the plan — a 90° clockwise
+    # rotation, which the similarity expresses. Source-north then lands to the plan's east.
+    p = formats_module.OverlayProjector(
+        [(0, 0), (10, 10)],
+        align=[{'src': [0.0, 0.0], 'dst': [0.5, 0.5]},
+               {'src': [10.0, 0.0], 'dst': [0.5, 0.9]}])
+    assert p.georeferenced is True
+    assert p.project(0, 10) == pytest.approx((0.9, 0.5))
+
+
+def test_overlay_projector_affine_from_three_pairs(formats_module):
+    # Three pairs solve a full affine — here with anisotropic scale (x squeezed 2× more than y),
+    # which a similarity cannot express. Exactly interpolating pairs reproduce, and a fourth
+    # point follows the affine.
+    p = formats_module.OverlayProjector(
+        [(0, 0), (10, 10)],
+        align=[{'src': [0.0, 0.0], 'dst': [0.0, 1.0]},
+               {'src': [10.0, 0.0], 'dst': [1.0, 1.0]},
+               {'src': [0.0, 10.0], 'dst': [0.0, 0.5]}])
+    assert p.georeferenced is True
+    assert p.project(0, 0) == pytest.approx((0.0, 1.0))
+    assert p.project(10, 0) == pytest.approx((1.0, 1.0))
+    assert p.project(0, 10) == pytest.approx((0.0, 0.5))
+    assert p.project(10, 10) == pytest.approx((1.0, 0.5))
+
+
+@pytest.mark.parametrize('align', [
+    None,                                                        # no pairs at all
+    [],                                                          # empty list
+    [{'src': [0.0, 0.0], 'dst': [0.2, 0.2]}],                    # only one pair
+    [{'src': [5.0, 5.0], 'dst': [0.2, 0.2]},                     # coincident sources — no scale
+     {'src': [5.0, 5.0], 'dst': [0.8, 0.8]}],
+    [{'src': 'nope', 'dst': [0.1, 0.1]},                         # malformed pairs all dropped
+     {'src': [1.0, 'x'], 'dst': [0.1, 0.1]},
+     'junk',
+     {'src': [0.0, 0.0]},
+     {'src': [float('nan'), 0.0], 'dst': [0.1, 0.1]},
+     {'src': [True, False], 'dst': [0.1, 0.1]}],
+])
+def test_overlay_projector_falls_back_to_fit(formats_module, align):
+    # Anything short of two clean, solvable pairs degrades to plain fit-to-bounds — flagged
+    # approximate, identical to the no-alignment placement.
+    p = formats_module.OverlayProjector([(0, 0), (10, 10)], align=align)
+    assert p.georeferenced is False
+    assert p.project(0, 0) == pytest.approx((0.0, 1.0))
+    assert p.project(10, 10) == pytest.approx((1.0, 0.0))
+
+
+def test_overlay_projector_geographic_corrects_aspect(formats_module):
+    import math
+    # A lon/lat layer away from the equator: 10° of longitude at lat 50 spans only cos(50°) of
+    # 10° of latitude, so the equirectangular pre-scale narrows x and the fit centers it —
+    # instead of the old planar treatment that stretched the layer square.
+    p = formats_module.OverlayProjector([(0, 45), (10, 55)], crs='geographic')
+    k = math.cos(math.radians(50))
+    off = (10 - 10 * k) / 2 / 10
+    assert p.crs == 'geographic'
+    assert p.project(0, 45) == pytest.approx((off, 1.0))
+    assert p.project(10, 55) == pytest.approx((1.0 - off, 0.0))
+
+
+def test_overlay_projector_meta_transform_matches_project(formats_module):
+    # `srcTransform` is the exact raw-source→unit affine behind `project` — the frontend inverts
+    # it to recover source coordinates, so the two must agree on every path (fit + geographic
+    # here, control-point + geographic below).
+    for p in (
+        formats_module.OverlayProjector([(0, 45), (10, 55)], crs='geographic'),
+        formats_module.OverlayProjector(
+            [(0, 45), (10, 55)], crs='geographic',
+            align=[{'src': [0.0, 45.0], 'dst': [0.1, 0.9]},
+                   {'src': [10.0, 55.0], 'dst': [0.9, 0.1]}]),
+    ):
+        meta = p.meta()
+        a, b, c, d, e, f = meta['srcTransform']
+        for x, y in ((0, 45), (10, 55), (3.7, 51.2)):
+            nx, ny = p.project(x, y)
+            assert (a * x + b * y + c, d * x + e * y + f) == pytest.approx((nx, ny))
+        assert meta['georeferenced'] is p.georeferenced
+        assert meta['crs'] == 'geographic'
+
+
+@pytest.mark.parametrize('wkt,kind', [
+    ('GEOGCS["WGS 84",DATUM["WGS_1984"]]', 'geographic'),
+    ('PROJCS["NAD83 / UTM zone 10N",GEOGCS["NAD83"]]', 'projected'),
+    ('GEOGCRS["WGS 84",ENSEMBLE["..."]]', 'geographic'),          # WKT2 spelling
+    ('\ufeff  PROJCRS("ETRS89")', 'projected'),               # BOM + whitespace + parens
+    ('LOCAL_CS["Nonearth"]', 'unknown'),                          # recognized-but-other WKT
+    ('complete garbage', 'unknown'),
+])
+def test_shapefile_crs_kind_from_prj(formats_module, tmp_path, wkt, kind):
+    (tmp_path / 'layer.prj').write_text(wkt, encoding='utf-8')
+    assert formats_module.ShapefileFormat._crs_kind(str(tmp_path / 'layer.shp')) == kind
+
+
+def test_shapefile_crs_kind_without_prj(formats_module, tmp_path):
+    # No .prj → unknown (treated planar): guessing geographic from coordinate ranges would
+    # misread a small local planar grid.
+    assert formats_module.ShapefileFormat._crs_kind(str(tmp_path / 'bare.shp')) == 'unknown'
+
+
+def test_geojson_extract_overlay_applies_align_pairs(formats_module, tmp_path):
+    # End-to-end through a real handler: `overlayAlign` pairs georeference the layer — the two
+    # anchored corners land exactly on their dst, the rest of the square follows the similarity,
+    # and the manifest metadata flips to georeferenced.
+    src = tmp_path / 'poly.geojson'
+    _write_geojson(src, {
+        'type': 'Feature', 'properties': {},
+        'geometry': {'type': 'Polygon',
+                     'coordinates': [[[0, -5], [0, 5], [10, 5], [10, -5], [0, -5]]]},
+    })
+    res = formats_module.format_for(str(src)).extract_overlay(
+        str(src),
+        align=[{'src': [0.0, -5.0], 'dst': [0.25, 0.75]},
+               {'src': [10.0, -5.0], 'dst': [0.75, 0.75]}])
+    assert res['georeferenced'] is True
+    (feat,) = res['features']
+    expected = [[0.25, 0.75], [0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]]
+    for got, want in zip(feat['coords'], expected):
+        assert got == pytest.approx(want)
+
+
 # ---- overlay dispatch + build wiring (Preprocessor, loaded by path) ----
 
 def test_extract_overlay_dispatch_guards(preprocess_module):
@@ -1234,8 +1463,11 @@ def test_build_attaches_overlay_to_floor(preprocess_module, tmp_path, make_pdf, 
     class _StubOverlay:
         name, exts, role, requires = 'stubov', ('.ovtest',), fm.OVERLAY, 'stub'
 
-        def extract_overlay(self, path):
-            return [{'type': 'point', 'coords': [0.5, 0.5], 'props': {'id': 'sensor-1'}}]
+        def extract_overlay(self, path, align=None):
+            return {'features': [{'type': 'point', 'coords': [0.5, 0.5],
+                                  'props': {'id': 'sensor-1'}}],
+                    'georeferenced': False, 'crs': 'unknown',
+                    'srcTransform': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]}
 
     stub = _StubOverlay()
     real_format_for = fm.format_for
@@ -1259,6 +1491,59 @@ def test_build_attaches_overlay_to_floor(preprocess_module, tmp_path, make_pdf, 
     assert overlay['name'] == 'sensors'                # source stem, extension stripped
     assert overlay['features'] == [
         {'type': 'point', 'coords': [0.5, 0.5], 'props': {'id': 'sensor-1'}}]
+    # The handler's placement metadata rides into the manifest entry: fit-to-bounds is never a
+    # true georeference, so the flag stays approximate (drives the frontend's warning) and the
+    # recorded raw-source→unit transform is what the align editor inverts.
+    assert overlay['georeferenced'] is False
+    assert overlay['crs'] == 'unknown'
+    assert overlay['srcTransform'] == [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+
+
+def test_build_passes_overlay_align_pairs(preprocess_module, tmp_path, make_pdf, monkeypatch):
+    """The build routes the import map's `overlayAlign` pairs (keyed by drawing stem, FMT-6) into
+    the matching overlay file's extract — and the extract's `georeferenced` verdict lands in the
+    manifest. A recording stub keeps this a pure wiring test (the solve itself is covered in the
+    OverlayProjector section)."""
+    fm = preprocess_module.drawing_formats
+    seen = {}
+
+    class _StubOverlay:
+        name, exts, role, requires = 'stubov', ('.ovtest',), fm.OVERLAY, 'stub'
+
+        def extract_overlay(self, path, align=None):
+            seen['align'] = align
+            return {'features': [{'type': 'point', 'coords': [0.1, 0.2], 'props': {}}],
+                    'georeferenced': align is not None, 'crs': 'unknown',
+                    'srcTransform': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]}
+
+    stub = _StubOverlay()
+    real_format_for = fm.format_for
+    monkeypatch.setattr(fm, 'DRAWING_EXTS', fm.DRAWING_EXTS + ('.ovtest',))
+    monkeypatch.setattr(fm, 'format_for',
+                        lambda p: stub if p.lower().endswith('.ovtest') else real_format_for(p))
+
+    _write_pdf(tmp_path / 'uploads' / 'AlphaWing' / 'ground.pdf', make_pdf())
+    _write(tmp_path / 'uploads' / 'AlphaWing' / 'sensors.ovtest', b'{"stub": true}')
+    pairs = [{'src': [0.0, 0.0], 'dst': [0.25, 0.75]},
+             {'src': [10.0, 0.0], 'dst': [0.75, 0.75]}]
+    entry = {'slug': 'alpha', 'name': 'Alpha Wing', 'abbr': 'AB',
+             'floors': {'ground': 'g', 'sensors': 'g'},
+             'overlayAlign': {'sensors': pairs}}
+
+    building, _ = preprocess_module.Preprocessor(str(tmp_path)).build_building_from_pdfs(
+        'AlphaWing', entry)
+
+    assert seen['align'] == pairs
+    (floor,) = building['floors']
+    (overlay,) = floor['overlays']
+    assert overlay['georeferenced'] is True
+
+    # A malformed (non-dict) overlayAlign is ignored — the overlay falls back to no pairs.
+    entry['overlayAlign'] = ['not', 'a', 'dict']
+    building, _ = preprocess_module.Preprocessor(str(tmp_path)).build_building_from_pdfs(
+        'AlphaWing', entry)
+    assert seen['align'] is None
+    assert building['floors'][0]['overlays'][0]['georeferenced'] is False
 
 
 def test_build_drops_overlay_only_floor(preprocess_module, tmp_path, monkeypatch):
@@ -1269,8 +1554,10 @@ def test_build_drops_overlay_only_floor(preprocess_module, tmp_path, monkeypatch
     class _StubOverlay:
         name, exts, role, requires = 'stubov', ('.ovtest',), fm.OVERLAY, 'stub'
 
-        def extract_overlay(self, path):
-            return [{'type': 'point', 'coords': [0.5, 0.5], 'props': {}}]
+        def extract_overlay(self, path, align=None):
+            return {'features': [{'type': 'point', 'coords': [0.5, 0.5], 'props': {}}],
+                    'georeferenced': False, 'crs': 'unknown',
+                    'srcTransform': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]}
 
     stub = _StubOverlay()
     real_format_for = fm.format_for
@@ -1285,3 +1572,175 @@ def test_build_drops_overlay_only_floor(preprocess_module, tmp_path, monkeypatch
         'AlphaWing', entry)
 
     assert building['floors'] == []
+
+
+# ---- render quality (READ-1) ----
+
+class _FakePage:
+    """Stand-in for a pypdfium2 page — `_render_scale` only ever asks for its point size."""
+
+    def __init__(self, w, h):
+        self._size = (w, h)
+
+    def get_size(self):
+        return self._size
+
+
+LETTER = (612, 792)        # the common sheet
+E_SIZE = (2448, 3168)      # the big one the item's complaint is really about
+
+
+def test_render_scale_standard_quality_is_unchanged(formats_module):
+    # The whole point of deriving the clamp from point size: an operator who never touches the
+    # setting must get byte-identical renders to before. Both common sheets stay at RENDER_SCALE.
+    pdf = formats_module.PdfFormat()
+    for size in (LETTER, E_SIZE):
+        assert pdf._render_scale(_FakePage(*size), 1.0) == pdf.RENDER_SCALE
+
+
+def test_render_scale_high_quality_lifts_a_normal_sheet(formats_module):
+    # A letter sheet has pixels to spare, so it gets the multiplier in full: 2.0 -> 3.0 (~216 DPI).
+    pdf = formats_module.PdfFormat()
+    assert pdf._render_scale(_FakePage(*LETTER), 1.5) == pdf.RENDER_SCALE * 1.5
+
+
+def test_render_scale_clamps_an_oversized_sheet_to_the_pixel_cap(formats_module):
+    # The gotcha this guards: raster area grows with the SQUARE of the scale, and the render
+    # subprocess is address-space-capped. An E-size sheet at 1.5x would reach 9504px on its long
+    # side; it must give density back instead, landing exactly on the cap rather than being killed.
+    pdf = formats_module.PdfFormat()
+    scale = pdf._render_scale(_FakePage(*E_SIZE), 1.5)
+    assert max(E_SIZE) * scale == pytest.approx(pdf.MAX_IMAGE_PX)
+    # Clamped, but still sharper than standard — the operator gets *some* of what they asked for.
+    assert pdf.RENDER_SCALE < scale < pdf.RENDER_SCALE * 1.5
+
+
+def test_render_scale_never_exceeds_the_cap(formats_module):
+    # The invariant that actually protects the child, across sheet sizes and quality settings.
+    pdf = formats_module.PdfFormat()
+    for size in (LETTER, E_SIZE, (5000, 7000)):
+        for quality in (1.0, 1.5, 4.0):
+            longest = max(size) * pdf._render_scale(_FakePage(*size), quality)
+            assert longest <= pdf.MAX_IMAGE_PX + 1e-6
+
+
+@pytest.mark.parametrize('quality', [0, -1, None])
+def test_render_scale_falls_back_to_standard_for_a_bogus_quality(formats_module, quality):
+    # A malformed --scale must not render a degenerate 0-px image; standard is the safe reading.
+    pdf = formats_module.PdfFormat()
+    assert pdf._render_scale(_FakePage(*LETTER), quality) == pdf.RENDER_SCALE
+
+
+def test_render_scale_survives_a_page_whose_size_cannot_be_read(formats_module):
+    # A damaged PDF still renders (at the unclamped scale) and is left to the subprocess rlimits —
+    # the same backstop as before this cap existed. It must not raise.
+    class Broken:
+        def get_size(self):
+            raise RuntimeError('damaged')
+
+    pdf = formats_module.PdfFormat()
+    assert pdf._render_scale(Broken(), 1.5) == pdf.RENDER_SCALE * 1.5
+
+
+def test_scaled_px_scales_a_vector_target(formats_module):
+    # The RENDER_PX analogue used by the SVG/DXF handlers.
+    assert formats_module._scaled_px(2000, 1.5) == 3000
+    assert formats_module._scaled_px(2000, 1.0) == 2000
+    for bogus in (0, -1, None):
+        assert formats_module._scaled_px(2000, bogus) == 2000
+
+
+# ---- _hq_constrained: the "HQ couldn't be delivered" signal (HEALTH-3) ----
+
+def test_hq_constrained_flags_a_clamped_pdf(preprocess_module, formats_module):
+    # HQ on and the rendered longest side reached the PDF pixel cap == the sheet was clamped below
+    # full quality. A sheet comfortably under the cap got its full quality, so it's not constrained.
+    pdf = formats_module.PdfFormat()
+    hq = preprocess_module.Preprocessor._hq_constrained
+    assert hq(pdf, 1.5, pdf.MAX_IMAGE_PX, 5000) is True
+    assert hq(pdf, 1.5, pdf.MAX_IMAGE_PX - 1, 5000) is True     # rounding tolerance
+    assert hq(pdf, 1.5, 4000, 3000) is False
+
+
+@pytest.mark.parametrize('quality', [1.0, 0, -1, None])
+def test_hq_constrained_ignores_non_high_quality(preprocess_module, formats_module, quality):
+    # At standard (or bogus) quality nothing is an HQ constraint, even a sheet sitting on the cap.
+    pdf = formats_module.PdfFormat()
+    hq = preprocess_module.Preprocessor._hq_constrained
+    assert hq(pdf, quality, pdf.MAX_IMAGE_PX, pdf.MAX_IMAGE_PX) is False
+
+
+def test_hq_constrained_skips_a_raster_at_its_cap(preprocess_module, formats_module):
+    # A raster ignores quality (no more detail to extract from a scan), so reaching its own
+    # downscale cap is not an HQ constraint. The RENDER_SCALE gate (PdfFormat-only) excludes it.
+    raster = formats_module.RasterFormat()
+    hq = preprocess_module.Preprocessor._hq_constrained
+    assert not hasattr(raster, 'RENDER_SCALE')
+    assert hq(raster, 1.5, raster.MAX_IMAGE_PX, raster.MAX_IMAGE_PX) is False
+
+
+def test_build_scale_renders_more_pixels(tmp_path, make_pdf):
+    # End-to-end through the CLI the way imports.py drives it: the same source, built twice, must
+    # differ only in pixel dimensions — and the coordinate model is normalized 0..1, so nothing
+    # else in the manifest may move.
+    def build(base, *extra):
+        _write_pdf(base / 'uploads' / 'AlphaWing' / 'ground.pdf', make_pdf(120, 160))
+        (base / 'import-map.json').write_text(json.dumps({'buildings': {'AlphaWing': {
+            'slug': 'alpha', 'name': 'Alpha', 'abbr': 'A', 'floors': {'ground': 'g'}}}}))
+        assert _run('build', base, *extra).returncode == 0
+        return json.loads((base / 'manifest.json').read_text())['buildings'][0]['floors'][0]
+
+    std = build(tmp_path / 'std')
+    hq = build(tmp_path / 'hq', '--scale', '1.5')
+
+    assert (hq['w'], hq['h']) == (int(std['w'] * 1.5), int(std['h'] * 1.5))
+    # Same floor identity/geometry contract either way — the scale must not leak past the pixels.
+    assert (hq['id'], hq['label'], hq['floorSlug']) == (std['id'], std['label'], std['floorSlug'])
+
+
+def _render_summary(stderr):
+    """The RENDER-SUMMARY {json} dict from a build's stderr (HEALTH-3), or None if absent."""
+    for line in reversed(stderr.splitlines()):
+        if line.startswith('RENDER-SUMMARY '):
+            return json.loads(line[len('RENDER-SUMMARY '):])
+    return None
+
+
+def test_build_emits_a_render_summary(tmp_path, make_pdf):
+    # End-to-end: a clean small build reports zero problems, and the `hq` flag tracks --scale — the
+    # machine-readable line imports.RenderRunner parses to surface HQ memory constraints.
+    _write_pdf(tmp_path / 'uploads' / 'AlphaWing' / 'ground.pdf', make_pdf(120, 160))
+    (tmp_path / 'import-map.json').write_text(json.dumps({'buildings': {'AlphaWing': {
+        'slug': 'alpha', 'name': 'Alpha', 'abbr': 'A', 'floors': {'ground': 'g'}}}}))
+
+    std = _run('build', tmp_path)
+    assert std.returncode == 0
+    assert _render_summary(std.stderr) == {'hq': False, 'unrendered': 0, 'hq_clamped': 0}
+
+    hq = _run('build', tmp_path, '--scale', '1.5')
+    # A small sheet has pixels to spare, so HQ is delivered in full — flagged on, nothing clamped.
+    assert _render_summary(hq.stderr) == {'hq': True, 'unrendered': 0, 'hq_clamped': 0}
+
+
+def test_build_summary_counts_an_unrenderable_drawing(tmp_path):
+    # A drawing that can't be decoded is dropped (graceful) and tallied as unrendered, so a build
+    # that silently lost content can say so rather than reporting a spurious success.
+    _write(tmp_path / 'uploads' / 'AlphaWing' / 'ground.pdf', b'%PDF-not-really-a-pdf')
+    (tmp_path / 'import-map.json').write_text(json.dumps({'buildings': {'AlphaWing': {
+        'slug': 'alpha', 'name': 'Alpha', 'abbr': 'A', 'floors': {'ground': 'g'}}}}))
+
+    res = _run('build', tmp_path)
+    assert res.returncode == 0                       # graceful: the build still completes
+    assert _render_summary(res.stderr)['unrendered'] == 1
+
+
+def test_build_bogus_scale_falls_back_to_standard(tmp_path, make_pdf):
+    # An unparseable --scale must not lose the whole build.
+    def build(base, *extra):
+        _write_pdf(base / 'uploads' / 'AlphaWing' / 'ground.pdf', make_pdf(120, 160))
+        (base / 'import-map.json').write_text(json.dumps({'buildings': {'AlphaWing': {
+            'slug': 'alpha', 'name': 'Alpha', 'abbr': 'A', 'floors': {'ground': 'g'}}}}))
+        assert _run('build', base, *extra).returncode == 0
+        return json.loads((base / 'manifest.json').read_text())['buildings'][0]['floors'][0]
+
+    assert build(tmp_path / 'bogus', '--scale', 'abc') == build(tmp_path / 'std')

@@ -11,9 +11,29 @@ import pytest
 from django.db import IntegrityError, transaction
 from django.urls import reverse
 
-from netbox_facilitymap.models import FacilityMapBlob, Room
+from netbox_facilitymap.models import FacilityMapBlob, Room, parse_floor_key
 
 pytestmark = pytest.mark.django_db
+
+
+# ---- parse_floor_key (pure, no DB) — the two building-anchor floor-key shapes (MODEL-3) ----
+
+@pytest.mark.parametrize('key,expected', [
+    # 2-segment Site-anchored: no building slug.
+    ('campus/floor-1', ('campus', '', 'floor-1')),
+    # 3-segment Location-anchored: building slug in the middle.
+    ('campus/alpha-bldg/level-1', ('campus', 'alpha-bldg', 'level-1')),
+    # Tolerate an unexpected extra segment (deeper nesting is out of scope but must not choke —
+    # BUILDING-ANCHOR-DESIGN §8): site=first, floor=last, building=second-to-last.
+    ('campus/cluster/bldg/level-1', ('campus', 'bldg', 'level-1')),
+    # Malformed (fewer than 2 segments) resolves to empties so callers reject it uniformly.
+    ('campus', ('', '', '')),
+    ('', ('', '', '')),
+    # A trailing-empty floor segment surfaces as an empty floor slug (caller rejects on it).
+    ('campus/', ('campus', '', '')),
+])
+def test_parse_floor_key_shapes(key, expected):
+    assert parse_floor_key(key) == expected
 
 
 def _site_floor_room_locations():
@@ -83,6 +103,39 @@ def test_migration_0009_backfills_floor_location():
     r_bad.refresh_from_db()
     assert r_ok.floor_location_id == floor.pk
     assert r_bad.floor_location_id is None
+
+
+def test_migration_0012_shards_editor_blobs_by_floor():
+    # CONC-1 migration: each whole-document editor blob (key='') splits into one row per floor
+    # (key=floor_key); siteplan/settings are untouched. Reverse recombines into one key='' row.
+    import importlib
+    from django.apps import apps as global_apps
+
+    FacilityMapBlob.objects.create(kind='annotations', facility='', key='', data={
+        'sa/f1': {'arrows': [{'p': 1}]}, 'sb/f2': {'notes': []}})
+    FacilityMapBlob.objects.create(kind='placements', facility='west', key='', data={
+        'wa/f1': {'placements': [{'room': 'r'}]}})
+    FacilityMapBlob.objects.create(kind='siteplan', facility='', key='', data={'hotspots': []})
+
+    mod = importlib.import_module('netbox_facilitymap.migrations.0012_shard_editor_blobs_by_floor')
+
+    mod.shard(global_apps, None)
+    # annotations split into two per-floor rows; the whole-doc row is gone.
+    assert not FacilityMapBlob.objects.filter(kind='annotations', key='').exists()
+    assert FacilityMapBlob.objects.get(kind='annotations', key='sa/f1').data == {'arrows': [{'p': 1}]}
+    assert FacilityMapBlob.objects.get(kind='annotations', key='sb/f2').data == {'notes': []}
+    assert FacilityMapBlob.objects.get(kind='placements', facility='west', key='wa/f1').data \
+        == {'placements': [{'room': 'r'}]}
+    # siteplan (facility-wide) is left as one key='' row.
+    assert FacilityMapBlob.objects.get(kind='siteplan', key='').data == {'hotspots': []}
+
+    mod.unshard(global_apps, None)
+    # Recombined back to one whole-document row per (kind, facility); per-floor rows gone.
+    assert not FacilityMapBlob.objects.filter(kind='annotations').exclude(key='').exists()
+    assert FacilityMapBlob.objects.get(kind='annotations', facility='', key='').data == {
+        'sa/f1': {'arrows': [{'p': 1}]}, 'sb/f2': {'notes': []}}
+    assert FacilityMapBlob.objects.get(kind='placements', facility='west', key='').data == {
+        'wa/f1': {'placements': [{'room': 'r'}]}}
 
 
 # ---- FacilityMapBlob ----

@@ -8,9 +8,14 @@ Fixtures here fall into two groups:
   * `make_pdf` / `workdir` / `backupdir` — filesystem/config plumbing, no DB needed.
   * `editor_user` / `plain_user` — NetBox users with (and without) object permissions, for the
     DB-backed tier that exercises `sync_rooms` delete-scoping and the permission-gated endpoints.
+
+Also hooks pytest-django's db-naming extension point (`django_db_modify_db_settings`, see below)
+so each git worktree gets its own test database — see `_worktree_test_db_suffix` (INFRA-1).
 """
 
 import io
+import re
+from pathlib import Path
 
 import pytest
 
@@ -34,6 +39,69 @@ def grant(user, model, actions, constraints=None):
     op.object_types.add(ObjectType.objects.get_for_model(model))
     op.users.add(user)
     return op
+
+
+def _worktree_test_db_suffix(start):
+    """Return a Postgres test-DB suffix identifying the linked git worktree containing `start`,
+    or `None` for the main checkout (or if no repo is found at all). A linked worktree's `.git`
+    is a *file* reading `gitdir: <main-repo>/.git/worktrees/<name>`, unlike the main checkout's
+    `.git` directory — `<name>` is already the worktree's own unique identity (basename of the
+    path `EnterWorktree`/`git worktree add` created, deduplicated by git on any collision), so no
+    `git` subprocess or extra bookkeeping is needed (INFRA-1)."""
+    git_entry = None
+    for parent in (start, *start.parents):
+        candidate = parent / '.git'
+        if candidate.exists():
+            git_entry = candidate
+            break
+    if git_entry is None or not git_entry.is_file():
+        return None
+
+    line = git_entry.read_text().strip()
+    if not line.startswith('gitdir:'):
+        return None
+    worktree_name = Path(line.split(':', 1)[1].strip()).name
+    suffix = re.sub(r'[^a-z0-9]+', '_', worktree_name.lower()).strip('_')
+    return suffix or None
+
+
+def _apply_worktree_db_suffix(suffix):
+    """Suffix every configured database's TEST NAME, mirroring pytest-django's own (private)
+    `_set_suffix_to_test_databases` — replicated rather than imported since that helper is
+    underscore-prefixed/internal."""
+    from django.conf import settings
+
+    for db_settings in settings.DATABASES.values():
+        test_name = db_settings.get('TEST', {}).get('NAME')
+        if not test_name:
+            if db_settings['ENGINE'] == 'django.db.backends.sqlite3':
+                continue
+            test_name = f"test_{db_settings['NAME']}"
+        if test_name == ':memory:':
+            continue
+        db_settings.setdefault('TEST', {})
+        db_settings['TEST']['NAME'] = f'{test_name}_{suffix}'
+
+
+@pytest.fixture(scope='session')
+def django_db_modify_db_settings_worktree_suffix():
+    """Give each linked git worktree its own Postgres test database, so parallel `/plan-todo`
+    tabs never share schema — one worktree landing a migration can no longer corrupt another
+    tab's pytest run (INFRA-1). No-op for the main checkout, which keeps the plain `test_netbox`
+    name (and `--reuse-db` speed) documented in `CLAUDE.md`."""
+    suffix = _worktree_test_db_suffix(Path(__file__).resolve().parent)
+    if suffix:
+        _apply_worktree_db_suffix(suffix)
+
+
+@pytest.fixture(scope='session')
+def django_db_modify_db_settings(
+    django_db_modify_db_settings_parallel_suffix,  # pytest-django's tox/xdist suffixing
+    django_db_modify_db_settings_worktree_suffix,
+):
+    """Overrides pytest-django's fixture of the same name to add worktree suffixing (INFRA-1)
+    on top of its existing tox/xdist suffixing — the same composition pattern pytest-django uses
+    internally (see `django_db_modify_db_settings_parallel_suffix` in `pytest_django/fixtures.py`)."""
 
 
 @pytest.fixture

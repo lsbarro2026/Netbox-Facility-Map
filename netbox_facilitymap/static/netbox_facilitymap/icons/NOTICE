@@ -22,13 +22,20 @@ after replacing an icon here. Keep this map in sync with `Icons`:
   move           move.svg
   arrange        layout-grid.svg
   dup            copy.svg
+  plus           plus.svg
   check          check.svg
   rack           server.svg          (closest fit for a rack)
   settings       settings.svg
+  panelRight     panel-right.svg
   rightangle     triangle-right.svg  (right-angled triangle → 90° snap toggle)
   arrow          arrow-up-right.svg
+  note           type.svg            (closest fit — Lucide's typography glyph, used for the "Add note" text annotation)
   layers         layers.svg
   link           link.svg
   download       download.svg
   print          printer.svg
   info           info.svg
+  sliders        sliders-horizontal.svg
+  chevron        chevron-right.svg   (used generically as a caret, not just "next")
+  todo           list-todo.svg
+  wifi           wifi.svg

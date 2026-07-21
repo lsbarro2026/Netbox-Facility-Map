@@ -107,8 +107,10 @@ def facility_site_slugs(facility, group=None, user=None):
 
 def facility_floor_scope(facility, group=None, user=None):
     """A `Q` matching `Room` rows whose floor belongs to `facility`, or `None` when the facility has
-    no sites. `floor_key` is `"<site.slug>/<floor.slug>"`, so the base match is an OR of
-    `floor_key__startswith '<slug>/'` over the facility's site slugs — the scoping both
+    no sites. `floor_key`'s **first** segment is always the site slug — for both the 2-segment
+    Site-anchored `"<site.slug>/<floor.slug>"` and the 3-segment Location-anchored
+    `"<site.slug>/<building.slug>/<floor.slug>"` shapes (MODEL-3) — so the base match is an OR of
+    `floor_key__startswith '<slug>/'` over the facility's site slugs, correct for either shape. It is the scoping both
     `sync_rooms`' cross-floor delete and `compose_annotations` use to stay per-facility (Room has no
     facility column by design). It also unions the rename-proof `floor_location` FK
     (`floor_location__site__slug in <facility slugs>`, BIND-1) so a room whose Site was renamed —
@@ -216,13 +218,14 @@ def suggested_target(key):
     Reads the key's `annotations`/`placements` floor keys (`"<site>/<floor>"`), resolves each site's
     *current* facility (`facility_for_site`), and returns it when the data's sites all agree on a
     single reachable target. Ambiguous (mixed sites) or unresolvable (sites gone) → `''`, leaving the
-    operator to choose."""
+    operator to choose. Those kinds are sharded one row per floor (`key=floor_key`, CONC-1), so each
+    row's `key` is a floor key directly."""
     site_slugs = set()
-    for blob in FacilityMapBlob.objects.filter(facility=key, kind__in=('annotations', 'placements')):
-        for floor_key in (blob.data or {}):
-            site_slug = floor_key.split('/', 1)[0]
-            if site_slug:
-                site_slugs.add(site_slug)
+    for floor_key in (FacilityMapBlob.objects.filter(facility=key, kind__in=('annotations', 'placements'))
+                      .exclude(key='').values_list('key', flat=True)):
+        site_slug = floor_key.split('/', 1)[0]
+        if site_slug:
+            site_slugs.add(site_slug)
     if not site_slugs:
         return ''
     targets = {facility_for_site(s) for s in Site.objects.filter(slug__in=site_slugs)}

@@ -18,13 +18,14 @@ class RoomFilterSet(NetBoxModelFilterSet):
 
     class Meta:
         model = Room
-        fields = ('id', 'floor_key', 'room_id', 'label')
+        fields = ('id', 'floor_key', 'room_id', 'label', 'alias')
 
     def search(self, queryset, name, value):
-        # `q` free-text across the human-meaningful identity fields.
+        # `q` free-text across the human-meaningful identity fields (incl. the NAV-18 search aliases).
         if not value.strip():
             return queryset
         return queryset.filter(
             Q(label__icontains=value)
+            | Q(alias__icontains=value)
             | Q(room_id__icontains=value)
             | Q(floor_key__icontains=value))

@@ -14,7 +14,7 @@ full design.
 # `FacilityMapConfig.version` below is set from it — so a release bumps exactly this one line.
 # Keep it a plain string literal: setuptools resolves it via AST without importing this module
 # (which would fail at build time, before NetBox is present).
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 from netbox.plugins import PluginConfig
 
@@ -86,9 +86,10 @@ class FacilityMapConfig(PluginConfig):
         'backup_max_mb': 1024,   # prune oldest backups once the dir exceeds this (newest always kept)
         # Optional-capability defaults (the add-on framework, ADDON-2): every KNOWN capability's
         # own settings — chiefly its feature flag, defaulted off so the core stays barebones —
-        # merged in so an operator can flip one on. See capabilities.all_default_settings; today
-        # this registers `allow_location_create` (LOC-1, defaulted off) — the format-extra
-        # capabilities contribute nothing.
+        # merged in so an operator can flip one on. See capabilities.all_default_settings; today no
+        # shipped capability contributes a default (the format-extra capabilities register none, and
+        # inline Location creation moved to the runtime `write_mode` setting in LOC-2), so this merges
+        # nothing — the seam stays for a future flag-gated feature.
         **capabilities.all_default_settings(),
     }
 
@@ -97,6 +98,10 @@ class FacilityMapConfig(PluginConfig):
         # import the module here to run its `@register_widget` decorator at app-ready.
         super().ready()
         from . import dashboard  # noqa: F401
+        # Wire the slug-rename remap receivers (HEALTH-4) — signal modules aren't auto-discovered,
+        # so connect them here at app-ready, the same manual step the dashboard widget import is.
+        from . import signals
+        signals.connect()
         # Register any dashboard widgets contributed by an enabled capability (same manual step —
         # NetBox doesn't auto-discover widgets). Empty until a capability ships one (ADDON-2 seam).
         from extras.dashboard.widgets import register_widget

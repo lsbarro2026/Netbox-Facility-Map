@@ -16,6 +16,11 @@
 
 const ORTHO_KEY = 'facilitymap:ortho';   // persisted right-angle-snap toggle (default on)
 
+// Draft kinds that are a single point rather than a run of them: the first click both places
+// and finishes them (see the click handler in _bindPointer). A subclass opts a tool in by
+// drafting one of these kinds — FloorEditor's text note and access-point tools do.
+const SINGLE_POINT_KINDS = new Set(['note', 'ap']);
+
 class Editor {
   constructor(app) {
     this.app = app;
@@ -33,6 +38,7 @@ class Editor {
     this.dragVertex = null;        // { poly, i, exclude, dirty } while dragging
     this.gridDrag = null;          // { x, y, ox, oy } while moving grid
     this.dragItem = null;          // { move(nx,ny) } while dragging a free point (e.g. a rack marker)
+    this.dragEdge = null;          // { move(nx,ny,ev) } while dragging a whole polygon edge (both endpoints)
     this.dragSheet = null;         // { move(nx,ny), drop() } while dragging a whole sheet (Arrange mode)
     this.pan = null;               // { x, y, moved, btn } while panning the viewport
     this._pointers = new Map();    // active TOUCH pointerId -> { x, y }, tracked for multi-touch pinch-zoom
@@ -71,12 +77,14 @@ class Editor {
 
   // ---- undo (Ctrl+Z) ----
   // A subclass opts into undo by implementing this pair. `_snapshotState()` returns a
-  // JSON-serializable clone of everything a mutation could change (its shapes + the
-  // store dirty flags), or null to opt out (the base default — undo is then a no-op).
-  // `_restoreState(snap)` applies such a snapshot back onto the store and refreshes the
-  // badge. Snapshots are taken BEFORE a mutation (and before markDirty), so restoring
-  // one also restores the pre-edit dirty state — undoing back to a saved state clears
-  // the badge for free.
+  // JSON-serializable clone of everything a mutation could change (its shapes/data), or null
+  // to opt out (the base default — undo is then a no-op). `_restoreState(snap)` writes such a
+  // snapshot back onto the store, RE-DERIVES the dirty flags from the store baselines, and
+  // refreshes the badge. Snapshots are taken BEFORE a mutation; the flags are re-derived rather
+  // than stored, because history now survives a Save (SAVE-6) — a save advances the baselines, so
+  // a flag captured before the mutation would be stale after the save, whereas re-deriving from
+  // last-saved content is always correct (undoing back across a save re-marks the badge dirty so
+  // the restored state can be re-saved).
   _snapshotState() { return null; }
   _restoreState(snap) {}
 
@@ -314,15 +322,21 @@ class Editor {
     const wrap = svgEl.parentNode, container = wrap.parentNode;
     this.wrap = wrap;
     this.viewport.mount(wrap, container);
+    // Cull the legibility-floored labels once the viewport is zoomed out to ~the overview,
+    // where they'd otherwise pile into an unreadable carpet (READ-2). Fires only on a real
+    // zoom change, so pans don't touch the class.
+    this.viewport.onScale = (k) => this._applyLabelLod(k);
     if (this.app.interactive) container.append(this._zoomControls());
     // Fit once the wrap has real dimensions. A floor can tile several sheets, so
-    // wait for every <img> to load before measuring (each one grows the wrap). A
-    // multi-sheet floor frames its primary sheet (this.initialFocus); else full fit.
-    // The fit still bails if the viewport itself hasn't been laid out yet (a fit
-    // against a zero-size box is what leaves the map stuck zoomed-in at the top-left);
-    // in that case _fitted stays false and the ResizeObserver below retries once the
-    // container has a real size. After the first successful fit the observer reverts
-    // to clamp-only, so a later window resize never resets the user's pan/zoom.
+    // wait for every <img> to settle (load or error) before measuring (each one grows the
+    // wrap). A settled-but-broken sheet (HEALTH-9: a 404'd plan image) still counts — otherwise
+    // a single missing sheet on a multi-sheet floor would starve _imgsReady forever and leave
+    // the whole floor, not just that sheet, stuck unfitted. A multi-sheet floor frames its
+    // primary sheet (this.initialFocus); else full fit. The fit still bails if the viewport
+    // itself hasn't been laid out yet (a fit against a zero-size box is what leaves the map
+    // stuck zoomed-in at the top-left); in that case _fitted stays false and the ResizeObserver
+    // below retries once the container has a real size. After the first successful fit the
+    // observer reverts to clamp-only, so a later window resize never resets the user's pan/zoom.
     const fit = () => {
       this.render();
       const ok = this.initialFocus ? this.viewport.fitRegion(...this.initialFocus) : this.viewport.fit();
@@ -331,12 +345,104 @@ class Editor {
     const imgs = [...wrap.querySelectorAll('img')];
     let pending = imgs.filter(im => !im.complete).length;
     const ready = () => { this._imgsReady = true; fit(); };
-    pending ? imgs.forEach(im => im.complete || im.addEventListener('load',
-      () => { if (--pending === 0) ready(); })) : ready();
+    const settle = () => { if (--pending === 0) ready(); };
+    pending ? imgs.forEach(im => { if (im.complete) return;
+      im.addEventListener('load', settle); im.addEventListener('error', settle); }) : ready();
     new ResizeObserver(() => {
       if (this._imgsReady && !this._fitted) return fit();   // retry a fit that measured a not-yet-sized viewport
       this.render(); this.viewport.onResize();
     }).observe(container);
+  }
+
+  /** Toggle the zoomed-out label cull (READ-2). Below `LABEL_LOD_SCALE` the CSS legibility floor
+   *  has blown labels up enough that they'd overlap into a carpet, so `.labels-lod` hides them
+   *  (the label being edited stays via `.lod-keep`); above it they draw normally and the floor
+   *  keeps them readable. Driven by `PanZoom.onScale`, so it only runs on a real zoom change. */
+  _applyLabelLod(k) {
+    if (this.svg) this.svg.classList.toggle('labels-lod', k < LABEL_LOD_SCALE);
+  }
+
+  /** Make a side panel drag-resizable and collapsible, persisting its width + collapsed state to
+   *  localStorage. Shared by both editors (the shared-base / Edit-menu-lockstep rule): the
+   *  siteplan building index (`SiteplanEditor`) and the floor to-do list (`FloorEditor`) are the
+   *  same interaction, so it lives here once rather than copy-pasted into each. The panel sits in a
+   *  flex row beside the `flex:1 1 auto` `.map-viewport`, so changing only the panel width reflows
+   *  the map, and that reflow trips the viewport's ResizeObserver (see `attach`), which re-clamps
+   *  pan/zoom — keeping normalized 0..1 coordinates correct after a resize.
+   *
+   *  `opts = { view, panel, handle, widthKey, collapsedKey, minW, collapseW, defaultW, maxFrac }`:
+   *  `view` is the flex-row container, `panel`/`handle` the elements to size/drag, and the
+   *  remaining keys the panel's own localStorage keys + sizing, so the two panels persist and clamp
+   *  independently. Non-embed only (the chrome-free dashboard embed keeps a plain fixed panel). */
+  _installPanelResize(opts) {
+    const { view, panel, handle, widthKey, collapsedKey, minW, collapseW, defaultW, maxFrac } = opts;
+    // The single show/hide control is the shared top-bar toggle (NAV-8), a persistent `#topbar`
+    // button. Only one editor is shown at a time, so both panels reuse this one button: reveal it
+    // on this non-embed path (App.router re-hides it on leaving) and mirror the panel's visibility
+    // as its `.active` state. Reassigned (not addEventListener) each show, so re-entering a view
+    // never stacks handlers on the persistent button.
+    const toggle = Dom.$('#panel-toggle');
+    toggle.hidden = false;
+
+    const maxW = () => Math.max(minW, Math.round(view.clientWidth * maxFrac));
+    const applyWidth = (w) => {
+      panel.style.width = Math.round(Math.min(maxW(), Math.max(minW, w))) + 'px';
+    };
+    const setCollapsed = (on, persist = true) => {
+      panel.hidden = on; handle.hidden = on;
+      toggle.classList.toggle('active', !on);   // pressed when the panel is showing
+      toggle.setAttribute('aria-pressed', String(!on));
+      if (persist) { try { localStorage.setItem(collapsedKey, on ? '1' : '0'); } catch (e) {} }
+    };
+
+    // Restore persisted state. Width is applied even while collapsed so a later expand returns to
+    // the remembered size.
+    const saved = this._loadPanelWidth(widthKey);
+    applyWidth(saved != null ? saved : defaultW);
+    setCollapsed(this._loadPanelCollapsed(collapsedKey), false);
+    // Published so a subclass can open its own panel programmatically — the floor's per-room "+"
+    // reveals the to-do panel before pre-filling the composer. Kept as the one writer of the
+    // collapsed state (toggle `.active`, persistence) so no caller can half-set it by hand.
+    this._setPanelCollapsed = setCollapsed;
+    this._panelCollapsed = () => panel.hidden;
+
+    toggle.onclick = () => setCollapsed(!panel.hidden);
+    handle.addEventListener('dblclick', () => setCollapsed(true));
+
+    let startX = 0, startW = 0, willCollapse = false;
+    handle.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      startX = e.clientX; startW = panel.offsetWidth; willCollapse = false;
+      handle.setPointerCapture(e.pointerId);
+      handle.classList.add('dragging');
+    });
+    handle.addEventListener('pointermove', (e) => {
+      if (!handle.hasPointerCapture(e.pointerId)) return;
+      const desired = startW + (startX - e.clientX);   // drag left → widen, right → narrow
+      willCollapse = desired < collapseW;
+      handle.classList.toggle('will-collapse', willCollapse);
+      applyWidth(desired);
+    });
+    const end = (e) => {
+      if (!handle.hasPointerCapture(e.pointerId)) return;
+      handle.releasePointerCapture(e.pointerId);
+      handle.classList.remove('dragging', 'will-collapse');
+      if (willCollapse) { setCollapsed(true); return; }   // released past the min → collapse
+      try { localStorage.setItem(widthKey, String(panel.offsetWidth)); } catch (e2) {}
+    };
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
+  }
+
+  /** Persisted panel width (px) for `key`, or null when unset/invalid. */
+  _loadPanelWidth(key) {
+    try { const v = Number(localStorage.getItem(key)); return v > 0 ? v : null; }
+    catch (e) { return null; }
+  }
+  /** Whether the panel under `key` was left collapsed; defaults to expanded when unset. */
+  _loadPanelCollapsed(key) {
+    try { return localStorage.getItem(key) === '1'; }
+    catch (e) { return false; }
   }
 
   _bindPointer() {
@@ -368,8 +474,9 @@ class Editor {
       if (this.draft) {
         const snapped = this._placePoint(...this.evtNorm(e), this._draftNeighbours()).pt;
         const dp = this.draft.points;
-        // A text note is a single-point shape: the first click places it and finishes.
-        if (this.draft.kind === 'note') { dp.push(snapped); return this.finish(); }
+        // A single-point shape (a text note, an access point): the first click places it
+        // and finishes — there is no second point to wait for.
+        if (SINGLE_POINT_KINDS.has(this.draft.kind)) { dp.push(snapped); return this.finish(); }
         // Polygons close when you click near the first point; an open arrow never does.
         if (this.draft.kind !== 'arrow' && dp.length >= 3) {
           const [W, H] = this.dispSize();
@@ -421,8 +528,9 @@ class Editor {
       // A vertex/marker press only becomes an edit once the pointer travels past a
       // small threshold; below it the press is a select/inspect click and must not
       // move geometry or mark the store dirty (else a stray click looks like an edit).
-      if ((this.dragItem || this.dragVertex) && !this._pastDragThreshold(e)) return;
+      if ((this.dragItem || this.dragVertex || this.dragEdge) && !this._pastDragThreshold(e)) return;
       if (this.dragItem) { this.dragItem.move(...this.evtNorm(e), e); return; }
+      if (this.dragEdge) { this.dragEdge.move(...this.evtNorm(e), e); return; }
       if (this.dragVertex) {
         // A midpoint press defers inserting its node until the drag really starts, so
         // clicking a midpoint without dragging adds nothing (and stays clean).
@@ -463,19 +571,19 @@ class Editor {
       if (this.dragSheet) { this._suppressClick = true; const d = this.dragSheet; this.dragSheet = null; d.drop(); return; }
       // A left-button pan is followed by a click event — swallow that one click.
       if (this.pan && this.pan.moved && this.pan.btn === 0) this._suppressClick = true;
-      // A vertex/handle press or drag also ends with a synthetic click on the svg;
+      // A vertex/handle/edge press or drag also ends with a synthetic click on the svg;
       // swallow it so it doesn't fall through to the background-click deselect,
       // keeping the shape selected for the next node edit.
-      if (this.dragVertex || this.dragItem) this._suppressClick = true;
-      // A vertex/marker drag that actually moved geometry commits its pre-drag snapshot
+      if (this.dragVertex || this.dragItem || this.dragEdge) this._suppressClick = true;
+      // A vertex/marker/edge drag that actually moved geometry commits its pre-drag snapshot
       // to the undo history (captured on pointerdown). A press that never passed the
       // drag threshold — a plain select/inspect click — mutated nothing, so discard it.
-      if ((this.dragVertex || this.dragItem) && this._dragDown && this._dragDown.moved
+      if ((this.dragVertex || this.dragItem || this.dragEdge) && this._dragDown && this._dragDown.moved
           && this._gestureSnap) this.history.push(this._gestureSnap);
       this._gestureSnap = null;
       const hadVertex = !!this.dragVertex;
       this.pan = null; s.classList.remove('panning');
-      this.dragVertex = null; this.gridDrag = null; this.dragItem = null;
+      this.dragVertex = null; this.gridDrag = null; this.dragItem = null; this.dragEdge = null;
       if (hadVertex) this.renderActive();   // drop the transient right-angle guide
     });
     s.addEventListener('pointerleave', () => {
@@ -504,6 +612,43 @@ class Editor {
     d.moved = true; return true;
   }
 
+  /** Index of the polygon edge the press `e` lies on (within a zoom-invariant grab band),
+   *  or -1 when the press is in the interior. `poly` is normalized; the band mirrors
+   *  snapPoint's SNAP_PX/scale so it feels the same at any zoom, and the projection is done
+   *  in displayed px (via W/H) so the non-uniform 0..1 space doesn't skew the distance.
+   *  A general hit-test for edge dragging: a caller wires it on a selected shape's own body
+   *  press, where the vertex/midpoint circles' stopPropagation has already excluded node
+   *  presses, so a positive hit is an edge grab and a -1 falls through to a whole-shape move. */
+  _edgeHit(e, poly) {
+    const [W, H] = this.dispSize(); if (!W) return -1;
+    const [nx, ny] = this.evtNorm(e);
+    const px = nx * W, py = ny * H;
+    let best = EDGE_GRAB_PX / this.viewport.scale, hit = -1;
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i], b = poly[(i + 1) % poly.length];
+      const pr = Geom.projSeg(px, py, a[0] * W, a[1] * H, b[0] * W, b[1] * H);
+      if (pr.d < best) { best = pr.d; hit = i; }
+    }
+    return hit;
+  }
+
+  /** CAD-style resize cursor for hovering polygon edge `i` (a companion to `_edgeHit`): the
+   *  double-arrow aligned with the edge's *perpendicular*, i.e. the axis a wall drag moves
+   *  along. The edge angle is taken in displayed px (via W/H, like `_edgeHit`) so the
+   *  non-uniform 0..1 space doesn't skew it, then rotated 90° and bucketed to the nearest 45°.
+   *  Axis-aligned rooms — the common case — resolve exactly (horizontal edge -> `ns-resize`,
+   *  vertical -> `ew-resize`); diagonals get the matching diagonal resize cursor. */
+  _edgeCursor(poly, i) {
+    const [W, H] = this.dispSize();
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    let deg = Math.atan2((b[1] - a[1]) * H, (b[0] - a[0]) * W) * 180 / Math.PI + 90;
+    deg = ((deg % 180) + 180) % 180;   // motion axis in [0,180)
+    if (deg < 22.5 || deg >= 157.5) return 'ew-resize';
+    if (deg < 67.5) return 'nwse-resize';
+    if (deg < 112.5) return 'ns-resize';
+    return 'nesw-resize';
+  }
+
   // ---- multi-touch pinch-zoom (view-mode touch; MOBILE-1) ----
   // Two fingers zoom the viewport. Zoom is safe in every mode, but a pinch never
   // hijacks an in-progress edit gesture (vertex/marker/sheet/grid/rect/draft), so
@@ -512,7 +657,7 @@ class Editor {
   /** A second finger landed: begin a pinch. Converts any in-progress background pan
    *  into the pinch and seeds the initial finger distance + midpoint. */
   _beginPinch() {
-    if (this.dragVertex || this.dragItem || this.dragSheet || this.gridDrag
+    if (this.dragVertex || this.dragItem || this.dragEdge || this.dragSheet || this.gridDrag
         || this.rectDraft || this.draft) return;
     const [a, b] = [...this._pointers.values()];
     this._pinch = { dist: Math.hypot(a.x - b.x, a.y - b.y),
@@ -710,11 +855,22 @@ class Editor {
     const ls = shape.labelStyle || {};
     if (ls.font) textEl.style.fontFamily = ls.font;
     if (ls.color) textEl.style.fill = ls.color;
-    const g = Dom.svg('g', { class: 'label-grp',
+    // The label being edited stays visible through the zoomed-out LOD cull (.lod-keep), so
+    // its move/rotate/resize handles never vanish mid-edit.
+    const editing = this.editingLabel === this._labelKey(shape);
+    const g = Dom.svg('g', { class: 'label-grp' + (editing ? ' lod-keep' : ''),
       transform: `translate(${cx * W},${cy * H}) rotate(${ls.rot || 0})` });
-    g.append(textEl);
+    // Inner counter-scale group: it (and, for placements, the chip inserted into it) is what
+    // the CSS legibility floor scales — as one unit, about its own centre — so a zoomed-out
+    // label holds a readable on-screen size (`.label-scale` reads `--label-base` + `--inv-scale`,
+    // READ-2). `--label-base` is unitless so the CSS `calc()` yields a plain number for `scale()`.
+    // Handles are appended to `g`, outside this group, so they don't counter-scale.
+    const gScale = Dom.svg('g', { class: 'label-scale' });
+    gScale.style.setProperty('--label-base', String(sizePx));
+    gScale.append(textEl);
+    g.append(gScale);
     s.append(g);
-    if (this.editingLabel !== this._labelKey(shape)) return g;
+    if (!editing) return g;
 
     // Drag the label to move it (snaps to the grid; Alt frees it). Keep the grab
     // offset so it doesn't jump its centre under the cursor.
@@ -927,6 +1083,8 @@ class Editor {
       const draw = this._editButtons();
       if (draw.length) tb.push(...draw, this.toolDivider());
       tb.push(this.undoButton(), this.toolDivider(), ...this._alignTools());
+      const devices = this._deviceTools();
+      if (devices.length) tb.push(this.toolDivider(), ...devices);
       const extra = this._editExtras();
       if (extra.length) tb.push(this.toolDivider(), ...extra);
     } else {
@@ -944,12 +1102,14 @@ class Editor {
 
   // Toolbar hooks — a subclass overrides only what it needs. `_editButtons` are the
   // mode-specific draw/add tools (undo is appended by the base); `_alignTools` is the
-  // right-angle/grid factory row (FloorEditor prepends its Snap toggle); `_editExtras`
-  // are the trailing edit-only tools (copy/racks/arrange/overlay); `_viewButtons` are the
-  // view-mode tools; `_showsSave` gates the Save+badge cluster (SiteplanEditor hides it in
-  // view — its home screen stays uncluttered).
+  // right-angle/grid factory row (FloorEditor prepends its Snap toggle); `_deviceTools`
+  // are the device-placement tools (AP/rack); `_editExtras` are the trailing edit-only
+  // tools (arrange/copy/overlay); `_viewButtons` are the view-mode tools; `_showsSave`
+  // gates the Save+badge cluster (SiteplanEditor hides it in view — its home screen stays
+  // uncluttered).
   _editButtons() { return []; }
   _alignTools() { return [this.orthoButton(), this.gridToggleButton(), this.gridSizeSelect(), this.gridMoveButton()]; }
+  _deviceTools() { return []; }
   _editExtras() { return []; }
   _viewButtons() { return []; }
   _showsSave() { return true; }
@@ -957,13 +1117,57 @@ class Editor {
 
   /** The mode-toggle button: an edit ⇄ done switch shared by both editors. `Icons.edit`
    *  + label (`Edit` while viewing, `Done` while editing), `.active` in edit mode; routes
-   *  through `_switchMode`. */
+   *  through `_requestModeSwitch` (the unsaved-work gate), which dispatches `_switchMode`. */
   _modeButton() {
     const editing = this.editing();
     const b = Dom.el('button', { class: 'mode' + (editing ? ' active' : ''),
       html: Icons.edit + '<span>' + (editing ? 'Done' : 'Edit') + '</span>' });
-    b.onclick = () => this._switchMode(editing ? 'view' : 'edit');
+    b.onclick = () => this._requestModeSwitch(editing ? 'view' : 'edit');
     return b;
+  }
+
+  /** Gate the edit ⇄ view toggle on unsaved work. Leaving edit mode (`view`) with a dirty
+   *  editor prompts Save / Leave / Cancel before dispatching; entering edit, or leaving a
+   *  clean editor, switches immediately. The gate sits here — at the `_modeButton` onclick,
+   *  BEFORE `_switchMode` — so it covers both editors and `FloorEditor`'s Arrange sub-mode
+   *  override (which early-returns without calling the base `_switchMode`). Save awaits the
+   *  persist and only exits on success; Leave discards the in-memory edits via `store.discard`
+   *  (re-fetching authoritative server state, mirroring the page-nav guard) so view mode shows
+   *  reverted data with a clean badge; Cancel stays in edit. */
+  async _requestModeSwitch(mode) {
+    if (mode === 'view' && this._dirty()) {
+      const choice = await this._confirmLeaveEdit();
+      if (choice === 'cancel') return;
+      if (choice === 'save') { if (!await this.save()) return; }
+      else {
+        try { await this.store.discard(); }
+        catch (e) { Toast.show('Could not discard unsaved changes: ' + e.message, true); return; }
+      }
+    }
+    this._switchMode(mode);
+  }
+
+  /** Unsaved-work prompt shown when leaving edit mode, resolving `'save'` / `'exit'` /
+   *  `'cancel'`. Uses the shared `.fm-modal` dialog pattern (mirrors `SettingsPage`'s confirm
+   *  modals); backdrop, Cancel, or a resolved choice each dismiss it exactly once. */
+  _confirmLeaveEdit() {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (choice) => { if (done) return; done = true; overlay.remove(); resolve(choice); };
+      const overlay = Dom.el('div', { class: 'fm-modal', onclick: (e) => { if (e.target === overlay) finish('cancel'); } }, [
+        Dom.el('div', { class: 'fm-modal-panel' }, [
+          Dom.el('h3', {}, 'Unsaved changes'),
+          Dom.el('p', {},
+            'You have unsaved changes. Leaving edit mode without saving will discard them.'),
+          Dom.el('div', { class: 'fm-modal-actions' }, [
+            Dom.el('button', { onclick: () => finish('cancel') }, 'Cancel'),
+            Dom.el('button', { onclick: () => finish('exit') }, 'Leave without saving'),
+            Dom.el('button', { class: 'primary', onclick: () => finish('save') }, 'Save'),
+          ]),
+        ]),
+      ]);
+      document.body.append(overlay);
+    });
   }
 
   /** Toggle edit ⇄ view in place — rebuild the toolbar and re-`render()` against the
@@ -992,19 +1196,65 @@ class Editor {
    *  subclass that persists overrides it (e.g. the siteplan dirty flag, or the floor's
    *  three-category union). */
   _dirty() { return false; }
-  /** Persist this editor's work, then clear undo history (undoing across a save would
-   *  restore stale dirty flags against now-saved data), refresh the badge, and toast.
+  /** Persist this editor's work, then refresh the badge and toast. History is deliberately
+   *  KEPT across a save so a just-saved mistake stays undoable (SAVE-6) — the save advances the
+   *  store baselines, and an undo restore re-derives the dirty flags from those baselines
+   *  (`recomputeFloorDirty`/`recomputeSiteDirty`), so undoing back across the save re-marks the
+   *  badge dirty against the now-saved data rather than restoring a stale clean flag.
    *  The whole scaffold — the try/catch and the shared failure toast — lives here so the
    *  two editors can't drift; a subclass supplies only the store writes (`_persist`) and,
-   *  if different, the success message (`_savedMessage`). Clearing an empty history (the
-   *  siteplan opts out of undo) is a harmless no-op. */
+   *  if different, the success message (`_savedMessage`). Returns `true` on success, `false` on
+   *  failure, so a caller (the leave-edit guard) can gate the exit on the save landing. */
   async save() {
     try {
       await this._persist();
-      this.history.clear();
       this._setBadge();
       Toast.show(this._savedMessage());
-    } catch (e) { Toast.show('Save failed: ' + e.message, true); }
+      return true;
+    } catch (e) {
+      // A version conflict (409, `Api.postV` flags `e.conflict`) already carries the friendly
+      // "the map changed — reload and re-apply" guidance as its message; show it verbatim rather
+      // than burying it under a generic "Save failed:" prefix. The edits stay in memory (the save
+      // threw before clearing the dirty flag), so the user can reload and re-apply (CONC-1).
+      if (e.conflict) { Toast.show(e.message, true); return false; }
+      // Any other failure — a session/CSRF expiry (403) after a long edit, a transient network or
+      // server error — keeps the edits in memory AND in the local crash-recovery draft (SAVE-5), so
+      // nothing is lost. Offer an actionable Retry via a modal rather than a toast that auto-dismisses.
+      const choice = await this._saveFailedDialog(e);
+      if (choice === 'retry') return this.save();
+      if (choice === 'reload') { location.reload(); return false; }
+      return false;
+    }
+  }
+
+  /** Save-failure prompt (non-conflict) — a `.fm-modal` mirroring `_confirmLeaveEdit`. It surfaces
+   *  the error and offers Retry: the edits are kept in memory and mirrored to a local draft
+   *  (SAVE-5), so a failed save never silently loses work. A likely session/CSRF expiry (403,
+   *  `Api.postV` flags `e.authExpired`) also offers Reload, whose re-auth + on-load draft-restore
+   *  prompt brings the work back. Resolves `'retry' | 'reload' | 'dismiss'`; backdrop or Dismiss
+   *  resolves `'dismiss'`. */
+  _saveFailedDialog(e) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => { if (done) return; done = true; overlay.remove(); resolve(v); };
+      const msg = e.authExpired
+        ? 'Your session may have expired, so the save was rejected. Your changes are kept and saved '
+          + 'as a local draft, so they will not be lost — reload to sign back in (your draft is offered '
+          + 'on load), or retry now.'
+        : 'The save could not be completed: ' + e.message + ' Your changes are kept and saved as a '
+          + 'local draft, so they will not be lost.';
+      const actions = [Dom.el('button', { onclick: () => finish('dismiss') }, 'Dismiss')];
+      if (e.authExpired) actions.push(Dom.el('button', { onclick: () => finish('reload') }, 'Reload page'));
+      actions.push(Dom.el('button', { class: 'primary', onclick: () => finish('retry') }, 'Retry'));
+      const overlay = Dom.el('div', { class: 'fm-modal', onclick: (ev) => { if (ev.target === overlay) finish('dismiss'); } }, [
+        Dom.el('div', { class: 'fm-modal-panel' }, [
+          Dom.el('h3', {}, 'Save failed'),
+          Dom.el('p', {}, msg),
+          Dom.el('div', { class: 'fm-modal-actions' }, actions),
+        ]),
+      ]);
+      document.body.append(overlay);
+    });
   }
   /** The actual store writes for this editor. Subclass responsibility. */
   _persist() {}
@@ -1032,7 +1282,10 @@ class Editor {
    *  rows (`.nm` primary + `.sl` sub, `.bound` when selected). Shared by the floor
    *  room→Location panel and the siteplan area→building panel. `opts`:
    *  `{ items, placeholder, filter(item, ql)→bool, row(item)→{nm, sl, bound}, pick(item),
-   *  limit? }`. Appends the input + list into `body`, auto-focuses, and returns
+   *  limit?, footer? }`. `footer(list, matches, ql)` (optional) is invoked after the rows on every
+   *  keystroke so a caller can append a match-count-aware affordance into the results — the floor
+   *  panel uses it for the contextual "create new room" tile (LOC-2); the siteplan panel passes
+   *  none, so it is unaffected. Appends the input + list into `body`, auto-focuses, and returns
    *  `{ search, list, renderList }` so a caller can splice extra hints around them. */
   _bindList(body, opts) {
     const search = Dom.el('input', { id: 'room-search', placeholder: opts.placeholder });
@@ -1052,6 +1305,7 @@ class Editor {
         item.onclick = () => opts.pick(it);
         list.append(item);
       }
+      if (opts.footer) opts.footer(list, matches, ql);
     };
     search.addEventListener('input', () => renderList(search.value));
     renderList(''); search.focus();

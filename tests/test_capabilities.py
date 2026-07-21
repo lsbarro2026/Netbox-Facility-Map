@@ -169,26 +169,6 @@ def test_enabled_keys_are_a_subset_of_known_keys():
     assert set(cap.enabled_keys()) <= known
 
 
-# ---- The shipped location-create feature capability (LOC-1) ------------------------------------
-
-def test_location_create_capability_is_flag_gated_off_by_default():
-    # The first shipped *feature* add-on: registered, feature-flag gated, and its default is off so
-    # the core stays barebones and NetBox keeps being the Location source of truth by default.
-    (loc,) = [c for c in cap.CAPABILITIES if c.key == "location-create"]
-    assert loc.setting_flag == "allow_location_create"
-    assert loc.requires_module == () and loc.requires_binary == ()
-    assert cap.all_default_settings()["allow_location_create"] is False
-
-
-def test_location_create_is_enabled_follows_the_flag(monkeypatch):
-    # `is_enabled` is the backend mirror of App.hasCapability — the create endpoint gates on it.
-    import netbox.plugins as np
-    monkeypatch.setattr(np, "get_plugin_config", lambda _app, _key: False)
-    assert cap.is_enabled("location-create") is False
-    monkeypatch.setattr(np, "get_plugin_config", lambda _app, _key: True)
-    assert cap.is_enabled("location-create") is True
-
-
 # ---- Isolation contract: no Django / decoder import at module scope ----------------------------
 
 def test_module_top_level_is_import_safe():

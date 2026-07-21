@@ -1,17 +1,30 @@
 {% comment %}
-  Rack/device placement markers (MVP boxes), included by floor_rooms.html.
-  Expects `markers` (from previews.placement_markers): pre-computed transform + centered
-  rect attrs + label + a permission-scoped `url` to the rack/device's NetBox page (empty
-  when it didn't resolve). When `m.url` is set the marker links to that page (mirroring how
-  room polygons wrap on `s.url` in floor_rooms.html); otherwise it's a plain, link-less box.
-  Styling is inline because the host page doesn't load the plugin CSS.
+  Rack/device placement markers, included by floor_rooms.html.
+  Expects `markers` (from previews.placement_markers): a pre-computed transform, a `glyph` list
+  of styled SVG primitives (the device's schematic shape from DeviceShapes — an AP's broadcast
+  puck, a switch's port row, …), a label, and a permission-scoped `url` to the rack/device's
+  NetBox page (empty when it didn't resolve). When `m.url` is set the marker links to that page
+  (mirroring how room polygons wrap on `s.url` in floor_rooms.html); otherwise it's link-less.
+  Each primitive carries its own inline `style` (the host page loads no plugin CSS) and a
+  non-scaling stroke so the glyph reads at a stable weight however the embed SVG is scaled.
 {% endcomment %}
 {% for m in markers %}
   {% if m.url %}<a href="{{ m.url }}" target="_blank">{% endif %}
   <g transform="{{ m.transform }}">
-    <rect x="{{ m.x }}" y="{{ m.y }}" width="{{ m.w }}" height="{{ m.h }}" rx="2"
-          vector-effect="non-scaling-stroke"
-          style="{% if m.is_rack %}fill:#cfd6e0;stroke:#57606a{% else %}fill:#ddf4ff;stroke:#0969da{% endif %};stroke-width:1.5"/>
+    {% for g in m.glyph %}
+      {% if g.tag == 'rect' %}
+        <rect x="{{ g.x }}" y="{{ g.y }}" width="{{ g.w }}" height="{{ g.h }}" rx="2"
+              vector-effect="non-scaling-stroke" style="{{ g.style }}"/>
+      {% elif g.tag == 'line' %}
+        <line x1="{{ g.x1 }}" y1="{{ g.y1 }}" x2="{{ g.x2 }}" y2="{{ g.y2 }}"
+              vector-effect="non-scaling-stroke" style="{{ g.style }}"/>
+      {% elif g.tag == 'circle' %}
+        <circle cx="{{ g.cx }}" cy="{{ g.cy }}" r="{{ g.r }}"
+                vector-effect="non-scaling-stroke" style="{{ g.style }}"/>
+      {% elif g.tag == 'path' %}
+        <path d="{{ g.d }}" vector-effect="non-scaling-stroke" style="{{ g.style }}"/>
+      {% endif %}
+    {% endfor %}
     {% if m.label %}
       <text x="0" y="{{ m.label_y }}" text-anchor="middle"
             style="font:600 11px sans-serif;paint-order:stroke;stroke:#fff;stroke-width:3px;fill:#1a1a1a">{{ m.label }}</text>

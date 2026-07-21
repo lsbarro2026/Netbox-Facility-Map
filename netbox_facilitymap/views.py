@@ -1,10 +1,10 @@
 """Server-rendered UI pages for the plugin.
 
 `MapView` serves the full-bleed map application shell (the framework-free frontend then
-talks back through `frontend_api`); `SettingsView` is the permission-gated page for the
-editable plugin settings. Both are login-gated and read NetBox data straight from the ORM —
-there is no API token in play. Room/Location page content lives in `template_content.py`,
-not here.
+talks back through `frontend_api`); `TodoTabView` and `ImportTabView` are nav-reachable entry
+points to two of that shell's SPA routes; `SettingsView` is the permission-gated page for the
+editable plugin settings. All are login-gated and read NetBox data straight from the ORM — there
+is no API token in play. Room/Location page content lives in `template_content.py`, not here.
 """
 
 import json
@@ -18,13 +18,17 @@ from django.views import View
 from django.views.generic import TemplateView
 from netbox.plugins import get_plugin_config
 
+from dcim.models import DeviceRole
+
 from . import capabilities, facilities, health
 from .access import IMPORT_PERM, MapReadAccessMixin
-from .drawing_formats import COMPANION_EXTS, DRAWING_EXTS
+from .drawing_formats import COMPANION_EXTS, DRAWING_EXTS, OVERLAY_EXTS
+from .frontend_api import serialize_user
 from .models import FacilityMapBlob
 from .previews import (
     ORIENTATION_DEFAULT, SIZE_DEFAULT, SIZE_MAX, SIZE_MIN, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN,
-    RoomEmbedSettings, clamp_embed_size, clamp_floor_label_field, clamp_orientation, clamp_zoom,
+    RoomEmbedSettings, ap_settings, clamp_embed_size, clamp_floor_label_field, clamp_orientation,
+    clamp_zoom, inline_room_creation_enabled, render_hq_enabled, todos_enabled, write_mode_enabled,
 )
 
 # Orientation choices for the Settings <select> (value → human label). The values are the keys
@@ -64,12 +68,22 @@ class MapView(MapReadAccessMixin, TemplateView):
         context['embed'] = 'embed' in self.request.GET
         context['interactive'] = 'interactive' in self.request.GET
         context['legend'] = 'legend' in self.request.GET
+        # `?finder=1` (set by FacilitySearchWidget's iframe) is a search-only embed: the SPA shows
+        # just the wayfinding finder — no map, no legend. Only meaningful alongside `embed`.
+        context['finder'] = 'finder' in self.request.GET
+        # `?target=netbox` (FacilitySearchWidget's result-target option, NAV-16) makes a result click
+        # open the object's NetBox detail page instead of deep-linking the map; anything else (the
+        # default) keeps map navigation. Whitelisted to the two known modes.
+        context['result_target'] = 'netbox' if self.request.GET.get('target') == 'netbox' else 'map'
         # The import wizard's accepted-extension list is derived from the server's format
         # registry (`drawing_formats`) and injected into `window.MAP.drawingExts`, so the
         # frontend doesn't hand-mirror it. `companion_exts` are a drawing's sibling files (a
         # shapefile set) — accepted for upload but not themselves drawings.
         context['drawing_exts'] = json.dumps(list(DRAWING_EXTS))
         context['companion_exts'] = json.dumps(list(COMPANION_EXTS))
+        # `overlay_exts` is the OVERLAY-role subset of the accepted drawings — the wizard keys
+        # overlay-only affordances (the FMT-6 align editor) off it, again without hand-mirroring.
+        context['overlay_exts'] = json.dumps(list(OVERLAY_EXTS))
         # The enabled optional capabilities (the add-on framework, ADDON-2), injected into
         # `window.MAP.capabilities` so the frontend can lazy-load + gate a capability's tool on its
         # presence (App.hasCapability) — the same detect-and-enable model as `drawing_exts`. Today
@@ -87,12 +101,55 @@ class MapView(MapReadAccessMixin, TemplateView):
         # remain the security boundary. `can_reset` mirrors ResetView's superuser tier.
         context['can_import'] = self.request.user.has_perm(IMPORT_PERM)
         context['can_reset'] = self.request.user.is_superuser
-        # Whether THIS user may create a NetBox Location inline from the bind panel (LOC-1). The
-        # install-wide on/off is the `location-create` capability (in `capabilities` above); this
-        # per-user flag adds the `dcim.add_location` object permission so the affordance is only
-        # offered to users who could actually create. Both are re-checked server-side in
-        # `NbLocationCreateView` — this is purely UX, like `can_import`/`can_reset`.
+        # Whether THIS user may create a NetBox Location inline from the bind panel (LOC-1/LOC-2). The
+        # install-wide on/off is now the runtime `write_mode` setting (below); this per-user flag adds
+        # the `dcim.add_location` object permission so the affordance is only offered to users who
+        # could actually create. Both are re-checked server-side in `NbLocationCreateView` — this is
+        # purely UX, like `can_import`/`can_reset`.
         context['can_create_location'] = self.request.user.has_perm('dcim.add_location')
+        # Install-wide write mode (LOC-2): the runtime, admin-controlled **master gate** on
+        # everything the plugin writes into NetBox core, replacing the old redeploy-time
+        # `allow_location_create` capability flag. Flipped on the in-app Settings page
+        # (SettingsPage), read back here so the write add-ons apply without a worker restart.
+        # Server-enforced at each write endpoint; this is the UX mirror.
+        context['write_mode'] = write_mode_enabled()
+        # The inline-room-creation add-on's own switch (SET-5), sitting on top of that gate: it, write
+        # mode, and `can_create_location` must all be true before the bind panel offers the create
+        # tile. Server-enforced in `NbLocationCreateView`; UX mirror, like `write_mode` above.
+        context['inline_room_creation'] = inline_room_creation_enabled()
+        # High-quality rendering (READ-1), mirrored so the Settings page can show its current state.
+        # Unlike the switches around it this one steers no browser behaviour at all — the render it
+        # controls happens in the import subprocess — so this is purely the toggle's initial value.
+        context['render_hq'] = render_hq_enabled()
+        # The to-do feature's install-wide switch (ADDON-4) — a general (non-write) add-on. Mirrored
+        # to the browser so the SPA hides the to-do pages, the floor panel, and the compose icon when
+        # off; every to-do endpoint re-checks it server-side (frontend_api.TodoFeatureGateMixin), so
+        # this is the UX mirror, like write_mode/ap_tool above.
+        context['todos'] = todos_enabled()
+        # Access-point tool configuration (DEV-3), mirrored to the browser so the Settings page can
+        # render its current state and the floor editor can decide whether to offer the tool. Every
+        # value is re-read/re-enforced server-side; this is the UX mirror, like `write_mode` above.
+        # `can_create_device` is the per-user half (`dcim.add_device`), the exact analogue of
+        # `can_create_location` — the AP tool's install-wide halves are `ap_tool` AND `write_mode`.
+        ap = ap_settings()
+        context['ap_tool'] = ap['enabled']
+        context['ap_name_template'] = ap['name_template']
+        context['ap_count_scope'] = ap['count_scope']
+        context['can_create_device'] = self.request.user.has_perm('dcim.add_device')
+        # Resolve the configured role id to {id,name} so the Settings combobox shows its label
+        # without a round-trip. A role that has since been deleted — or that this user may not see —
+        # resolves to None, i.e. "unconfigured": the picker opens empty and the tool stays hidden,
+        # which is the honest reading. `clamp_ap_device_role` deliberately doesn't check existence
+        # (a clamp can't ask the ORM); this is where that question gets answered.
+        #
+        # Passed as a dict, NOT pre-serialised with json.dumps + |safe like `capabilities`/
+        # `drawing_exts` above: those are fixed server-side vocabularies, whereas a role name (and
+        # `ap_name_template`) is operator-typed free text. JSON escaping does not escape `/`, so a
+        # name containing `</script>` would break out of the inline <script> block. The template
+        # renders both through `|escapejs`, which is the correct escaping for a JS string context.
+        role = (DeviceRole.objects.restrict(self.request.user, 'view')
+                .filter(pk=ap['device_role']).first() if ap['device_role'] else None)
+        context['ap_device_role'] = {'id': role.pk, 'name': role.name} if role else None
         # Default Location field the import wizard's floor-label picker starts on; the wizard
         # lets the user override it per import without editing PLUGINS_CONFIG.
         context['floor_label_field'] = _floor_label_field()
@@ -102,11 +159,68 @@ class MapView(MapReadAccessMixin, TemplateView):
         # the frontend never boots into a dead or empty facility. See facilities.default_facility.
         context['default_facility'] = facilities.default_facility()
         # A read-only pointer banner (HEALTH-1): flag when the install holds map data parked under a
-        # facility no current Site resolves to, so an importer sees "your data looks empty because a
-        # grouping change orphaned it — reassign it in Settings" rather than a silently blank map.
-        # Purely informational; the reassignment itself is the IMPORT_PERM-gated Settings action.
+        # facility no current Site resolves to, so a viewer sees "the map looks empty because a
+        # grouping change orphaned it" rather than a silently blank map. Surfaced to EVERY map viewer
+        # (HEALTH-6), not just importers — the template shows the actionable "reassign it in Settings"
+        # link only to `can_import` users, since the reassignment itself is the IMPORT_PERM-gated
+        # Settings action; other viewers are told an admin must reassign it. Purely informational.
         context['has_orphaned_data'] = bool(facilities.orphaned_facility_keys())
+        # Who is looking at the map (TASK-3). The to-do surfaces sort a user's own to-dos above
+        # everyone else's, so they need the viewer's identity client-side; it is stamped here rather
+        # than fetched because it can't change within a page load, and a round-trip to learn it would
+        # gate the panel's first sort on a request. `serialize_user` is reused verbatim so the viewer
+        # arrives in the exact shape a to-do's `assignees` do and the ids compare directly. This page
+        # is login-gated (`MapReadAccessMixin`), so there is always a real user here.
+        context['map_user'] = serialize_user(self.request.user)
         return context
+
+
+class TodoTabView(MapReadAccessMixin, View):
+    """The **To-do** nav entry (TASK-5) — a redirect to the map shell's `#/todo` SPA route.
+
+    The facility-wide to-do page is a client-side route inside `MapView`'s single-page shell, but a
+    `PluginMenuItem` links by reversible URL *name* and cannot carry a fragment, so the nav needs a
+    real URL to point at. This is it: the one job is to send the browser to the map with the hash
+    that selects the page. (`SettingsView` is not the analogue — that's a genuinely separate
+    server-rendered page, not a route into the shell.)
+
+    A **bare** `#/todo` is deliberate: `App.init` applies the operator-pinned default facility to a
+    hash that names none, preserving the route while it rewrites to `#/y/<slug>/todo` (NAV-10). A
+    facility hard-coded here would instead override that pin. Carries the same read gate as the map
+    it lands on.
+
+    When the to-do add-on is switched off (ADDON-4) this lands on the bare map instead of `#/todo`.
+    The nav item stays statically registered (NetBox caches the plugin menu at worker start, so it
+    can't be hidden live), so a viewer may still click it while the feature is off — a graceful
+    bounce to the map is the honest destination, mirrored client-side by `App.showTodo`. The
+    `api/todos*` data endpoints refuse loudly (404) instead; this is chrome, not an API."""
+
+    def get(self, request):
+        target = reverse('plugins:netbox_facilitymap:map')
+        if todos_enabled():
+            target += '#/todo'
+        return redirect(target)
+
+
+class ImportTabView(MapReadAccessMixin, View):
+    """Nav entry that lands directly on the in-app import/edit flow (`#/import`), HEALTH-8.
+
+    Mirrors `TodoTabView`'s shape exactly, for the same reason: a `PluginMenuItem` links by
+    reversible URL *name* and can't carry a fragment, so this supplies the real URL the nav item
+    points at. Gated only on `MapReadAccessMixin` (the plain map-read check) — deliberately
+    **not** `IMPORT_PERM` — so every change-only editor (holds `change_facilitymapblob` but not
+    `import_facilitymapblob`) can reach it, not just importers (PERM-1, HEALTH-8). The permission
+    split happens at the destination instead: `App.showImport()` already checks `app.canImport`
+    and falls back to `App.showNoImport()`'s "ask an administrator" signpost for anyone who lacks
+    it — this view doesn't duplicate that gate, just like `TodoTabView` doesn't duplicate the
+    to-do add-on's own gating.
+
+    The nav item that links here (`navigation.py`) is gated on `change_facilitymapblob`, so an
+    importer sees this alongside `Settings`' own "Edit buildings & floors" button — a small,
+    deliberate duplication (TASK-5's `To-do` item duplicates map access the same way)."""
+
+    def get(self, request):
+        return redirect(reverse('plugins:netbox_facilitymap:map') + '#/import')
 
 
 class SettingsView(LoginRequiredMixin, PermissionRequiredMixin, View):

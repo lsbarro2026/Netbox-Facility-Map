@@ -14,6 +14,15 @@ from . import capabilities, frontend_api, imports, views
 urlpatterns = [
     path('', views.MapView.as_view(), name='map'),
 
+    # The facility-wide to-do page's nav entry (TASK-5). The page itself is an SPA route
+    # (`#/todo`), but a PluginMenuItem links by URL *name*, so this is the reversible URL that
+    # lands there. Also makes the page linkable/bookmarkable without a hash.
+    path('todo', views.TodoTabView.as_view(), name='todo'),
+
+    # The change-only editor's nav-reachable door into the in-app import/edit flow (`#/import`,
+    # HEALTH-8) — same reversible-URL-name shape as `todo` above, for the same reason.
+    path('import', views.ImportTabView.as_view(), name='import'),
+
     # In-app plugin settings (permission-gated write). Reached from the plugin nav.
     path('settings', views.SettingsView.as_view(), name='settings'),
 
@@ -21,22 +30,69 @@ urlpatterns = [
     # rooted here at /plugins/facilitymap/api/ (see window.MAP.api in index.html).
     path('api/annotations', frontend_api.AnnotationsView.as_view(), name='api-annotations'),
     path('api/siteplan', frontend_api.BlobView.as_view(kind='siteplan'), name='api-siteplan'),
-    path('api/rackplacements', frontend_api.BlobView.as_view(kind='placements'), name='api-placements'),
-    path('api/pagelayouts', frontend_api.BlobView.as_view(kind='layouts'), name='api-layouts'),
+    path('api/rackplacements', frontend_api.BlobView.as_view(kind='placements', sharded=True),
+         name='api-placements'),
+    path('api/pagelayouts', frontend_api.BlobView.as_view(kind='layouts', sharded=True),
+         name='api-layouts'),
 
     # NetBox reads (replace the token-holding proxy with direct ORM queries,
     # restricted by the requester's object permissions).
     path('api/netbox/rooms', frontend_api.NbRoomsView.as_view(), name='api-nb-rooms'),
     path('api/netbox/locations', frontend_api.NbLocationsView.as_view(), name='api-nb-locations'),
-    # The plugin's one write into dcim core (LOC-1): create a child Location under a floor Location.
-    # Gated on the off-by-default `allow_location_create` capability flag + the `dcim.add_location`
-    # object permission (both enforced in the view), unlike the login-only reads above.
+    # The plugin's one write into dcim core (LOC-1/LOC-2): create a child Location under a floor
+    # Location. Gated on the off-by-default runtime `write_mode` master gate + the
+    # `inline_room_creation` add-on switch (SET-5) + the `dcim.add_location` object permission (all
+    # enforced in the view), unlike the login-only reads above.
     path('api/netbox/locations/create', frontend_api.NbLocationCreateView.as_view(),
          name='api-nb-location-create'),
     path('api/netbox/sites', frontend_api.NbSitesView.as_view(), name='api-nb-sites'),
+    # Sibling of api/netbox/sites for the Site = campus topology: candidate building-anchor
+    # Locations, facility-scoped the same way (FACIL-1, MODEL-4).
+    path('api/netbox/building-locations', frontend_api.NbBuildingLocationsView.as_view(),
+         name='api-nb-building-locations'),
     path('api/netbox/facilities', frontend_api.NbFacilitiesView.as_view(), name='api-nb-facilities'),
     path('api/netbox/racks', frontend_api.NbRacksView.as_view(), name='api-nb-racks'),
     path('api/netbox/devices', frontend_api.NbDevicesView.as_view(), name='api-nb-devices'),
+    # Read-only diagnostic for the empty placement panel (PLACE-2): counts gear on the room's
+    # nearby Locations (ancestors + Site) so the panel can point the user at where to reassign it.
+    path('api/netbox/placement-nearby', frontend_api.NbPlacementNearbyView.as_view(),
+         name='api-nb-placement-nearby'),
+    # Backs the Settings page's access-point role picker (DEV-3); object-permission scoped like the
+    # reads above, and facility-agnostic (device roles are global in NetBox).
+    path('api/netbox/device-roles', frontend_api.NbDeviceRolesView.as_view(),
+         name='api-nb-device-roles'),
+    # Backs the AP tool's model picker (DEV-5); an ordinary object-scoped, facility-agnostic read
+    # like device-roles above.
+    path('api/netbox/device-types', frontend_api.NbDeviceTypesView.as_view(),
+         name='api-nb-device-types'),
+    # The plugin's second write into dcim core (DEV-5) and the name it suggests: create an unracked
+    # access-point Device in a room. Both gated in the view on the AP tool + write mode + the
+    # `dcim.add_device` permission (`_ap_write_gate`) — suggest-name included, since a name is only
+    # useful to a caller who could create the device.
+    path('api/netbox/devices/suggest-name', frontend_api.NbDeviceSuggestNameView.as_view(),
+         name='api-nb-device-suggest-name'),
+    path('api/netbox/devices/create', frontend_api.NbDeviceCreateView.as_view(),
+         name='api-nb-device-create'),
+    # Facility-wide room/rack/device search for the siteplan wayfinding finder's unplaced results
+    # (NAV-3). Facility-scoped like /api/netbox/sites (FACIL-1), so it's threaded ?facility= via
+    # lib.js FACILITY_PREFIXES; object-permission scoped like the reads above.
+    path('api/netbox/inventory', frontend_api.NbInventoryView.as_view(), name='api-nb-inventory'),
+
+    # Floor to-do list (ADDON-1): per-room notes on the floor page. GET/create on the collection,
+    # update/delete on a single item. The Api client is GET/POST-only, so update and delete are
+    # POSTs rather than PATCH/DELETE. Reads ride the map-read gate; writes require EDIT_PERM.
+    path('api/todos', frontend_api.TodosView.as_view(), name='api-todos'),
+    # The facility-wide rollup behind the to-do page (TASK-5): every floor's to-dos in one read,
+    # nested `floor_key -> room_id`. Explicitly `?facility=`-scoped (threaded by lib.js
+    # FACILITY_PREFIXES), unlike the per-floor read whose `floor_key` already implies a facility.
+    # `<int:pk>` below can't match `all`, so the two are unambiguous in either order.
+    path('api/todos/all', frontend_api.FacilityTodosView.as_view(), name='api-todos-all'),
+    path('api/todos/<int:pk>', frontend_api.TodoView.as_view(), name='api-todo'),
+    path('api/todos/<int:pk>/delete', frontend_api.TodoDeleteView.as_view(), name='api-todo-delete'),
+
+    # Active-user lookup (TASK-2): backs the to-do assignee picker. Rides the map-read gate like
+    # the to-do reads above, not EDIT_PERM — a viewer must be able to render existing assignees.
+    path('api/users', frontend_api.UsersView.as_view(), name='api-users'),
 
     # In-app settings the SPA #/settings page owns (SET-1). NetBox-interaction settings (the
     # room_embed_* controls, facility_grouping) stay on the chrome'd views.SettingsView; everything
@@ -45,6 +101,29 @@ urlpatterns = [
          name='api-settings-floor-label-field'),
     path('api/settings/default-facility', frontend_api.DefaultFacilitySettingView.as_view(),
          name='api-settings-default-facility'),
+    path('api/settings/write-mode', frontend_api.WriteModeSettingView.as_view(),
+         name='api-settings-write-mode'),
+    # The inline-room-creation write add-on's own switch (SET-5), sitting on top of write mode's
+    # master gate — the Location-create endpoint above checks both.
+    path('api/settings/inline-room-creation', frontend_api.InlineRoomCreationSettingView.as_view(),
+         name='api-settings-inline-room-creation'),
+    # High-quality floor-plan rendering (READ-1). Read by the import build, not the map, so it only
+    # bites on the next import/rebuild.
+    path('api/settings/render-hq', frontend_api.RenderHqSettingView.as_view(),
+         name='api-settings-render-hq'),
+    # The to-do feature's install-wide on/off switch (ADDON-4), a general (non-write) add-on — so it
+    # sits with the settings family, not behind write mode.
+    path('api/settings/todos', frontend_api.TodosSettingView.as_view(),
+         name='api-settings-todos'),
+    # Access-point tool configuration (DEV-3). Three endpoints rather than one because they are
+    # three Settings rows; the naming template and its counter scope share one because they are one
+    # row (a template is only meaningful alongside the counter that suffixes it).
+    path('api/settings/ap-tool', frontend_api.ApToolSettingView.as_view(),
+         name='api-settings-ap-tool'),
+    path('api/settings/ap-device-role', frontend_api.ApDeviceRoleSettingView.as_view(),
+         name='api-settings-ap-device-role'),
+    path('api/settings/ap-naming', frontend_api.ApNamingSettingView.as_view(),
+         name='api-settings-ap-naming'),
 
     # PDF import (permission-gated) + authenticated serving of the rendered result.
     path('api/import/upload', imports.UploadView.as_view(), name='api-import-upload'),

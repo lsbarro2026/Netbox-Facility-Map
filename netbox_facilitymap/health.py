@@ -30,9 +30,10 @@ from django.db.models import Count
 from dcim.models import Device, Location, Rack, Site
 
 from .facilities import (
-    EDITOR_KINDS, imported_facility_slugs, orphaned_facility_keys, suggested_target,
+    EDITOR_KINDS, facility_for_site, imported_facility_slugs, orphaned_facility_keys,
+    suggested_target,
 )
-from .models import FacilityMapBlob, Room
+from .models import FacilityMapBlob, Room, parse_floor_key
 from .storage import read_manifest
 
 
@@ -134,11 +135,18 @@ def _check_floor_keys(user):
 
     # Bulk resolution sets: the (site slug, floor Location slug) pairs that exist, and the set of
     # live site slugs (to tell "no such site" from "site exists, floor Location gone"). Mirrors
-    # how `template_content.SiteFloors` keys floor Locations by slug under a Site.
+    # how `template_content.SiteFloors` keys floor Locations by slug under a Site. A second,
+    # parent-scoped set resolves **Location-anchored** 3-segment keys (MODEL-3): the floor Location
+    # lives under a *building* Location, so it's keyed by (site slug, building slug, floor slug) —
+    # two buildings under one campus can share a floor slug, so the plain (site, floor) pair isn't
+    # enough to confirm a 3-segment key.
     site_slugs = set(_scoped(Site.objects, user).values_list('slug', flat=True))
     resolved = set(_scoped(Location.objects, user)
                    .filter(site__isnull=False)
                    .values_list('site__slug', 'slug'))
+    resolved_nested = set(_scoped(Location.objects, user)
+                          .filter(site__isnull=False, parent__isnull=False)
+                          .values_list('site__slug', 'parent__slug', 'slug'))
     # Floor keys the BIND-1 rename-proof FK still binds: any room with a non-null `floor_location`
     # resolves its floor Location by FK regardless of the (possibly renamed) slug in `floor_key`, so
     # the key isn't actually orphaned even when its slugs don't resolve. Skip those below.
@@ -148,8 +156,10 @@ def _check_floor_keys(user):
 
     rows = []
     for floor_key in sorted(floor_keys):
-        site_slug, _, floor_slug = floor_key.partition('/')
-        if (site_slug, floor_slug) in resolved or floor_key in fk_covered:
+        site_slug, building_slug, floor_slug = parse_floor_key(floor_key)
+        resolves = ((site_slug, building_slug, floor_slug) in resolved_nested if building_slug
+                    else (site_slug, floor_slug) in resolved)
+        if resolves or floor_key in fk_covered:
             continue
         reason = 'no such site' if site_slug not in site_slugs else 'no floor Location under site'
         rows.append(UnresolvedFloorKey(
@@ -170,22 +180,23 @@ def _check_unbound_rooms(user):
 def _check_stale_placements(user):
     """Placements on the map whose referenced rack/device PK is no longer in NetBox.
 
-    Scans **every** facility's `kind='placements'` blob (all facilities share the global rack/device
-    namespace, so a single bulk PK resolution covers them all) and every floor's `placements[]`
-    (mirroring `previews.placement_markers` / `placement_for_object`), then bulk-resolves which
-    referenced PKs still exist. A placement with no `id` is malformed rather than stale, so it's
-    skipped here (out of scope for this check)."""
+    Scans **every** facility's `kind='placements'` rows (all facilities share the global rack/device
+    namespace, so a single bulk PK resolution covers them all). Placements are sharded one row per
+    floor (`key=floor_key`, CONC-1), so each row *is* a floor's `placements[]` (mirroring
+    `previews.placement_markers` / `placement_for_object`); then bulk-resolve which referenced PKs
+    still exist. A placement with no `id` is malformed rather than stale, so it's skipped here (out
+    of scope for this check)."""
     entries = []          # (floor_key, kind, id, label) for every placement carrying an id
     rack_ids, device_ids = set(), set()
-    for blob in FacilityMapBlob.objects.filter(kind='placements'):
-        for floor_key, floor in (blob.data or {}).items():
-            for p in ((floor or {}).get('placements') or []):
-                pid = p.get('id')
-                if pid is None:
-                    continue
-                kind = 'rack' if p.get('kind') == 'rack' else 'device'
-                entries.append((floor_key, kind, pid, p.get('label') or ''))
-                (rack_ids if kind == 'rack' else device_ids).add(pid)
+    for blob in FacilityMapBlob.objects.filter(kind='placements').exclude(key=''):
+        floor_key = blob.key
+        for p in ((blob.data or {}).get('placements') or []):
+            pid = p.get('id')
+            if pid is None:
+                continue
+            kind = 'rack' if p.get('kind') == 'rack' else 'device'
+            entries.append((floor_key, kind, pid, p.get('label') or ''))
+            (rack_ids if kind == 'rack' else device_ids).add(pid)
 
     present_racks = set(_scoped(Rack.objects, user).filter(pk__in=rack_ids)
                         .values_list('pk', flat=True)) if rack_ids else set()
@@ -213,6 +224,55 @@ def _check_orphaned_facilities():
                        .values_list('kind', flat=True).distinct())
         rows.append(OrphanedFacility(facility=key, blob_kinds=kinds, suggested=suggested_target(key)))
     return rows
+
+
+def floor_plan_drift(loc):
+    """True when `loc` is a floor whose rendered plan is in the manifest under a key that no
+    longer resolves — the rename/bulk-edit drift HEALTH-4's `post_save` remap can't catch (a
+    pre-HEALTH-4 rename, a `bulk_update` CSV import/bulk-edit that fires no signal, or a manual DB
+    edit). Lets `template_content.FloorRooms` explain a *blank* floor panel to a regular user
+    (HEALTH-5) instead of leaving it silent — the graceful-degradation backstop for the residue
+    `signals.py` leaves behind.
+
+    Conservative by construction so it never fires on a Location that simply *isn't* a floor (the
+    many non-floor Locations that also hit `FloorRooms`' empty-floor branch): drift is reported only
+    on a confident positive match — a manifest floor whose own `id` still equals `loc.slug` (the
+    floor's own slug intact) sitting under a `dir` whose Site slug is **no longer live** (its
+    ancestor drifted). That is exactly a renamed Site whose manifest wasn't re-keyed. A renamed floor
+    *Location* (its own slug changed, so `floor.id != loc.slug`) or a 3-segment building-anchored
+    floor leaves an empty floor with no reliable link to its manifest entry, so it stays blank —
+    accepted degradation, since HEALTH-4 already covers the normal `save()` path for both.
+
+    Read-only, like the rest of this module. Cheap on the hot Location-page render: it reads the
+    mtime-memoized manifest and only issues the single live-Site-slug query when a same-slug manifest
+    floor actually exists, so a genuine non-floor Location costs one memoized read and no query."""
+    site = getattr(loc, 'site', None)
+    if site is None:
+        return False
+    manifest = read_manifest(facility_for_site(site))
+    if manifest is None:
+        return False
+    buildings = manifest.get('buildings', [])
+    # The `dir`s of every manifest floor whose own id still matches this Location's slug. If `loc`
+    # is a floor whose Site was renamed, its plan lives here under the *old* site slug.
+    same_slug_dirs = {b['dir'] for b in buildings
+                      for floor in b.get('floors', [])
+                      if b.get('dir') and floor.get('id') == loc.slug}
+    if not same_slug_dirs:
+        return False
+    # First collision guard: if `loc`'s *current* Site slug is itself a live manifest `dir`, that Site
+    # has its own rendered building — so a same-slug floor is a legitimate floor of some building that
+    # merely shares this slug, not `loc`'s orphaned plan. (A renamed Site's new slug never appears as a
+    # frozen manifest dir, so this excludes only genuine collisions, never a real drift.)
+    dir_site_slugs = {b['dir'].split('/', 1)[0] for b in buildings if b.get('dir')}
+    if site.slug in dir_site_slugs:
+        return False
+    # Second collision guard: the same-slug floor must sit under a dir whose leading Site slug is no
+    # longer live. A dir whose Site slug *is* live is another building's real floor that happens to
+    # share this slug — so it never triggers the message. Drift = a same-slug floor stranded under a
+    # dead (renamed-away) Site.
+    live_site_slugs = set(Site.objects.values_list('slug', flat=True))
+    return any(d.split('/', 1)[0] not in live_site_slugs for d in same_slug_dirs)
 
 
 def run_checks(user=None):

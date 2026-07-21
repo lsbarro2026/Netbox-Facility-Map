@@ -1,0 +1,25 @@
+{% comment %}
+  Shown on a floor's Location page (via `template_content.FloorRooms`) when the floor *was* a real
+  rendered floor but its plan can no longer be resolved — a Site/floor rename (a bulk-edit / manual
+  DB edit / pre-HEALTH-4 rename) moved the slug without re-keying the manifest (HEALTH-5). Replaces
+  the silently-blank panel a regular user would otherwise see with a non-alarming explanation and a
+  concrete recovery hint. Gated by `health.floor_plan_drift` so it never appears on a Location that
+  simply isn't a floor. Self-contained/inline-styled — the plugin stylesheet isn't loaded on dcim
+  pages. Wording is kept consistent with the Settings-page health panel so an admin who follows the
+  hint lands on the right recovery.
+{% endcomment %}
+<div class="card">
+  <h5 class="card-header">Facility Map — Rooms</h5>
+  <div class="card-body">
+    <div style="border:1px solid #ccc;background:#f4f5f7;border-radius:4px;padding:1rem 1.25rem;color:#495057">
+      <p style="margin:0 0 .35rem;font-weight:600">
+        <i class="mdi mdi-map-marker-off"></i> Floor plan unavailable
+      </p>
+      <p style="margin:0">
+        This floor's plan couldn't be matched — a Site or floor may have been renamed. Ask an
+        administrator to re-import the facility, or check <strong>Facility Map &rsaquo; Settings</strong>
+        for consistency issues. No room data has been lost.
+      </p>
+    </div>
+  </div>
+</div>

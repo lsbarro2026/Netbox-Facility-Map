@@ -23,15 +23,59 @@ class App {
     // and the keyboard handler consult `interactive`.
     this.embed = !!(window.MAP && window.MAP.embed);
     this.interactive = !this.embed || !!(window.MAP && window.MAP.interactive);
+    // Search-only embed (?finder=1, FacilitySearchWidget): the siteplan renders just the wayfinding
+    // finder — no map, no legend (SiteplanEditor.show). Always paired with embed, so a result click
+    // still escapes to the top window (openBuilding / _gotoTarget).
+    this.finder = !!(window.MAP && window.MAP.finder);
+    // Search-widget result-target (NAV-16, FacilitySearchWidget): 'netbox' makes a finder hit open
+    // the object's NetBox detail page; anything else keeps the default map deep-link. Only consulted
+    // in the embed, and only the search widget ever sets it, so the map widget is unaffected.
+    this.resultTarget = (window.MAP && window.MAP.resultTarget) || 'map';
     // Import/reset are gated server-side; these mirror the gate so we don't offer a wizard whose
     // every call would 403 (canImport = import_facilitymapblob) or a reset the user can't run
     // (canReset = superuser). The server is the security boundary — these are UX only.
     this.canImport = !!(window.MAP && window.MAP.canImport);
     this.canReset = !!(window.MAP && window.MAP.canReset);
     // Whether this user holds `dcim.add_location`, so the floor bind panel may offer inline Location
-    // creation (LOC-1). The install-wide on/off is the `location-create` capability (hasCapability);
-    // this is the per-user half. Both are re-checked server-side — UX only, like canImport/canReset.
+    // creation (LOC-1). The install-wide on/off is `writeMode` (below); this is the per-user half.
+    // Both are re-checked server-side — UX only, like canImport/canReset.
     this.canCreateLocation = !!(window.MAP && window.MAP.canCreateLocation);
+    // Install-wide "write mode" (LOC-2): the runtime, admin-controlled MASTER GATE on everything the
+    // plugin writes into NetBox core, replacing the old redeploy-time `location-create` capability.
+    // Since SET-5 it gates and nothing more — each write add-on carries its own switch on top
+    // (inlineRoomCreation below, apTool further down). Seeded from the server's settings blob
+    // (previews.write_mode_enabled → window.MAP.writeMode) and held live here so the Settings toggle
+    // flips it without a reload. UX only — every write endpoint re-checks it server-side.
+    this.writeMode = !!(window.MAP && window.MAP.writeMode);
+    // The inline-room-creation add-on's own install-wide switch (SET-5): whether the floor bind panel
+    // may offer the create tile at all. Needs writeMode AND canCreateLocation too — all three are
+    // re-checked server-side in NbLocationCreateView. Note it is seeded from a server reader that
+    // DEFAULTS ON for a blob predating SET-5, so an upgrader keeps the tile write mode used to imply.
+    this.inlineRoomCreation = !!(window.MAP && window.MAP.inlineRoomCreation);
+    // Whether this user holds `dcim.add_device`, the per-user half of the access-point tool's gate
+    // (DEV-3) — the exact analogue of canCreateLocation. UX only; re-checked server-side.
+    this.canCreateDevice = !!(window.MAP && window.MAP.canCreateDevice);
+    // The access-point tool's install-wide configuration (DEV-3), seeded from the settings blob
+    // (previews.ap_settings → window.MAP) and held live so the Settings page's saves apply without a
+    // reload, like writeMode/floorLabelField. `apTool` is the feature's own switch, stored SEPARATELY
+    // from writeMode (the master gate) exactly as inlineRoomCreation is — placing an AP needs apTool
+    // AND writeMode AND canCreateDevice AND a configured apDeviceRole ({id,name}, or null when
+    // unset/deleted/hidden). All re-enforced server-side; these are the UX mirror.
+    this.apTool = !!(window.MAP && window.MAP.apTool);
+    // High-quality floor-plan rendering (READ-1). Held live for the same reason as the switches
+    // above — so the Settings page's save is reflected without a reload — but nothing in the
+    // browser reads it otherwise: the render it controls runs in the import subprocess, and it
+    // only bites on the next import/rebuild.
+    this.renderHq = !!(window.MAP && window.MAP.renderHq);
+    // The to-do feature's install-wide switch (ADDON-4), a general (non-write) add-on seeded from the
+    // settings blob (previews.todos_enabled → window.MAP.todos) and held live so the Settings toggle
+    // flips it without a reload, like writeMode/apTool. Read by showTodo (the #/todo page) and
+    // FloorEditor (the per-floor panel + compose "+"). UX only — every to-do endpoint re-checks it
+    // server-side (frontend_api.TodoFeatureGateMixin).
+    this.todos = !!(window.MAP && window.MAP.todos);
+    this.apDeviceRole = (window.MAP && window.MAP.apDeviceRole) || null;
+    this.apNameTemplate = (window.MAP && window.MAP.apNameTemplate) || '{room}-{role_short}';
+    this.apCountScope = (window.MAP && window.MAP.apCountScope) || 'none';
     // The enabled optional capabilities (keys), from the server's capability registry (the add-on
     // framework). hasCapability(key) gates a capability's lazy-loaded tool on its presence — the
     // detect-and-enable model, the frontend mirror of window.MAP.drawingExts. Absent (non-plugin
@@ -44,6 +88,18 @@ class App {
     this.floorLabelField = (window.MAP && window.MAP.floorLabelField) || 'name';
     this._floorData = null;             // shared promise for the deferred floor-level load (ensureFloorData)
     this._pendingFocus = null;          // wayfinding-search target to frame+pulse on the next floor entry (focusRoom)
+    // The last floor opened this session ({dir,fid}), recorded by showFloor. Read only by the
+    // facility-wide to-do page, to badge that floor's group "Current" (TASK-5) — a "you were just
+    // here" anchor in a list that spans every building. Null until a floor is entered, which is the
+    // honest answer on a cold deep-link straight to #/todo: nothing is current yet.
+    this.lastFloor = null;
+    // Where the current view was navigated *from*, when that origin should show in the breadcrumb:
+    // 'todo' (the facility-wide to-do page) or null (any other route — today's plain trail). Set by
+    // TodoPage as it navigates out, consumed by rootCrumbs(), cleared by the router on any route the
+    // to-do page can't reach. Distinct from `lastFloor`, which is "which floor was last opened", not
+    // a referrer. UI-only, exactly like lastFloor: it decorates a crumb trail and nothing else —
+    // never persisted, never in the hash, never load-bearing for routing.
+    this.navOrigin = null;
     // Active facility ('' = the default facility), threaded onto every per-facility API call via
     // Api.facility. A leading `#/y/<slug>` hash segment selects it; the picker switches it (MULTI-2).
     this.facility = '';
@@ -55,6 +111,11 @@ class App {
     this.defaultFacility = (window.MAP && window.MAP.defaultFacility) || '';
     this.facilities = null;             // [{slug,name,has_content}] for the picker; loaded once in init()
     this.grouping = 'sitegroup';        // which dcim grouping identifies a facility (SiteGroup|Region)
+    // The signed-in viewer, {id,username,display,initials} — the shape a to-do's assignees arrive in
+    // (TASK-3), so `TodoModel.assignedTo` compares ids straight across. Null only when window.MAP is
+    // absent (standalone), which every reader must tolerate: an unknown viewer just means "no to-do
+    // of mine to float to the top", never a broken list.
+    this.user = (window.MAP && window.MAP.user) || null;
   }
 
   /** Whether an optional capability (from the server's capability registry) is enabled on this
@@ -78,9 +139,13 @@ class App {
     // the router — which re-reads the hash and treats a facility mismatch as a switch — stays in
     // lockstep and doesn't bounce back to ''. replaceState (not a hash assignment) avoids a spurious
     // history entry, so Back doesn't return to the bare pre-resolution hash; the hashchange listener
-    // isn't bound yet, so this fires no extra router pass.
+    // isn't bound yet, so this fires no extra router pass. Preserve any incoming route (e.g. a shared
+    // `#/r/<dir>/<fid>/<seg>` deep-link) rather than collapsing to the bare siteplan — `boot.parts`
+    // are the raw, still-encoded segments with the `y/<slug>` prefix already stripped, so rejoining
+    // them reconstructs the path for `_hash` to re-prefix (NAV-10).
     if (this.facility && !boot.explicit) {
-      history.replaceState(null, '', '#' + this._hash('/'));
+      const rest = boot.parts.length ? '/' + boot.parts.join('/') : '/';
+      history.replaceState(null, '', '#' + this._hash(rest));
     }
     try { await this.store.loadCore(); }
     catch (e) {
@@ -94,13 +159,63 @@ class App {
       .catch(() => { this.facilities = []; });
     this._bindGlobal();
     this._navHash = location.hash;   // baseline for the unsaved-work navigation guard
+    await this._maybeRestoreDraft();
     this.router();
+  }
+
+  /** Offer to restore a persisted draft of unsaved edits from a previous session — a crash, a
+   *  killed tab, or a save that failed on a session/CSRF expiry (SAVE-5). Called on boot and after
+   *  a facility switch (each facility has its own draft). Prompting rather than auto-restoring lets
+   *  a stale draft be declined and avoids a surprise dirty badge. Restore loads fresh floor data
+   *  first so the CONC-1 tokens + `_base` baseline are current, THEN overlays the draft's content —
+   *  a stale draft still 409s on save, never a silent clobber. Skipped in the non-interactive/embed
+   *  views, which never edit. */
+  async _maybeRestoreDraft() {
+    if (!this.interactive || this.embed) return;
+    const draft = this.store.peekDraft();
+    if (!draft) return;
+    if (!await this._confirmRestore()) { this.store.clearDraft(); return; }
+    try { await this.ensureFloorData(); }
+    catch (e) { Toast.show('Could not load data to restore your draft: ' + e.message, true); return; }
+    this.store.applyDraft(draft);
+  }
+
+  /** Restore-draft prompt (mirrors Editor._confirmLeaveEdit's `.fm-modal` pattern): resolves `true`
+   *  to restore, `false` to discard. Backdrop click or Discard dismisses as discard. */
+  _confirmRestore() {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => { if (done) return; done = true; overlay.remove(); resolve(v); };
+      const overlay = Dom.el('div', { class: 'fm-modal', onclick: (e) => { if (e.target === overlay) finish(false); } }, [
+        Dom.el('div', { class: 'fm-modal-panel' }, [
+          Dom.el('h3', {}, 'Restore unsaved changes?'),
+          Dom.el('p', {}, 'This browser has map edits from a previous session that were never saved. '
+            + 'Restore them, or discard and start from the last saved version.'),
+          Dom.el('div', { class: 'fm-modal-actions' }, [
+            Dom.el('button', { onclick: () => finish(false) }, 'Discard'),
+            Dom.el('button', { class: 'primary', onclick: () => finish(true) }, 'Restore'),
+          ]),
+        ]),
+      ]);
+      document.body.append(overlay);
+    });
   }
 
   // ---- routing ----
   /** Navigate to a facility-relative hash (`rest` is unprefixed, e.g. '/f/dir/fid' or '/'); the
    *  active facility is prefixed as `#/y/<slug>` so links stay in-facility (MULTI-2). */
   go(rest) { this._setHash(this._hash(rest)); }
+
+  /** Navigate to a facility-relative hash, but in the dashboard-widget embed **escape to the top
+   *  window** instead of drilling in-card. The chrome-free embed has no breadcrumbs to return
+   *  through, so an in-iframe drill-in would strand the user (§10); the full map opens deep-linked at
+   *  `rest` in the top window (same-origin iframe, `location.pathname` is the `MapView` URL minus the
+   *  `?embed=1` query). Standalone (`!embed`) it's a plain `go`. This is the canonical form of the
+   *  escape idiom `SiteplanEditor.openBuilding`/`_gotoTarget` also apply. */
+  navigateOut(rest) {
+    if (this.embed) { window.top.location.href = location.pathname + '#' + this._hash(rest); return; }
+    this.go(rest);
+  }
 
   /** Prefix a facility-relative hash path with the active `#/y/<slug>` segment ('' = default,
    *  no prefix). `rest` may be '' or '/' (the siteplan) or a leading-slash path. */
@@ -205,22 +320,39 @@ class App {
           + e.message + '</div>';
         return;
       }
+      await this._maybeRestoreDraft();   // this facility may carry a draft from a prior session (SAVE-5)
     }
     this.closePanel();
     // The persistent settings gear lives in #topbar, outside the per-view toolbar that
     // setToolbar() rebuilds — sync its active tint here so every route (incl. navigating
     // away via breadcrumbs/Back) reflects whether settings is open.
     Dom.$('#settings-gear').classList.toggle('active', parts[0] === 'settings');
+    // The buildings-panel toggle (NAV-8) is siteplan-only chrome. Default it hidden on every
+    // route; SiteplanEditor.show re-reveals it, so it never leaks onto a floor/settings/import view.
+    Dom.$('#panel-toggle').hidden = true;
     // A pending wayfinding focus only applies to the floor it names. If we're routing
     // anywhere but a floor (e.g. the unsaved-work guard reverted us to the siteplan),
     // drop it so it can't leak onto a later, unrelated floor entry.
     if (parts[0] !== 'f') this._pendingFocus = null;
+    // The `To-do` origin crumb belongs only to the views the to-do page can navigate *to* (a floor,
+    // a `#/r/` room deep-link, and the building view a floor's crumb leads back through). Any other
+    // route — the siteplan, settings, import, or the to-do page itself — means the user arrived some
+    // other way, so a stale `To-do` crumb must not follow them there.
+    if (!['f', 'r', 'b'].includes(parts[0])) this.navOrigin = null;
     if (parts[0] === 'import') return this.showImport();
-    if (parts[0] === 'settings') return this.showSettings();
+    // Settings is the one route with a second segment: an add-on with more to configure than a
+    // settings row can hold gets a sub-page (SET-6). Tabs are still NOT routed — they're instance
+    // state, and that distinction is deliberate: a tab is a view of the same page, a sub-page is a
+    // place. An unrecognised segment degrades to the settings page rather than a dead end.
+    if (parts[0] === 'settings') {
+      return parts[1] === 'access-points' ? this.showApSettings() : this.showSettings();
+    }
+    if (parts[0] === 'todo') return this.showTodo();
     if (parts[0] === 'b') return this.renderBuilding(decodeURIComponent(parts[1]));
     if (parts[0] === 'f') return this.showFloor(decodeURIComponent(parts[1]), decodeURIComponent(parts[2]));
-    // Room deep-link (#/r/<dir>/<fid>/<slug-or-id>): the same floor load/guard path as #/f/,
-    // plus a room to frame + highlight (resolved against the loaded floor in showFloor).
+    // Deep-link (#/r/<dir>/<fid>/<seg>): the same floor load/guard path as #/f/, plus a target to
+    // frame + highlight — a room (Location slug or uid) or a `rack-<id>`/`device-<id>` placement,
+    // resolved against the loaded floor in showFloor (NAV-10).
     if (parts[0] === 'r') return this.showFloor(decodeURIComponent(parts[1]), decodeURIComponent(parts[2]),
       parts[3] === undefined ? null : decodeURIComponent(parts[3]));
     // A fresh install has no facility yet → land on the import wizard, not an empty siteplan.
@@ -247,17 +379,25 @@ class App {
   }
 
   /** Empty state for a signed-in user who lacks import permission and has landed where the
-   *  wizard would be (a fresh install with no content, or #/import). Reuses the wizard's
-   *  `.import-view`/`.hint` styling so it reads as the same surface, minus the controls. */
+   *  wizard would be (a fresh install with no content, or #/import — including the nav-reachable
+   *  `views.ImportTabView`, HEALTH-8). Reuses the wizard's `.import-view`/`.hint` styling so it
+   *  reads as the same surface, minus the controls. The copy is content-aware
+   *  (`store.hasContent()`, the same check the router's home-route fallback already uses): a
+   *  fresh install has genuinely nothing yet, but a change-only editor who followed the nav here
+   *  because a floor plan looks wrong has a facility that's already imported — telling them "no
+   *  facility map yet" would be actively misleading. */
   showNoImport() {
-    this.crumbs([{ label: 'Siteplan', hash: '/' }, { label: 'Import' }]);
+    this.crumbs([{ label: this.homeCrumbLabel(), hash: '/' }, { label: 'Import' }]);
     this.setToolbar([]);
     const stage = Dom.$('#stage'); stage.innerHTML = '';
+    const hasContent = this.store.hasContent();
     stage.append(Dom.el('div', { class: 'import-view' }, [
-      Dom.el('h2', {}, 'No facility map yet'),
-      Dom.el('p', { class: 'hint' },
-        'No facility map has been imported yet. Ask an administrator with import '
-        + 'permission to set one up.'),
+      Dom.el('h2', {}, hasContent ? 'Editing needs import permission' : 'No facility map yet'),
+      Dom.el('p', { class: 'hint' }, hasContent
+        ? 'Only an administrator with import permission can add, replace, or reassign this '
+          + 'facility’s floor plans. If a plan looks wrong or outdated, ask one to update it here.'
+        : 'No facility map has been imported yet. Ask an administrator with import '
+          + 'permission to set one up.'),
     ]));
   }
 
@@ -267,13 +407,59 @@ class App {
    *  rack-related to configure here. */
   showSettings() {
     this.current = null;
-    this.crumbs([{ label: 'Siteplan', hash: '/' }, { label: 'Settings' }]);
+    this.crumbs([{ label: this.homeCrumbLabel(), hash: '/' }, { label: 'Settings' }]);
     this.setToolbar([]);
     const stage = Dom.$('#stage'); stage.innerHTML = '';
     new SettingsPage(this).mount(stage);
   }
 
+  /** The access point add-on's configuration sub-page (SET-6) — same shape as `showSettings()`,
+   *  delegating to `ApSettingsPage`, which subclasses `SettingsPage` (see ap-settings-page.js). The
+   *  linked `Settings` crumb is the way back, so the page carries no back control of its own; the
+   *  `#settings-gear` stays lit here and still returns to the siteplan, since both it and `router()`
+   *  key their settings-ness off `parts[0]` alone.
+   *
+   *  Unreachable in practice without import permission — the row carrying the `Configure` button
+   *  that leads here is `canImport`-gated — but a typed URL lands on a page whose every row is
+   *  likewise gated, so it renders empty rather than offering controls that would 403. */
+  showApSettings() {
+    this.current = null;
+    this.crumbs([{ label: this.homeCrumbLabel(), hash: '/' }, { label: 'Settings', hash: '/settings' },
+      { label: 'Access points' }]);
+    this.setToolbar([]);
+    const stage = Dom.$('#stage'); stage.innerHTML = '';
+    new ApSettingsPage(this).mount(stage);
+  }
+
+  /** The facility-wide to-do page (no editor active) — every building's and floor's work rolled up
+   *  into one prioritized list (TASK-5). Reached from the plugin nav (via `views.TodoTabView`) as
+   *  well as `#/todo`. Mounted like the settings view: no Editor, just a class into `#stage`.
+   *
+   *  Deliberately does **not** bounce to the import wizard on an empty install the way the bare
+   *  `#/` route does — `TodoPage` renders its own empty state instead. A route the user asked for
+   *  by name should land where they aimed it, exactly as `#/settings` and `#/import` do. */
+  showTodo() {
+    // The to-do add-on can be switched off install-wide (ADDON-4). When it is, #/todo is not a
+    // place — bounce to the map home rather than mounting a page for a disabled feature. The nav
+    // item (a cached NetBox menu that can't hide live) and TodoTabView redirect here likewise, and
+    // the endpoints refuse; this is the client mirror.
+    if (!this.todos) return this.go('/');
+    this.current = null;
+    this.crumbs([{ label: this.homeCrumbLabel(), hash: '/' }, { label: 'To-do' }]);
+    this.setToolbar([]);
+    const stage = Dom.$('#stage'); stage.innerHTML = '';
+    new TodoPage(this).mount(stage);
+  }
+
   showSiteplan() {
+    // No overall siteplan image (IMPORT-8): the siteplan view has no map to show. With exactly one
+    // building, drop straight into it (mirrors renderBuilding's single-floor shortcut) so a
+    // single-building facility lands on its content, not a one-row list; with several buildings,
+    // SiteplanEditor renders a full-stage building directory instead of a dead "No siteplan image".
+    if (this.store.manifest && !this.store.manifest.siteplan) {
+      const bs = this.store.manifest.buildings;
+      if (bs.length === 1) return this.renderBuilding(bs[0].dir);
+    }
     this.current = new SiteplanEditor(this); this.current.show();
     // Warm the deferred floor data in the background so a drill-in is instant. Skipped in the
     // embed (which only ever shows the siteplan); errors are swallowed here and resurface on an
@@ -281,9 +467,18 @@ class App {
     if (!this.embed) this.ensureFloorData().catch(() => {});
   }
 
-  /** `focusSeg` (room deep-links only) is a room's Location slug or its uid; the resolved
-   *  room is framed + highlighted on entry. An unknown/forbidden room degrades to the plain
-   *  floor view (a toast, no error). Plain `#/f/` navigation passes no `focusSeg`. */
+  /** The label for the app's home breadcrumb root (hash '/'). Normally "Siteplan"; "Buildings"
+   *  when the facility has no overall siteplan image (IMPORT-8), so a trail never reads "Siteplan"
+   *  pointing at a plan that doesn't exist — the home there is the building directory / a single
+   *  building. Defaults to "Siteplan" before the manifest has loaded. */
+  homeCrumbLabel() {
+    return (this.store.manifest && !this.store.manifest.siteplan) ? 'Buildings' : 'Siteplan';
+  }
+
+  /** `focusSeg` (deep-links only) names a target on this floor: a room (Location slug or uid) or a
+   *  `rack-<id>`/`device-<id>` placement. The resolved target is framed + highlighted on entry
+   *  (`FloorEditor._resolveFocusSeg`). An unknown/forbidden target degrades to the plain floor view
+   *  (a toast, no error). Plain `#/f/` navigation passes no `focusSeg`. */
   async showFloor(dir, fid, focusSeg = null) {
     const b = this.store.building(dir);
     if (!b) return this.showSiteplan();
@@ -295,25 +490,28 @@ class App {
     // rejects the Promise.all and we stay put.
     try {
       await Promise.all([
-        this.ensureScripts(['device-shapes.js', 'floor-export.js', 'floor-editor.js']),
+        this.ensureScripts(['device-shapes.js', 'floor-export.js', 'floor-todo.js', 'floor-editor.js']),
         this.ensureFloorData().catch(e => Toast.show('Could not load floor data: ' + e.message, true)),
       ]);
     } catch (e) { Toast.show('Could not load the floor view: ' + e.message, true); return; }
     this.mode = 'view';   // every floor entry lands in view; reset so a prior floor's edit doesn't carry over
+    // Recorded only once the floor is certain to render (past the guards and the bundle load), so a
+    // navigation that bailed can't leave a floor the user never saw marked "Current" on the to-do
+    // page. Set here rather than in the router because `#/f/` and `#/r/` both land here.
+    this.lastFloor = { dir, fid };
     this.current = new FloorEditor(this, b, f);
-    // Frame + pulse a room on mount from either entry point (both feed the editor's setFocus
-    // before show()): a `#/r/` room deep-link resolves the segment (Location slug, then uid
-    // fallback) against this floor's rooms and derives the region from the room's polygon; a
-    // wayfinding-search jump hands a precomputed region+room via `_pendingFocus`. The router
-    // clears `_pendingFocus` on any non-`f` route, so the two never both apply; consume it
-    // either way so it never leaks onto a later navigation.
+    // Frame + pulse a target on mount from either entry point (both feed the editor's setFocus
+    // before show()): a `#/r/` deep-link resolves its segment against this floor (a room by
+    // Location slug/uid → padded polygon bbox, or a `rack-<id>`/`device-<id>` placement → point
+    // region, framed like the search bar) via `_resolveFocusSeg`; a wayfinding-search jump hands a
+    // precomputed region+room via `_pendingFocus`. The router clears `_pendingFocus` on any non-`f`
+    // route, so the two never both apply; consume it either way so it never leaks onto a later
+    // navigation.
     const focus = this._pendingFocus; this._pendingFocus = null;
     if (focusSeg) {
-      const room = this.current.data().rooms.find(
-        r => (r.location && r.location.slug === focusSeg) || r.id === focusSeg);
-      const region = room && this.current._roomFocusRegion(room.id);
-      if (region) this.current.setFocus({ dir, fid, roomId: room.id, region });
-      else Toast.show('That room link no longer resolves; showing the floor.', true);
+      const target = this.current._resolveFocusSeg(focusSeg);
+      if (target) this.current.setFocus({ dir, fid, ...target });
+      else Toast.show('That link no longer resolves; showing the floor.', true);
     } else if (focus && focus.dir === dir && focus.fid === fid) {
       this.current.setFocus(focus);
     }
@@ -325,35 +523,35 @@ class App {
     this.current = null;
     const b = this.store.building(dir);
     if (!b) return this.showSiteplan();
+    // A single-floor building has no meaningful picker — go straight to its one floor. Rewrite the
+    // hash in place (replaceState, no new history entry) so Back returns to the siteplan rather than
+    // a `#/b/<dir>` that would just redirect here again; resync the guard baseline to match. This one
+    // redirect covers every entry point (hotspot/legend click, a shared `#/b/<dir>` deep-link, the
+    // embed's top-window open), so the shortcut lives here rather than in SiteplanEditor.openBuilding.
+    if (b.floors.length === 1) {
+      const only = b.floors[0];
+      history.replaceState(null, '', '#' + this._hash('/f/' + encodeURIComponent(dir) + '/' + encodeURIComponent(only.id)));
+      this._navHash = location.hash;
+      return this.showFloor(dir, only.id);
+    }
     // The per-floor room counts below read store.annotations, part of the deferred load; await
     // it up front so the whole view renders in one burst (a failed load leaves floors "unmapped").
     try { await this.ensureFloorData(); }
     catch (e) { Toast.show('Could not load room data: ' + e.message, true); }
-    this.crumbs([{ label: 'Siteplan', hash: '/' }, { label: b.name }]);
-    this.setToolbar([Dom.el('span', { class: 'hint' }, b.siteSlug)]);
+    this.crumbs([...this.rootCrumbs(), { label: b.name }]);
     const stage = Dom.$('#stage'); stage.innerHTML = '';
-    if (!b.floors.length) { stage.append(Dom.el('div', { class: 'empty' }, 'No floor maps for ' + b.name)); return; }
-
-    const grid = Dom.el('div', { class: 'floor-grid' });
-    for (const f of b.floors) {
-      const key = Util.floorKey(dir, f.id);
-      const rec = this.store.annotations[key];
-      const n = (rec && rec.rooms.length) || 0;
-      grid.append(Dom.el('div', {
-        class: 'floor-card',
-        onclick: () => this.go('/f/' + encodeURIComponent(dir) + '/' + encodeURIComponent(f.id)),
-      }, [
-        // Card-sized `thumb` when the manifest has one (builds since 1.44.0); full-res
-        // plan as the fallback for older manifests.
-        Dom.el('img', { src: this.store.mediaUrl(f.thumb || f.image), loading: 'lazy' }),
-        Dom.el('div', { class: 'cap' }, [
-          Dom.el('b', {}, f.label),
-          Dom.el('span', { class: 'cnt ' + (n ? 'mapped' : 'unmapped') }, n ? n + ' rooms' : 'unmapped'),
-          ...(f.pages && f.pages.length > 1 ? [Dom.el('span', { class: 'cnt sheets' }, f.pages.length + ' sheets')] : []),
-        ]),
-      ]));
+    if (!b.floors.length) {
+      this.setToolbar([Dom.el('span', { class: 'hint' }, b.siteSlug)]);
+      stage.append(Dom.el('div', { class: 'empty' }, 'No floor maps for ' + b.name));
+      return;
     }
-    stage.append(grid);
+    // FloorViewMenu owns the card grid + its display preferences (previews / size / layout / sort /
+    // badges), rebuilt per building entry. It's not an Editor, so it does NOT route through the
+    // shared edit-menu; its View button rides in the toolbar and its render() draws the grid,
+    // repainting just the grid (not the toolbar) when a preference changes (NAV-9).
+    const view = new FloorViewMenu(this, dir, b);
+    this.setToolbar([Dom.el('span', { class: 'hint' }, b.siteSlug), view.button()]);
+    view.render(stage);
   }
 
   /** (Re)draw the facility picker in the topbar from `this.facilities` (loaded once in init).
@@ -382,6 +580,15 @@ class App {
   }
 
   // ---- shared chrome ----
+  /** The head of a crumb trail: `Siteplan`, plus a `To-do` crumb when this view was reached from
+   *  the facility-wide to-do page (`navOrigin`), so the user can walk back to the list they came
+   *  from instead of hunting for Back. Views the to-do page can't reach build their own head — the
+   *  router has already cleared the origin by the time they render. */
+  rootCrumbs() {
+    const root = [{ label: this.homeCrumbLabel(), hash: '/' }];
+    if (this.navOrigin === 'todo') root.push({ label: 'To-do', hash: '/todo' });
+    return root;
+  }
   crumbs(items) {
     const nav = Dom.$('#crumbs'); nav.innerHTML = '';
     items.forEach((it, i) => {
@@ -414,6 +621,10 @@ class App {
   _bindGlobal() {
     const gear = Dom.$('#settings-gear');
     gear.innerHTML = Icons.settings;
+    // The buildings-panel toggle (NAV-8) is a siteplan-only sibling of the gear. Stamp its
+    // icon once here; SiteplanEditor.show reveals + wires it (and router() re-hides it on
+    // every other route), so no click handler lives here.
+    Dom.$('#panel-toggle').innerHTML = Icons.panelRight;
     // Toggle: on the settings route the gear returns to the siteplan; elsewhere it opens
     // settings. Mirrors the floor editor's "inspect state, go to the opposite" mode buttons.
     // The .active tint is kept in sync per-route by router(), not here.
@@ -423,6 +634,9 @@ class App {
     });
     Dom.$('#panel-close').addEventListener('click', () => this.closePanel());
     window.addEventListener('beforeunload', (e) => {
+      // Flush the crash-recovery draft synchronously on a clean close, capturing the last edits the
+      // debounce hasn't written yet (SAVE-5); the warning below still fires for unsaved work.
+      this.store.flushDraft();
       if (this.store.hasUnsaved()) { e.preventDefault(); e.returnValue = ''; }
     });
     // Every page change — crumbs, hotspots, floor cards, gear, go(), Back/Forward — flows

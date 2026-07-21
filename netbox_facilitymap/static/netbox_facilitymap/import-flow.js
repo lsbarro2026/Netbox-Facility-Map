@@ -56,6 +56,14 @@ class ImportFlow {
     // Add-drawings flow: when true the upload step merges new PDFs into the current model
     // (re-applying the saved draft so existing assignments survive) instead of starting fresh.
     this._mergeMode = false;
+    // `folder/stem` of every drawing whose bytes were replaced in place this session (REPL-1). A
+    // Replace keeps the floor id (so `_orphanedFloors` won't flag it) and usually the same
+    // pixel size + aspect ratio (so `_desyncedFloors`' angle/aspect checks won't either), yet a
+    // revision with shifted margins/title-block silently misaligns rooms placed against the old
+    // drawing — undetectable from manifest metadata (only `w`/`h` + angle are recorded). So a
+    // replaced drawing with placed features drives an unconditional desync warning at build time.
+    // Cleared after a successful build (the manifest is then rebuilt from the new drawing).
+    this._replaced = new Set();
     // File ingestion + upload live in ImportUploader (needs a back-ref for progress + the
     // post-upload routing); image zoom/pan + lightbox live in the static ImportPreview.
     this.uploader = new ImportUploader(this);
@@ -94,6 +102,16 @@ class ImportFlow {
     const box = r && r.box;
     return !!box && ['x', 'y', 'w', 'h'].every(k => typeof box[k] === 'number')
       && ImportFlow._validAssign(r.assign);
+  }
+
+  /** A persisted overlay control point (FMT-6) is `{src:[x,y], dst:[nx,ny]}` of finite numbers —
+   *  anything else (corrupt draft) is dropped so the layer just falls back to fit-to-bounds.
+   *  Mirrors the backend's `OverlayProjector._clean_pairs` gate. */
+  static _validAlignPair(p) {
+    const pt = (v) => Array.isArray(v) && v.length >= 2
+      && typeof v[0] === 'number' && isFinite(v[0])
+      && typeof v[1] === 'number' && isFinite(v[1]);
+    return !!p && typeof p === 'object' && pt(p.src) && pt(p.dst);
   }
 
   /** Render a fresh `#stage` view with the step title. `stepKey` (one of a flow's linear step
@@ -397,8 +415,15 @@ class ImportFlow {
         name, slug: ImportFlow.slugify(f.folder), abbr: ImportFlow.initials(name),
         // The NetBox Site this building is bound to, chosen in the "Map buildings to NetBox"
         // step: { id, slug, name, auto } (auto = picked by auto-map, awaiting confirmation).
-        // null = unbound. Its slug overwrites `slug` so it flows downstream as `siteSlug`.
+        // null = unbound. Its slug overwrites `slug` so it flows downstream as `siteSlug` — for a
+        // Site anchor this Site *is* the building; for a Location anchor it is the campus Site.
         nbSite: null,
+        // The building **Location** this building is anchored to when it lives under a campus Site
+        // (Site != building — the Site = campus topology, MODEL-4): { id, slug, name }. null for a
+        // Site anchor (today's default). Its slug flows downstream as the manifest `buildingSlug`,
+        // and the building's floors are this Location's children (see `_loadFloors`). `nbSite` still
+        // holds the campus Site (→ `siteSlug`), so a Location-anchored building has both set.
+        nbBuilding: null,
         // NetBox floor Locations for the building's bound site, lazily fetched in the map
         // step so floors can be picked as buttons. undefined = not fetched, 'loading' = in
         // flight, array = done (empty array = fall back to the floor-type buttons).
@@ -426,6 +451,12 @@ class ImportFlow {
         // The box is stored normalized 0..1 in *straightened-image* space (the split editor renders
         // the drawing at its `angle`, matching the backend's crop-after-rotate).
         regions: Object.fromEntries(pdfs.map(p => [p.stem, []])),
+        // Per-drawing overlay control points (FMT-6): `[{src:[sx,sy], dst:[nx,ny]}, …]` pairs
+        // tying a GIS overlay's raw source coordinates to spots on its floor's 0..1 canvas,
+        // captured in the align editor (`_stepAlignOverlay`). Only OVERLAY-role drawings use
+        // theirs; `_build` emits ≥2 pairs as the import-map `overlayAlign`, which georeferences
+        // the layer at the next build. Empty (the default) = fit-to-bounds, as before.
+        align: Object.fromEntries(pdfs.map(p => [p.stem, []])),
       });
     }
   }
@@ -462,34 +493,72 @@ class ImportFlow {
     return this.buildings.length === 1;
   }
 
-  /** Bind a building to a NetBox site: store its identity and prefill name/slug/abbr from it
-   *  so the slug flows downstream as the manifest `siteSlug`. `auto` flags an unconfirmed
+  /** Bind a building to a NetBox **Site** anchor (the Site *is* the building): store its identity
+   *  and prefill name/slug/abbr from it so the slug flows downstream as the manifest `siteSlug`.
+   *  Clears any prior Location anchor (`nbBuilding`), so re-binding a building to a Site drops its
+   *  `buildingSlug` and its floor keys revert to the 2-segment shape. `auto` flags an unconfirmed
    *  auto-match (the operator reviews it in the step). */
   _bindSite(b, site, auto) {
     b.nbSite = { id: site.id, slug: site.slug, name: site.name, auto: !!auto };
+    b.nbBuilding = null;
+    b.nbFloors = undefined;   // re-fetch floors for the new anchor
     b.slug = site.slug;
     b.name = site.name;
     b.abbr = ImportFlow.initials(site.name);
   }
 
-  /** Try to auto-match each still-unbound building to a NetBox site by name/slug. Runs once
-   *  per scan (guarded by `_autoMapDone`). Accept only a confident match — a site whose slug
-   *  equals the folder-derived slug, or whose name matches, or a lone search result — and
-   *  flag it `auto` so the operator confirms it. Ambiguous folders stay unbound for manual
-   *  binding. */
+  /** Bind a building to a **Location** anchor (Site = campus, the building is a `dcim.Location`
+   *  beneath the campus Site, MODEL-4). `site` is the campus (→ `nbSite`, its slug is the manifest
+   *  `siteSlug`); `building` is the building Location (→ `nbBuilding`, its slug is the
+   *  `buildingSlug`). Name/abbr prefill from the **building** (that's the actual building), while the
+   *  downstream `siteSlug` (`b.slug`) stays the campus Site's, keeping `floor_key`'s first segment a
+   *  pure site slug (MULTI-2 scoping). `auto` flags an unconfirmed auto-match. */
+  _bindBuilding(b, site, building, auto) {
+    b.nbSite = { id: site.id, slug: site.slug, name: site.name, auto: !!auto };
+    b.nbBuilding = { id: building.id, slug: building.slug, name: building.name };
+    b.nbFloors = undefined;   // re-fetch floors (this anchor's are the building Location's children)
+    b.slug = site.slug;
+    b.name = building.name;
+    b.abbr = ImportFlow.initials(building.name);
+  }
+
+  /** One-line summary of a building's current anchor, for the bind-state UI (shared by the bind
+   *  step and the edit hub). A Site anchor reads "Name (slug)"; a Location anchor reads
+   *  "Building (slug) in Campus" so the operator sees both the building and its campus. */
+  _anchorSummary(b) {
+    if (b.nbBuilding)
+      return b.nbBuilding.name + ' (' + b.nbBuilding.slug + ') in ' + b.nbSite.name;
+    return b.nbSite ? b.nbSite.name + ' (' + b.nbSite.slug + ')' : '';
+  }
+
+  /** Try to auto-match each still-unbound building to a NetBox **anchor** — a Site or, failing that,
+   *  a building Location (Site = campus, MODEL-4) — by name/slug. Runs once per scan (guarded by
+   *  `_autoMapDone`). A confident **Site** match wins first, exactly as before (a site whose slug
+   *  equals the folder-derived slug, whose name matches, or a lone result), so the Site-anchored
+   *  auto-map is unchanged. Only when no Site is confident does it search building Locations and
+   *  apply the same confidence test — so Location suggestions are purely additive. Every match is
+   *  flagged `auto` for the operator to confirm; ambiguous folders stay unbound for manual binding. */
   async _autoMapBuildings() {
     if (this._autoMapDone) return;
     this._autoMapDone = true;
     for (const b of this._floorBuildings()) {
       if (b.nbSite) continue;
-      let res;
-      try { res = await this.app.netbox.sites(b.name); } catch (_) { continue; }
-      const sites = res.sites || [];
       const nameLc = b.name.toLowerCase();
-      const match = sites.find(s => s.slug === b.slug)
+      let sites = [];
+      try { sites = (await this.app.netbox.sites(b.name)).sites || []; } catch (_) { /* try Locations */ }
+      const site = sites.find(s => s.slug === b.slug)
         || sites.find(s => s.name.toLowerCase() === nameLc)
         || (sites.length === 1 ? sites[0] : null);
-      if (match) this._bindSite(b, match, true);
+      if (site) { this._bindSite(b, site, true); continue; }
+      // No confident Site — look for a building Location (Site = campus). The endpoint already
+      // returns only building-like Locations (those with floor children), each carrying its campus
+      // site, so a confident hit binds a Location anchor.
+      let locs = [];
+      try { locs = (await this.app.netbox.buildingLocations(b.name)).locations || []; } catch (_) { continue; }
+      const loc = locs.find(l => l.slug === b.slug)
+        || locs.find(l => l.name.toLowerCase() === nameLc)
+        || (locs.length === 1 ? locs[0] : null);
+      if (loc) this._bindBuilding(b, { id: null, slug: loc.site_slug, name: loc.site_name }, loc, true);
     }
   }
 
@@ -535,37 +604,60 @@ class ImportFlow {
     view.append(this._buildingsActions(focusBuilding));
   }
 
-  /** One building's bind control: its current state plus a site-search autocomplete. */
+  /** One building's bind control: its current state plus an anchor-search autocomplete. The search
+   *  returns both **Sites** (Site = building) and building **Locations** (Site = campus, MODEL-4),
+   *  so the operator can confirm or override to either anchor kind in the same row. */
   _bindRow(b) {
     const state = Dom.el('div', { class: 'imp-bind-state' });
     if (b.nbSite && b.nbSite.auto)
       state.append(Dom.el('span', { class: 'imp-bind-auto' },
-        '✓ auto-matched → ' + b.nbSite.name + ' (' + b.nbSite.slug + '). Confirm or change.'));
+        '✓ auto-matched → ' + this._anchorSummary(b) + '. Confirm or change.'));
     else if (b.nbSite)
-      state.append(Dom.el('span', { class: 'imp-bind-ok' },
-        '✓ ' + b.nbSite.name + ' (' + b.nbSite.slug + ')'));
+      state.append(Dom.el('span', { class: 'imp-bind-ok' }, '✓ ' + this._anchorSummary(b)));
     else
       state.append(Dom.el('span', { class: 'imp-bind-warn' },
-        '⚠ not bound: pick a NetBox site'));
+        '⚠ not bound: pick a NetBox site or building'));
 
-    const search = Dom.el('input', { placeholder: 'Search NetBox sites…' });
+    const search = Dom.el('input', { placeholder: 'Search NetBox sites or buildings…' });
     const list = Dom.el('div', { class: 'imp-bind-list' });
     let token = 0;
     const run = async (q) => {
       const mine = ++token;
-      let res;
-      try { res = await this.app.netbox.sites(q); } catch (_) { return; }
+      // Fetch Sites and building Locations together; either may error independently (fall back to
+      // whatever came back), and a stale keystroke's results are dropped.
+      const [sr, lr] = await Promise.all([
+        this.app.netbox.sites(q).catch(() => ({ sites: [] })),
+        this.app.netbox.buildingLocations(q).catch(() => ({ locations: [] })),
+      ]);
       if (mine !== token) return;   // a newer keystroke superseded this fetch
       list.innerHTML = '';
-      const sites = res.sites || [];
-      if (!sites.length) { list.append(Dom.el('div', { class: 'hint' }, 'No sites found.')); return; }
+      const sites = sr.sites || [], locs = lr.locations || [];
+      if (!sites.length && !locs.length) {
+        list.append(Dom.el('div', { class: 'hint' }, 'No sites or buildings found.'));
+        return;
+      }
+      // Sites first (the common Site = building case), then building Locations, each labelled so the
+      // two anchor kinds are distinguishable. A row is marked bound when it matches the current
+      // anchor — for a Location that means both its site slug and its own slug.
       for (const s of sites) {
-        const isThis = b.nbSite && b.nbSite.slug === s.slug;
+        const isThis = !b.nbBuilding && b.nbSite && b.nbSite.slug === s.slug;
         const item = Dom.el('div', { class: 'room-item' + (isThis ? ' bound' : '') }, [
           Dom.el('div', { class: 'nm' }, s.name + (isThis ? '  ✓' : '')),
-          Dom.el('div', { class: 'sl' }, s.slug),
+          Dom.el('div', { class: 'sl' }, 'Site · ' + s.slug),
         ]);
         item.onclick = () => { this._bindSite(b, s, false); this._stepBuildings(); };
+        list.append(item);
+      }
+      for (const l of locs) {
+        const isThis = b.nbBuilding && b.nbBuilding.slug === l.slug && b.nbSite.slug === l.site_slug;
+        const item = Dom.el('div', { class: 'room-item' + (isThis ? ' bound' : '') }, [
+          Dom.el('div', { class: 'nm' }, l.name + (isThis ? '  ✓' : '')),
+          Dom.el('div', { class: 'sl' }, 'Building in ' + l.site_name + ' · ' + l.slug),
+        ]);
+        item.onclick = () => {
+          this._bindBuilding(b, { id: null, slug: l.site_slug, name: l.site_name }, l, false);
+          this._stepBuildings();
+        };
         list.append(item);
       }
     };
@@ -929,6 +1021,335 @@ class ImportFlow {
     });
   }
 
+  // ---- step 2c: align a GIS overlay onto its floor plan (FMT-6) ----
+
+  /** The overlay card's alignment row: the layer's placement state (approximate fit vs aligned
+   *  with N control points) and the jump into the align editor. Overlay cards only. */
+  _alignRow(b, p) {
+    const pairs = ((b.align && b.align[p.stem]) || []).filter(ImportFlow._validAlignPair);
+    const aligned = pairs.length >= 2;
+    const state = Dom.el('span', { class: 'imp-align-state' + (aligned ? ' ok' : '') },
+      aligned ? '⌖ aligned (' + pairs.length + ' points)' : 'placed by approximate fit');
+    return Dom.el('div', { class: 'imp-align-row' }, [
+      state,
+      Dom.el('button', { class: 'imp-floor',
+        title: 'Pin points on this data layer to their true spots on the floor plan (georeference)',
+        onclick: () => this._stepAlignOverlay(b, p) }, '⌖ Align on plan…'),
+    ]);
+  }
+
+  /** The built manifest's overlay entry for drawing stem `stem` of building model `b` — with its
+   *  floor + manifest building — or null when the facility hasn't been built with this overlay
+   *  mapped yet. Matched by the manifest `folder` (the same key the edit hub's binding recovery
+   *  uses) and the overlay `name` (the drawing stem `preprocess` writes). */
+  _manifestOverlay(b, stem) {
+    const manifest = this.app.store.manifest;
+    for (const mb of (manifest && manifest.buildings) || []) {
+      if (mb.folder !== b.folder) continue;
+      for (const floor of mb.floors || [])
+        for (const ov of floor.overlays || [])
+          if (ov.name === stem) return { building: mb, floor, overlay: ov };
+    }
+    return null;
+  }
+
+  /** Align-overlay editor (FMT-6): the floor's combined canvas with the overlay drawn on top;
+   *  clicking a feature vertex drops a control-point pin whose head is then dragged to the same
+   *  physical spot on the plan. Each pin is a `{src, dst}` pair — `src` the vertex's RAW source
+   *  coordinate (recovered by inverting the manifest's `srcTransform`), `dst` a 0..1 point on the
+   *  floor canvas — stored on `b.align[p.stem]` (draft-persisted) and emitted at build as the
+   *  import-map `overlayAlign`, which georeferences the layer server-side. With ≥2 pins the
+   *  editor re-solves the transform locally (`_alignSolve`, the JS mirror of the backend's
+   *  OverlayProjector) so the preview tracks live; the authoritative solve still happens at
+   *  rebuild. Needs a built manifest carrying this overlay — the deliberate flow is build once
+   *  (approximate fit), then align, then rebuild. Follows the `_stepSplitRegions` viewport/zoom
+   *  precedent. */
+  _stepAlignOverlay(b, p) {
+    const view = this._stage('Align ' + p.file + ' on the plan');
+    const found = this._manifestOverlay(b, p.stem);
+    const unproject = found && Array.isArray(found.overlay.srcTransform)
+      ? ImportFlow._invertAffine(found.overlay.srcTransform) : null;
+    if (!unproject) {
+      view.append(Dom.el('p', { class: 'hint' },
+        'This overlay isn’t part of the built facility yet (or was built by an older version). '
+        + 'Assign it a floor and run Review & build once — it imports with an approximate fit — '
+        + 'then come back here to pin it to the plan.'));
+      view.append(Dom.el('div', { class: 'imp-actions' },
+        [Dom.el('button', { class: 'primary', onclick: () => this._stepMap() }, '← Back')]));
+      return;
+    }
+    const { building, floor, overlay } = found;
+
+    // Every feature vertex back in RAW source coordinates, so the live preview can re-place the
+    // whole layer through a freshly solved transform (and a clicked vertex knows its `src`).
+    const rawFeats = (overlay.features || []).map((feat) => ({
+      type: feat.type,
+      raw: feat.type === 'point'
+        ? [unproject(feat.coords[0], feat.coords[1])]
+        : feat.coords.map((c) => unproject(c[0], c[1])),
+    }));
+    const rawPoints = [];
+    for (const f of rawFeats) for (const pt of f.raw) rawPoints.push(pt);
+
+    view.append(Dom.el('p', { class: 'hint' },
+      'Click a recognizable point on the data layer (a corner, a junction), then drag the pin to '
+      + 'the same physical spot on the floor plan. Two pins align the layer (scale + rotation); '
+      + 'a third refines it with a best fit. The preview updates live — the alignment is applied '
+      + 'to the facility when you rebuild (Review & build).'));
+
+    // One SVG in layout-px units: sheet images tiled per the floor's combined canvas (honoring a
+    // saved arrangement — the same `floorLayout` geometry the map renders), the overlay features,
+    // and the control-point pins. Normalized 0..1 coords scale by the layout size, exactly the
+    // floor editor's convention, and the <svg> keeps the viewBox aspect so pointer→0..1 mapping
+    // is a plain getBoundingClientRect division (the `_attachRegionAdd` technique).
+    const g = this.app.store.floorLayout(building.dir, floor.id);
+    const svg = Dom.svg('svg', { viewBox: '0 0 ' + g.W + ' ' + g.H, class: 'imp-align-svg' });
+    for (const cell of g.cells)
+      svg.append(Dom.svg('image', { href: this.app.store.mediaUrl(cell.image),
+        x: cell.col * g.cellW, y: cell.row * g.cellH, width: cell.w, height: cell.h }));
+    const featLayer = Dom.svg('g');
+    const pinLayer = Dom.svg('g');
+    svg.append(featLayer);
+    svg.append(pinLayer);
+    const canvas = Dom.el('div', { class: 'imp-region-canvas imp-align-canvas' }, [svg]);
+    const viewport = Dom.el('div', { class: 'imp-region-view' }, [canvas]);
+    const status = Dom.el('p', { class: 'imp-align-status' });
+    const list = Dom.el('div', { class: 'imp-region-list' });
+    // Marker geometry in layout units (the canvas can be thousands of px wide, so fixed pixel
+    // radii would vanish); ~0.5% of a sheet reads well at fit-to-width and while zoomed.
+    const unit = Math.max(g.cellW, g.cellH) / 200;
+
+    const snapshot = JSON.stringify(b.align[p.stem] || []);
+    const pairs = () => b.align[p.stem];
+    const validPairs = () => pairs().filter(ImportFlow._validAlignPair);
+    // The transform the preview draws with: a live local solve once ≥2 pins exist, else the
+    // manifest's as-built placement.
+    const displayTransform = () => {
+      const clean = validPairs();
+      if (clean.length >= 2) {
+        const t = ImportFlow._alignSolve(clean, overlay.crs, rawPoints);
+        if (t) return t;
+      }
+      return overlay.srcTransform;
+    };
+
+    const redraw = () => {
+      const t = displayTransform();
+      featLayer.innerHTML = '';
+      pinLayer.innerHTML = '';
+      for (const f of rawFeats) {
+        const pts = f.raw.map((pt) => ImportFlow._applyAffine(t, pt[0], pt[1]));
+        if (f.type === 'point') {
+          featLayer.append(Dom.svg('circle', { cx: pts[0][0] * g.W, cy: pts[0][1] * g.H,
+            r: unit, class: 'imp-align-feat' }));
+        } else {
+          featLayer.append(Dom.svg(f.type === 'polygon' ? 'polygon' : 'polyline', {
+            points: pts.map((pt) => (pt[0] * g.W) + ',' + (pt[1] * g.H)).join(' '),
+            'stroke-width': unit / 2, class: 'imp-align-feat' }));
+        }
+      }
+      pairs().forEach((pr, i) => {
+        const s = ImportFlow._applyAffine(t, pr.src[0], pr.src[1]);
+        const d = pr.dst;
+        // Tail (where the source point currently sits) → head (its true spot). With ≥2 pins the
+        // solve interpolates the anchors exactly, so an anchored pin's tail collapses onto its
+        // head — visually confirming the fit.
+        pinLayer.append(Dom.svg('line', { x1: s[0] * g.W, y1: s[1] * g.H,
+          x2: d[0] * g.W, y2: d[1] * g.H, 'stroke-width': unit / 3, class: 'imp-align-link' }));
+        pinLayer.append(Dom.svg('circle', { cx: s[0] * g.W, cy: s[1] * g.H, r: unit * 0.8,
+          class: 'imp-align-tail' }));
+        const head = Dom.svg('circle', { cx: d[0] * g.W, cy: d[1] * g.H, r: unit * 1.4,
+          class: 'imp-align-head', 'data-pin': String(i) });
+        pinLayer.append(head);
+        const label = Dom.svg('text', { x: d[0] * g.W, y: d[1] * g.H - unit * 1.8,
+          'font-size': unit * 2.2, 'text-anchor': 'middle', class: 'imp-align-num' });
+        label.textContent = String(i + 1);
+        pinLayer.append(label);
+      });
+      const n = validPairs().length;
+      status.textContent =
+        n >= 3 ? n + ' pins — aligned (best-fit). Rebuild to apply.'
+          : n === 2 ? '2 pins — aligned (scaled + rotated to fit). Rebuild to apply.'
+            : n === 1 ? '1 pin — add at least one more to align the layer.'
+              : 'No pins yet.';
+      status.className = 'imp-align-status' + (n >= 2 ? ' ok' : '');
+      list.innerHTML = '';
+      pairs().forEach((pr, i) => {
+        list.append(Dom.el('div', { class: 'imp-region-row' }, [
+          Dom.el('span', { class: 'imp-region-rownum' }, 'Pin ' + (i + 1)),
+          Dom.el('button', { class: 'imp-floor', onclick: () => {
+            pairs().splice(i, 1); this._saveDraft(); redraw();
+          } }, 'Remove'),
+        ]));
+      });
+    };
+
+    this._attachAlignDrag(svg, { pairs, validPairs, displayTransform, rawFeats, redraw });
+
+    view.append(this._regionZoomBar(canvas));
+    view.append(viewport);
+    view.append(status);
+    view.append(list);
+    this._applyRegionZoom(canvas);
+    redraw();
+
+    view.append(Dom.el('div', { class: 'imp-actions' }, [
+      Dom.el('button', { class: 'primary',
+        onclick: async () => { await this._saveDraft(); this._stepMap(); } }, 'Done'),
+      Dom.el('button', { onclick: async () => {
+        if (pairs().length && !confirm('Remove all alignment pins from this overlay?')) return;
+        b.align[p.stem] = []; await this._saveDraft(); redraw();
+      } }, 'Clear alignment'),
+      Dom.el('button', { onclick: () => {
+        b.align[p.stem] = JSON.parse(snapshot); this._stepMap();
+      } }, 'Cancel'),
+    ]));
+  }
+
+  /** Pointer wiring for the align editor: press on a pin head drags it; press near a displayed
+   *  feature vertex drops a NEW pin there (src = that vertex's raw coordinate) and immediately
+   *  drags its head, so pinning is one gesture — press the layer point, drag to its true spot.
+   *  A press on empty plan does nothing (no accidental pins). Coordinates map pointer→0..1 via
+   *  the svg's live `getBoundingClientRect` (the `_attachRegionAdd` technique — the svg keeps the
+   *  viewBox aspect, so there is no letterboxing to correct for). */
+  _attachAlignDrag(svg, ed) {
+    svg.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      const norm = (ev) => [
+        Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width)),
+        Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height)),
+      ];
+      const [nx, ny] = norm(e);
+      // Screen-space hit radius (12px) converted to normalized units so snapping feels the same
+      // at any zoom. The canvas keeps the viewBox aspect, so one axis conversion suffices.
+      const hit = 12 / rect.width;
+      let pair = null;
+      const headEl = e.target.closest ? e.target.closest('.imp-align-head') : null;
+      if (headEl) {
+        pair = ed.pairs()[Number(headEl.getAttribute('data-pin'))] || null;
+      } else {
+        // Snap to the nearest displayed feature vertex within the hit radius.
+        const t = ed.displayTransform();
+        let best = null, bestD = hit * hit;
+        for (const f of ed.rawFeats) {
+          for (const pt of f.raw) {
+            const dpt = ImportFlow._applyAffine(t, pt[0], pt[1]);
+            const dx = dpt[0] - nx, dy = (dpt[1] - ny) * (rect.height / rect.width);
+            const d2 = dx * dx + dy * dy;
+            if (d2 < bestD) { bestD = d2; best = pt; }
+          }
+        }
+        if (best) {
+          const start = ImportFlow._applyAffine(t, best[0], best[1]);
+          pair = { src: [best[0], best[1]], dst: [start[0], start[1]] };
+          ed.pairs().push(pair);
+        }
+      }
+      if (!pair) return;
+      try { svg.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+      const move = (ev) => { pair.dst = norm(ev); ed.redraw(); };
+      const up = () => {
+        svg.removeEventListener('pointermove', move);
+        svg.removeEventListener('pointerup', up);
+        this._saveDraft();
+        ed.redraw();
+      };
+      svg.addEventListener('pointermove', move);
+      svg.addEventListener('pointerup', up);
+      ed.redraw();
+    });
+  }
+
+  /** Apply a 6-coefficient affine `[a,b,c,d,e,f]`: `(x, y) → [a·x + b·y + c, d·x + e·y + f]`. */
+  static _applyAffine(t, x, y) {
+    return [t[0] * x + t[1] * y + t[2], t[3] * x + t[4] * y + t[5]];
+  }
+
+  /** Invert a 6-coefficient affine, or null when (near-)singular. The align editor uses it to
+   *  recover the raw source coordinate behind a manifest overlay vertex from `srcTransform`. */
+  static _invertAffine(t) {
+    const a = t[0], bb = t[1], c = t[2], d = t[3], e = t[4], f = t[5];
+    const det = a * e - bb * d;
+    if (!isFinite(det) || Math.abs(det) < 1e-12) return null;
+    return (nx, ny) => [
+      (e * (nx - c) - bb * (ny - f)) / det,
+      (a * (ny - f) - d * (nx - c)) / det,
+    ];
+  }
+
+  /** Solve the control-point transform from ≥2 clean pairs — the JS mirror of the backend's
+   *  `OverlayProjector._solve_pairs` (keep the two in LOCKSTEP, architecture §10): two pairs →
+   *  exact similarity, three+ → least-squares affine, both solved in a Y-down pre-projected
+   *  working plane (`u = k·x, v = −y`; `k` = cos of the layer's clamped mid-latitude for a
+   *  geographic CRS, else 1 — `rawPoints` supplies the latitudes exactly as the backend derives
+   *  them from the layer's own points). Returns the raw-source→unit `[a,b,c,d,e,f]`, or null
+   *  when degenerate (the preview then keeps the as-built placement). */
+  static _alignSolve(pairs, crs, rawPoints) {
+    let k = 1;
+    if (crs === 'geographic' && rawPoints.length) {
+      let lo = Infinity, hi = -Infinity;
+      for (const pt of rawPoints) { if (pt[1] < lo) lo = pt[1]; if (pt[1] > hi) hi = pt[1]; }
+      const lat0 = Math.max(-89, Math.min(89, (lo + hi) / 2));
+      k = Math.cos(lat0 * Math.PI / 180);
+    }
+    const uv = pairs.map((pr) => [pr.src[0] * k, -pr.src[1]]);
+    const dst = pairs.map((pr) => pr.dst);
+    const plane = pairs.length === 2
+      ? ImportFlow._similarity(uv, dst) : ImportFlow._lsqAffine(uv, dst);
+    if (!plane || !plane.every(isFinite)) return null;
+    return [plane[0] * k, -plane[1], plane[2], plane[3] * k, -plane[4], plane[5]];
+  }
+
+  /** Exact 2-point similarity in the working plane (complex `dst = A·src + B` via real
+   *  arithmetic), or null when the source points coincide. Mirrors `OverlayProjector._similarity`. */
+  static _similarity(uv, dst) {
+    const su = uv[1][0] - uv[0][0], sv = uv[1][1] - uv[0][1];
+    const den = su * su + sv * sv;
+    if (den < 1e-24) return null;
+    const dx = dst[1][0] - dst[0][0], dy = dst[1][1] - dst[0][1];
+    const ar = (dx * su + dy * sv) / den;    // A = (d1 − d0) / (s1 − s0)
+    const ai = (dy * su - dx * sv) / den;
+    const br = dst[0][0] - (ar * uv[0][0] - ai * uv[0][1]);   // B = d0 − A·s0
+    const bi = dst[0][1] - (ai * uv[0][0] + ar * uv[0][1]);
+    return [ar, -ai, br, ai, ar, bi];
+  }
+
+  /** Least-squares affine in the working plane: two 3-unknown normal-equation systems over rows
+   *  `[u, v, 1]`, or null when singular (collinear sources). Mirrors `OverlayProjector._lsq_affine`. */
+  static _lsqAffine(uv, dst) {
+    const m = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    const rx = [0, 0, 0], ry = [0, 0, 0];
+    for (let n = 0; n < uv.length; n++) {
+      const row = [uv[n][0], uv[n][1], 1];
+      for (let i = 0; i < 3; i++) {
+        for (let j = 0; j < 3; j++) m[i][j] += row[i] * row[j];
+        rx[i] += row[i] * dst[n][0];
+        ry[i] += row[i] * dst[n][1];
+      }
+    }
+    const top = ImportFlow._solve3(m, rx), bot = ImportFlow._solve3(m, ry);
+    return top && bot ? [top[0], top[1], top[2], bot[0], bot[1], bot[2]] : null;
+  }
+
+  /** 3×3 Gaussian elimination with partial pivoting, or null when singular. Left side `m` and
+   *  `rhs` are not modified (worked on copies — `_lsqAffine` reuses `m` for both axes). */
+  static _solve3(m, rhs) {
+    const a = m.map((row, i) => [row[0], row[1], row[2], rhs[i]]);
+    for (let col = 0; col < 3; col++) {
+      let piv = col;
+      for (let r = col + 1; r < 3; r++) if (Math.abs(a[r][col]) > Math.abs(a[piv][col])) piv = r;
+      if (Math.abs(a[piv][col]) < 1e-12) return null;
+      const tmp = a[col]; a[col] = a[piv]; a[piv] = tmp;
+      for (let r = 0; r < 3; r++) {
+        if (r === col) continue;
+        const factor = a[r][col] / a[col][col];
+        for (let c = col; c < 4; c++) a[r][c] -= factor * a[col][c];
+      }
+    }
+    return [a[0][3] / a[0][0], a[1][3] / a[1][1], a[2][3] / a[2][2]];
+  }
+
   _stepMap() {
     // Order of the assign phase: pick the site plan first (it has no floor code), then mark the
     // code region (skippable) so the cards can show a close-up crop of each drawing's code.
@@ -1001,32 +1422,30 @@ class ImportFlow {
   }
 
   /** The Build / Add-drawings / Start-over action row. Build is gated until every drawing is
-   *  assigned to a floor (no building left with an `unassigned` drawing) and a site-plan image is
-   *  chosen; while gated it shows a disabled button + a hint naming what's missing, so the button
-   *  never silently vanishes. "Add drawings" (additive upload) and "Start over" stay available
-   *  regardless. The label tracks whether this is a fresh import or a re-edit: a facility already
-   *  in the store (`hasContent()`, the live store-state that also picks EditImportFlow in
-   *  `App.showImport`) means the action regenerates an existing map, so the button reads **Rebuild
-   *  map** rather than the from-scratch **Build facility map** — the rebuild itself is identical
-   *  either way. */
+   *  assigned to a floor (no building left with an `unassigned` drawing); while gated it shows a
+   *  disabled button + a hint naming what's missing, so the button never silently vanishes. The
+   *  siteplan is optional (IMPORT-8) — a facility with no overall site plan (a single building, or a
+   *  site with no campus map) builds fine with `site.file` unset, so it is NOT part of the gate.
+   *  "Add drawings" (additive upload) and "Start over" stay available regardless. The label tracks
+   *  whether this is a fresh import or a re-edit: a facility already in the store (`hasContent()`,
+   *  the live store-state that also picks EditImportFlow in `App.showImport`) means the action
+   *  regenerates an existing map, so the button reads **Rebuild map** rather than the from-scratch
+   *  **Build facility map** — the rebuild itself is identical either way. */
   _buildActions() {
     const unassigned = this._unassignedBuildings();
-    const needSiteplan = !this.site.file;
     const label = this.app.store.hasContent() ? 'Rebuild map' : 'Build facility map';
     // Linear back to the code-region step (fresh only; null in edit → dropped by `Dom.el`).
     const actions = [this._backButton('map')];
-    if (unassigned.length || needSiteplan) {
+    if (unassigned.length) {
       const blocked = Dom.el('button', { class: 'primary' }, label);
       blocked.disabled = true;
       actions.push(blocked);
       const reasons = [];
       // Name the offending buildings when there are few; a long list is just noise, so past a
       // handful collapse it to a count.
-      if (unassigned.length)
-        reasons.push(unassigned.length <= 5
-          ? 'Unassigned drawings in: ' + unassigned.join(', ') + '.'
-          : unassigned.length + ' buildings have unassigned drawings.');
-      if (needSiteplan) reasons.push('Pick a siteplan (use “Change” above).');
+      reasons.push(unassigned.length <= 5
+        ? 'Unassigned drawings in: ' + unassigned.join(', ') + '.'
+        : unassigned.length + ' buildings have unassigned drawings.');
       actions.push(Dom.el('span', { class: 'hint' }, reasons.join(' ')));
     } else {
       actions.push(Dom.el('button', { class: 'primary', onclick: () => this._build() }, label));
@@ -1075,14 +1494,16 @@ class ImportFlow {
     const slug = (b.slug || '').trim();
     if (!slug) { b.nbFloors = []; return; }
     b.nbFloors = 'loading';
-    // The building Location is named after the bound NetBox site, so match on that (not the
-    // user-editable `b.name`); fall back to `b.name` when unbound.
+    // For a Site anchor the building Location is named after the bound NetBox site, so match on that
+    // (not the user-editable `b.name`); fall back to `b.name` when unbound. For a Location anchor the
+    // building Location is known by slug (`nbBuilding`), so its children are the floors directly.
     const siteName = (b.nbSite && b.nbSite.name) || b.name;
+    const buildingSlug = b.nbBuilding && b.nbBuilding.slug;
     let floors = [];
     try {
       const res = await this.app.netbox.locations(slug);
       const locs = res.rooms || [];
-      floors = this._mergeAssignedFloors(b, this._floorsFromLocations(locs, siteName), locs);
+      floors = this._mergeAssignedFloors(b, this._floorsFromLocations(locs, siteName, buildingSlug), locs);
     } catch (_) { floors = []; }
     b.nbFloors = floors;
     if (floors.length) this._normalizeToLocations(b);
@@ -1108,15 +1529,29 @@ class ImportFlow {
     return floors.sort((x, y) => (x.name || '').localeCompare(y.name || '', undefined, { numeric: true }));
   }
 
-  /** Pick the floor Locations out of a site's flat Location list using the parent tree. The
-   *  building Location is the root named after the bound site (e.g. "MAIN BUILDING"); its
-   *  children are floors. Any OTHER root is itself a floor — some sites park a floor like
-   *  "Roof" or "Level B2" at the top level, as a sibling of the building. When no root matches
-   *  the site name the site has no building wrapper and the roots themselves are the floors
-   *  (e.g. ANNEX). Identifying the building by name — not by tree shape — works even when the
-   *  floors have no rooms under them yet; `depth`/`level` is avoided (MPTT-only, unreliable on
-   *  NetBox 4.2+). Floors are sorted by name for a stable, natural order (B1, B2, G, …, Roof). */
-  _floorsFromLocations(locs, siteName) {
+  /** Pick the floor Locations out of a site's flat Location list using the parent tree.
+   *
+   *  **Location anchor (Site = campus, `buildingSlug` given — MODEL-4):** the building Location is
+   *  known exactly, so the floors are strictly its **children** (`l.parent === building.id`) — no
+   *  root/sibling guessing, and two buildings under one campus stay separated. An unknown slug (the
+   *  Location vanished) yields no floors, driving the floor-type fallback.
+   *
+   *  **Site anchor (no `buildingSlug`):** the building Location is the root named after the bound
+   *  site (e.g. "MAIN BUILDING"); its children are floors. Any OTHER root is itself a floor — some
+   *  sites park a floor like "Roof" or "Level B2" at the top level, as a sibling of the building.
+   *  When no root matches the site name the site has no building wrapper and the roots themselves are
+   *  the floors (e.g. ANNEX). Identifying the building by name — not by tree shape — works even when
+   *  the floors have no rooms under them yet.
+   *
+   *  Either way `depth`/`level` is avoided (MPTT-only, unreliable on NetBox 4.2+). Floors are sorted
+   *  by name for a stable, natural order (B1, B2, G, …, Roof). */
+  _floorsFromLocations(locs, siteName, buildingSlug) {
+    const sortByName = (arr) =>
+      arr.sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { numeric: true }));
+    if (buildingSlug) {
+      const building = locs.find(l => l.slug === buildingSlug);
+      return sortByName(building ? locs.filter(l => l.parent === building.id) : []);
+    }
     const ids = new Set(locs.map(l => l.id));
     const roots = locs.filter(l => l.parent == null || !ids.has(l.parent));
     const nameLc = (siteName || '').trim().toLowerCase();
@@ -1124,7 +1559,7 @@ class ImportFlow {
       ? roots.find(r => (r.name || '').trim().toLowerCase() === nameLc) : null;
     const floors = roots.filter(r => r !== building);
     if (building) for (const l of locs) if (l.parent === building.id) floors.push(l);
-    return floors.sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { numeric: true }));
+    return sortByName(floors);
   }
 
   /** Entering Location mode: a drawing with no Location token yet is marked `unassigned` so it
@@ -1192,7 +1627,9 @@ class ImportFlow {
     const view = this._stage('Select the siteplan', 'siteplan');
     view.append(Dom.el('p', { class: 'hint' },
       'The siteplan is the overall map of the site: the drawing that shows where the buildings '
-      + 'sit. It has no floor code, so choose it here first; it’s left out of floor assignment.'));
+      + 'sit. It has no floor code, so choose it here first; it’s left out of floor assignment. '
+      + 'It’s optional — if your facility has no overall site plan (a single building, or a site '
+      + 'with no campus map), leave this as (none) and continue.'));
     view.append(Dom.el('div', { class: 'imp-siteplan' }, [
       Dom.el('label', {}, 'Siteplan image'), this._siteplanSelect(),
     ]));
@@ -1264,6 +1701,45 @@ class ImportFlow {
     }
   }
 
+  /** True when drawing `p` is this building's chosen site plan — the card that carries no floor and
+   *  shows a badge instead of the floor selector (`_pdfCard`). Keyed on the `this.site` match, not
+   *  merely `type:'none'`, so a card manually set to "(none)" is NOT the siteplan. The siteplan
+   *  renders page 1 of its file, so for a multi-page PDF only the first page row is the site plan —
+   *  pages 2..N are ordinary floor cards. Shared by `_pdfCard` and the bulk-triage actions, which
+   *  must never clobber the siteplan pick. */
+  _isSiteplanPick(b, p) {
+    return this.site.folder === b.folder && this.site.file === p.file && (!p.page || p.page === 1);
+  }
+
+  /** Whether drawing `p` may be swept to "(none)" by a bulk action: not the chosen site plan (a
+   *  distinct no-floor state) and not a region-split drawing (whose per-region floors would be
+   *  silently discarded — left to the explicit Unsplit). Keeps `_bulkNone` and the header controls'
+   *  visibility in lockstep. */
+  _bulkEligible(b, p) {
+    return !this._isSiteplanPick(b, p) && !(b.regions[p.stem] && b.regions[p.stem].length);
+  }
+
+  /** Bulk-triage helper: set every card in building `b` matching `matchFn(p)` to "(none)", the same
+   *  `{type:'none', token:null, label:''}` the per-card `(none)` button produces (`_floorButtons`) —
+   *  so bulk-none is pure UX ergonomics with no new "ignored" state, and `max_pdfs` is satisfied for
+   *  free (a `type:'none'` drawing is dropped from the build, see `_resolveFloors`). Ineligible cards
+   *  (the chosen site plan; a region-split drawing) are skipped via `_bulkEligible`. Saves the draft,
+   *  re-renders the building section in place (preserving scroll, IMPORT-2; also re-runs the build
+   *  gate), and toasts the count. */
+  _bulkNone(b, matchFn) {
+    let n = 0;
+    for (const p of b.pdfs) {
+      if (!this._bulkEligible(b, p) || !matchFn(p)) continue;
+      const a = b.assign[p.stem];
+      a.type = 'none'; a.token = null; a.label = '';
+      n++;
+    }
+    if (!n) { Toast.show('No matching drawings to set to (none).'); return; }
+    this._saveDraft();
+    this._rerenderBuildingSection(b);
+    Toast.show('Set ' + n + (n === 1 ? ' drawing' : ' drawings') + ' to (none).');
+  }
+
   /** Boundary validation for a building's editable `name`/`slug`, surfaced inline in the map step
    *  so a problem shows as the user types rather than only as a late build-time toast (the empty-slug
    *  and duplicate-slug guards in `_build` remain the hard safety net). Returns an error string, or
@@ -1321,6 +1797,8 @@ class ImportFlow {
     if (markable)
       fields.push(Dom.el('button', { class: 'imp-auto',
         onclick: () => this._stepRegionPick(b) }, 'Set this building’s code region'));
+    const bulk = this._bulkTriageControls(b);
+    if (bulk) fields.push(bulk);
     const head = Dom.el('div', { class: 'imp-bhead' }, fields);
     const grid = Dom.el('div', { class: 'imp-grid' });
     for (const p of b.pdfs) grid.append(this._pdfCard(b, p));
@@ -1378,16 +1856,26 @@ class ImportFlow {
     }
     // The chosen site plan carries no floor — show a badge instead of the floor selector so it
     // isn't presented as a card asking for a floor. Keyed on the `this.site` match, not merely
-    // `type:'none'`, so a card manually set to "— none —" keeps its floor buttons. The siteplan
-    // renders page 1 of its file, so for a multi-page PDF only the first page row is the site plan
-    // — pages 2..N keep their floor buttons.
-    const isSite = this.site.folder === b.folder && this.site.file === p.file
-      && (!p.page || p.page === 1);
+    // `type:'none'`, so a card manually set to "— none —" keeps its floor buttons.
+    const isSite = this._isSiteplanPick(b, p);
     // A plain floor click only touches this drawing's assignment, so it patches just this card in
     // place (+ the build gate) rather than re-running `_stepMap()`, which would reset the page
     // scroll (IMPORT-2). Same in-place swap the rotate control uses above; `card` is the `let card`
     // assigned below, so this closure resolves it at click time.
+    const isOverlay = ImportUploader.isOverlay(p.file);
+    // Snapshot the resolved floor at render time so the rerender callback below can tell a real
+    // floor *change* from a same-floor click (it fires on every assignment button press).
+    const tokenAtRender = this._assignToken(a, null);
     const rerenderCard = () => {
+      // Re-assigning an overlay's floor invalidates its control-point alignment — the dst
+      // points are 0..1 of the OLD floor's canvas — so clear it, mirroring how a rotation
+      // clears region-split boxes (FMT-6).
+      if (isOverlay && (b.align[p.stem] || []).length
+          && this._assignToken(a, null) !== tokenAtRender) {
+        b.align[p.stem] = [];
+        Toast.show('Alignment cleared — this overlay was aligned on its previous floor. '
+          + 'Use “Align on plan…” to re-align it.');
+      }
       card.replaceWith(card = this._pdfCard(b, p));
       this._applyThumbSize();      // keep the hi-res upgrade state at large thumbnail sizes
       this._refreshBuildActions(); // assigning the last unassigned drawing opens the gate
@@ -1403,6 +1891,9 @@ class ImportFlow {
     const body = Dom.el('div', { class: 'imp-cardbody' }, [
       Dom.el('div', { class: 'imp-cardfile' }, fileParts),
       floorRow,
+      // A GIS overlay card grows the align affordance (FMT-6): its placement state plus the
+      // jump into the align editor. Base drawings are untouched.
+      isOverlay && !isSite ? this._alignRow(b, p) : null,
     ]);
     // Flag a still-unassigned drawing so it stands out in the grid (and in the gated build hint) —
     // region-aware, so a region-split card with an unassigned region is flagged too (FLOOR-4).
@@ -1460,6 +1951,10 @@ class ImportFlow {
       try { const inv = await Api.post('/api/import/scan', {}); if (inv.ok) this.inv = inv; }
       catch (_) { /* the existing thumbnail stays until the next scan */ }
       p._rev = (p._rev || 0) + 1;
+      // Remember that this drawing's bytes changed, so the pre-build desync guard warns that any
+      // rooms/hotspots placed on it may no longer line up (REPL-1) — a margin/crop shift keeps the
+      // id, pixel size, and aspect ratio, so nothing else would flag it.
+      this._replaced.add(b.folder + '/' + p.stem);
       Toast.show('Replaced ' + p.file);
       this._stepMap();
     } catch (e) { Toast.show('Replace failed: ' + e.message, true); }
@@ -1564,7 +2059,11 @@ class ImportFlow {
       try { res = await this.app.netbox.locations(b.slug, q); } catch (_) { return; }
       if (mine !== seq) return;   // a newer keystroke superseded this fetch
       const have = new Set(b.nbFloors.map(f => f.slug));
-      const hits = (res.rooms || []).filter(l => !have.has(l.slug));
+      // A Location anchor's floors must be children of its building Location, or the 3-segment key
+      // (`site/building/floor`) wouldn't resolve — so restrict the site-wide search to that
+      // building's direct children. A Site anchor searches the whole site, as before.
+      const bId = b.nbBuilding && b.nbBuilding.id;
+      const hits = (res.rooms || []).filter(l => !have.has(l.slug) && (!bId || l.parent === bId));
       list.innerHTML = '';
       if (!hits.length) { list.append(Dom.el('div', { class: 'hint' }, 'No other locations found.')); return; }
       for (const loc of hits) {
@@ -1612,6 +2111,56 @@ class ImportFlow {
     this._rerenderBuildingSection(b);
   }
 
+  /** Bulk-triage cluster for the building header (a `.imp-bulk` sub-row): the affordances that let a
+   *  large multi-page set be dispatched to "(none)" many cards at once instead of one-by-one
+   *  (IMPORT-9). All route through `_bulkNone` (siteplan + region cards skipped there). Returns null
+   *  for a trivial single-drawing building, where per-card triage is already quick. Controls:
+   *   - **Set all to (none)** — nones every card, for a mostly-non-floor set (none all, then pick the
+   *     few real floors); the bulk counterpart to `_autoNumber`.
+   *   - **Unassigned → (none)** — nones only still-`unassigned` cards; shown only when there is at
+   *     least one (Location mode, where untouched cards default to `unassigned`) so it's never a
+   *     no-op button. The finisher for "assign the real floors, then none the rest".
+   *   - **Ignore pages N–M** — nones cards whose page number is in the inclusive range; shown only
+   *     for exploded multi-page sets (cards carrying `p.page`). The range matches the page number on
+   *     every PDF in the building — exact for the common one-multipage-PDF-per-building case. */
+  _bulkTriageControls(b) {
+    if (b.pdfs.length <= 1) return null;
+    const btn = (label, title, onclick) =>
+      Dom.el('button', { class: 'imp-floor', title, onclick }, label);
+    const children = [Dom.el('span', { class: 'imp-bulk-label' }, 'Bulk:')];
+    children.push(btn('Set all to (none)',
+      'Set every drawing in this building to (none) — then pick a floor on just the real plans.',
+      () => this._bulkNone(b, () => true)));
+    // Only meaningful (and only shown) when an eligible card is still unassigned — Location mode's
+    // default. Uses `_bulkEligible` so the button appears iff `_bulkNone` would actually act.
+    if (b.pdfs.some(p => this._bulkEligible(b, p) && b.assign[p.stem].type === 'unassigned'))
+      children.push(btn('Unassigned → (none)',
+        'Set every drawing still without a floor to (none).',
+        () => this._bulkNone(b, p => b.assign[p.stem].type === 'unassigned')));
+    // Page-range ignore, for an exploded multi-page set. Defaults span the building's page numbers.
+    const pages = b.pdfs.map(p => p.page || 0).filter(n => n > 0);
+    if (pages.length) {
+      const maxPage = Math.max(...pages);
+      const num = (val) => Dom.el('input', { type: 'number', class: 'imp-bulk-num',
+        min: '1', max: String(maxPage), value: String(val) });
+      const from = num(1);
+      const to = num(maxPage);
+      const apply = Dom.el('button', { class: 'imp-floor',
+        title: 'Set every page in this range to (none). Matches the page number on each PDF in the '
+          + 'building (one multi-page PDF per building is the usual case).',
+        onclick: () => {
+          let lo = parseInt(from.value, 10);
+          let hi = parseInt(to.value, 10);
+          if (!Number.isInteger(lo) || !Number.isInteger(hi)) { Toast.show('Enter a page range.', true); return; }
+          if (lo > hi) { const t = lo; lo = hi; hi = t; }   // tolerate a reversed range
+          this._bulkNone(b, p => p.page && p.page >= lo && p.page <= hi);
+        } }, 'Ignore');
+      children.push(Dom.el('span', { class: 'imp-bulk-range' },
+        [Dom.el('span', {}, 'Ignore pages'), from, Dom.el('span', {}, '–'), to, apply]));
+    }
+    return Dom.el('div', { class: 'imp-bulk' }, children);
+  }
+
   /** POST the current building model to the server as a draft so it can be restored on next
    *  open. Silent on failure — a missing draft just means the user starts fresh. */
   async _saveDraft() {
@@ -1645,6 +2194,7 @@ class ImportFlow {
         if (d.slug != null) b.slug = d.slug;
         if (d.abbr != null) b.abbr = d.abbr;
         if (d.nbSite !== undefined) b.nbSite = d.nbSite;
+        if (d.nbBuilding !== undefined) b.nbBuilding = d.nbBuilding;
         if (d.codeRegion !== undefined) b.codeRegion = d.codeRegion;
         // A restored `assign`/`regions` entry drives `_resolveFloors`/`_cardUnassigned`/the split
         // editor, so a malformed one (corrupt draft) is dropped rather than trusted — the stem
@@ -1657,6 +2207,8 @@ class ImportFlow {
           if (stem in b.angle) b.angle[stem] = a;
         for (const [stem, r] of Object.entries(d.regions || {}))
           if (stem in b.regions && Array.isArray(r)) b.regions[stem] = r.filter(ImportFlow._validRegion);
+        for (const [stem, a] of Object.entries(d.align || {}))
+          if (stem in b.align && Array.isArray(a)) b.align[stem] = a.filter(ImportFlow._validAlignPair);
       }
       if (draft.site?.file) this.site = draft.site;
       if (draft.codeRegion) this._codeRegion = draft.codeRegion;
@@ -1683,8 +2235,11 @@ class ImportFlow {
    *  building the draft left null, so the hub reflects the built state. Runs after `_applyDraft`
    *  and only touches nulls, so an in-progress draft binding still wins; a no-op when nothing is
    *  built yet (empty manifest) or on a manifest built before `folder` was emitted — those correct
-   *  on the next rebuild. `nbSite.id` is unused downstream (all logic keys off `slug`/`name`), so a
-   *  null id is fine. */
+   *  on the next rebuild. A Location-anchored manifest building (a `buildingSlug`, MODEL-4) restores
+   *  the Location anchor: `siteSlug` is the campus (no site *name* is stored, so the slug stands in —
+   *  only cosmetic, since a Location anchor's floors load by `buildingSlug`, not the site name), and
+   *  `buildingSlug`/`name` are the building Location. The `id`s are unused downstream (all logic keys
+   *  off `slug`/`name`), so null ids are fine. */
   _reconcileFromManifest() {
     const manifest = this.app.store.manifest;
     if (!manifest || !manifest.buildings) return;
@@ -1693,7 +2248,12 @@ class ImportFlow {
     for (const b of this.buildings) {
       if (b.nbSite) continue;
       const m = byFolder.get(b.folder);
-      if (m) this._bindSite(b, { id: null, slug: m.siteSlug, name: m.name || b.name }, false);
+      if (!m) continue;
+      if (m.buildingSlug)
+        this._bindBuilding(b, { id: null, slug: m.siteSlug, name: m.siteSlug },
+          { id: null, slug: m.buildingSlug, name: m.name || b.name }, false);
+      else
+        this._bindSite(b, { id: null, slug: m.siteSlug, name: m.name || b.name }, false);
     }
   }
 
@@ -1756,11 +2316,21 @@ class ImportFlow {
     return b.assign[p.stem].type === 'unassigned';
   }
 
+  /** The manifest `dir` a built building writes — the prefix its floor keys hang off. A Site anchor
+   *  is the bare site slug (`<siteSlug>`, a 2-segment key); a Location anchor nests one level
+   *  (`<siteSlug>/<buildingSlug>`, a 3-segment key), matching `preprocess.build_building_from_pdfs`'s
+   *  `rel_dir` and the manifest's `dir`. Every floor-key comparison against the live manifest
+   *  (`_orphanedFloors`/`_desyncedFloors`/`_resplitReprojections`) keys off this, so a rebuilt
+   *  Location-anchored floor matches its manifest entry instead of being falsely orphaned. */
+  static _dirOf(mb) {
+    return mb.buildingSlug ? mb.slug + '/' + mb.buildingSlug : mb.slug;
+  }
+
   /** Floors that currently hold rooms but whose id won't exist after this build — i.e. the
    *  rebuild would orphan their rooms. Compares the keys the build will produce
-   *  (`siteSlug/(abbr+token)`, mirroring `preprocess.build`) against the live manifest's floors
-   *  and their room counts. Returns `[{ key, label, count }]`; empty when nothing is at risk
-   *  (e.g. a pure PDF replacement, where the id is unchanged). */
+   *  (`<dir>/(abbr+token)`, mirroring `preprocess.build` — `dir` per `_dirOf`) against the live
+   *  manifest's floors and their room counts. Returns `[{ key, label, count }]`; empty when nothing
+   *  is at risk (e.g. a pure PDF replacement, where the id is unchanged). */
   async _orphanedFloors(map) {
     const store = this.app.store;
     if (!store || !store.manifest) return [];
@@ -1772,10 +2342,11 @@ class ImportFlow {
       // falsely orphan every real floor when rebuilding a region-split facility). A whole→region
       // split that would strand rooms is caught earlier by `_resplitReprojections` (FLOOR-5) and
       // reprojected, not discarded; `_build` excludes those keys before warning here.
+      const dir = ImportFlow._dirOf(mb);
       for (const stem in mb.floors) {
         const v = mb.floors[stem];
         const toks = Array.isArray(v) ? v.map(e => e.token) : [v];
-        for (const t of toks) newKeys.add(mb.slug + '/' + (mb.abbr + t));
+        for (const t of toks) newKeys.add(dir + '/' + (mb.abbr + t));
       }
     }
     // Fetch annotations fresh so the room counts reflect the current DB, not a stale cache.
@@ -1792,31 +2363,45 @@ class ImportFlow {
     return out;
   }
 
-  /** Built floors (and the siteplan) whose id survives this rebuild but whose orientation changes,
-   *  so the rooms/hotspots already drawn on them would be misaligned. Compares the sorted set of
-   *  sheet angles the build will produce against the ones baked into the live manifest
-   *  (`pages[].angle`, default 0). Floors whose id vanishes are left to `_orphanedFloors`. Returns
-   *  `[{ key, label, count, unit, hotspots? }]`; empty when nothing at risk (a plain unrotated
-   *  rebuild or replacement). Async only to fetch fresh room counts, mirroring `_orphanedFloors`. */
+  /** Built floors (and the siteplan) whose id survives this rebuild but whose drawing changes shape
+   *  (or is replaced in place), so the rooms/hotspots already drawn on them would be misaligned. A
+   *  floor is flagged when either its sorted set of sheet angles differs from the live manifest's
+   *  (`pages[].angle`, default 0) OR its drawing's bytes were replaced this session (REPL-1) — a
+   *  Replace keeps the id/pixel-size/aspect but a margin or crop shift, undetectable from manifest
+   *  metadata, still desyncs its rooms, so a replaced-with-rooms floor warns unconditionally. For
+   *  the siteplan, aspect ratio is additionally compared (via `_siteplanAspectChanged`) — the
+   *  overlay stretches hotspots `preserveAspectRatio:'none'`, so a new drawing of a different aspect
+   *  skews them even with no rotation — and a replaced siteplan drawing flags the same way. Floors
+   *  whose id vanishes are left to `_orphanedFloors`. Returns `[{ key, label, count, unit,
+   *  hotspots? }]`; empty when nothing at risk (a plain rebuild or an untouched, same-shape floor).
+   *  Async to fetch fresh room counts (mirroring `_orphanedFloors`) and to measure the new
+   *  siteplan's rendered aspect. */
   async _desyncedFloors(map) {
     const store = this.app.store;
     if (!store || !store.manifest) return [];
-    // Angles the build will render, per surviving floor key (`siteSlug/(abbr+token)`). Compared as
+    // Angles the build will render, per surviving floor key (`<dir>/(abbr+token)`, `dir` per
+    // `_dirOf`). Compared as
     // a sorted signature so a single-sheet floor matches exactly and a multi-sheet floor matches
-    // order-independently.
+    // order-independently. `replacedKeys` collects the surviving keys whose drawing was replaced
+    // this session (REPL-1), an unconditional desync trigger alongside the angle diff.
     const newAngles = new Map();
+    const replacedKeys = new Set();
     for (const folder in map.buildings) {
       const mb = map.buildings[folder];
       const am = mb.angles || {};
+      const dir = ImportFlow._dirOf(mb);
       for (const stem in mb.floors) {
         const v = mb.floors[stem];
         const toks = Array.isArray(v) ? v.map(e => e.token) : [v];
+        const wasReplaced = this._replaced.has(folder + '/' + stem);
         // A page's straightening angle is page-keyed and shared across every region floor split
-        // from it (FLOOR-4), so each expanded key takes the same `am[stem]`.
+        // from it (FLOOR-4), so each expanded key takes the same `am[stem]`; likewise a replaced
+        // page desyncs every region floor split from it.
         for (const t of toks) {
-          const key = mb.slug + '/' + (mb.abbr + t);
+          const key = dir + '/' + (mb.abbr + t);
           if (!newAngles.has(key)) newAngles.set(key, []);
           newAngles.get(key).push(am[stem] || 0);
+          if (wasReplaced) replacedKeys.add(key);
         }
       }
     }
@@ -1831,16 +2416,52 @@ class ImportFlow {
         const next = newAngles.get(key);
         if (!n || !next) continue;   // no rooms, or id vanishing (→ `_orphanedFloors`)
         const cur = (f.pages || []).map(pg => pg.angle || 0);
-        if (sig(cur) !== sig(next))
+        if (sig(cur) !== sig(next) || replacedKeys.has(key))
           out.push({ key, label: b.name + ' / ' + f.label, count: n, unit: 'room' });
       }
     }
-    // The siteplan keeps a fixed id but its hotspots are drawn against its orientation too.
+    // The siteplan keeps a fixed id but its hotspots are drawn against its orientation *and* its
+    // aspect ratio (the overlay stretches them `preserveAspectRatio:'none'`, SiteplanEditor). Count
+    // from the DB blob (`store.siteHotspots`) — the manifest's `siteplan.hotspots` is a permanent
+    // `[]` placeholder (preprocess.build_siteplan_from_pdf), so it never reflects real hotspots.
     const sp = store.manifest.siteplan;
-    const hs = (sp && sp.hotspots && sp.hotspots.length) || 0;
-    if (hs && map.siteplan && (sp.angle || 0) !== (map.siteplan.angle || 0))
-      out.push({ key: 'siteplan', label: 'Siteplan', count: hs, unit: 'hotspot', hotspots: true });
+    const hs = (store.siteHotspots || []).length;
+    if (hs && map.siteplan) {
+      const angleChanged = (sp.angle || 0) !== (map.siteplan.angle || 0);
+      const aspectChanged = await this._siteplanAspectChanged(map.siteplan, sp);
+      // The site drawing lives in a building folder; resolve its stem the way `_build` does to see
+      // whether its bytes were replaced this session (REPL-1) — a same-aspect margin shift wouldn't
+      // trip the angle/aspect checks yet still skews the hotspots.
+      const sb = this.buildings.find(x => x.folder === map.siteplan.folder);
+      const spd = sb && sb.pdfs.find(p => p.file === map.siteplan.pdf);
+      const replaced = !!(spd && this._replaced.has(map.siteplan.folder + '/' + spd.stem));
+      if (angleChanged || aspectChanged || replaced)
+        out.push({ key: 'siteplan', label: 'Siteplan', count: hs, unit: 'hotspot', hotspots: true });
+    }
     return out;
+  }
+
+  /** True when the newly-chosen siteplan drawing `next` (`{folder, pdf, angle?}` from the build
+   *  map) will render to a different aspect ratio than the live siteplan image `live`
+   *  (`manifest.siteplan`, with `w`/`h`). Because the overlay stretches hotspots
+   *  `preserveAspectRatio:'none'`, a same-aspect swap (any pixel size) keeps them aligned but a
+   *  different-aspect swap silently skews them — this drives the desync warning. The build's dims
+   *  aren't known until it runs, so measure them pre-build off the drawing's **full-scale preview**
+   *  render (`preprocess.preview` → `render_full`, same pipeline/angle as the build, so the same
+   *  aspect). Degrades to `false` — no false alarm — when the live dims are missing or the preview
+   *  can't be loaded. */
+  async _siteplanAspectChanged(next, live) {
+    if (!live || !live.w || !live.h) return false;
+    const rel = 'uploads/' + next.folder + '/' + next.pdf;
+    const dims = await new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(img.naturalWidth && img.naturalHeight
+        ? { w: img.naturalWidth, h: img.naturalHeight } : null);
+      img.onerror = () => resolve(null);
+      img.src = ImportPreview.previewUrl(rel, 1, next.angle || 0);
+    });
+    if (!dims) return false;
+    return Math.abs((dims.w / dims.h) / (live.w / live.h) - 1) > 0.01;   // >1% drift = visible skew
   }
 
   // ---- region-split room reprojection (FLOOR-5) ----
@@ -1898,6 +2519,7 @@ class ImportFlow {
     for (const b of this.buildings) {
       const mb = map.buildings[b.folder];
       if (!mb) continue;
+      const dir = ImportFlow._dirOf(mb);   // 2- or 3-segment key prefix (Location anchor nests, MODEL-4)
       // Whole-page token per drawing (resolve `b.assign` ignoring regions, chaining `last` for the
       // `same` case) — the floor id the drawing produced before it was split.
       const whole = {}; let last = null;
@@ -1910,8 +2532,8 @@ class ImportFlow {
         if (!Array.isArray(entry)) continue;   // not region-split
         const wtok = whole[p.stem];
         if (!wtok) continue;                   // no derivable whole-page id
-        const oldFid = mb.abbr + wtok, oldKey = mb.slug + '/' + oldFid;
-        const lf = liveFloor(mb.slug, oldFid);
+        const oldFid = mb.abbr + wtok, oldKey = dir + '/' + oldFid;
+        const lf = liveFloor(dir, oldFid);
         const newDeg = (b.angle[p.stem] && b.angle[p.stem].deg) || 0;
         const curDeg = (lf && lf.pages && lf.pages[0] && lf.pages[0].angle) || 0;
         if (lf && newDeg !== curDeg) continue; // split + rotate → leave to orphan/desync
@@ -1921,11 +2543,11 @@ class ImportFlow {
         if (!rooms.length && !arrows.length && !notes.length) continue;
         const regions = entry
           .filter(e => Array.isArray(e.region) && e.region.length === 4 && e.region[2] > 0 && e.region[3] > 0)
-          .map(e => ({ box: e.region, fid: mb.abbr + e.token, key: mb.slug + '/' + (mb.abbr + e.token) }));
+          .map(e => ({ box: e.region, fid: mb.abbr + e.token, key: dir + '/' + (mb.abbr + e.token) }));
         if (!regions.length) continue;
         const dests = new Map();
         const dest = (r) => {
-          if (!dests.has(r.key)) dests.set(r.key, { dir: mb.slug, fid: r.fid, rooms: [], arrows: [], notes: [] });
+          if (!dests.has(r.key)) dests.set(r.key, { dir, fid: r.fid, rooms: [], arrows: [], notes: [] });
           return dests.get(r.key);
         };
         let moved = 0, dropped = 0;
@@ -1981,19 +2603,23 @@ class ImportFlow {
   async _build() {
     const map = { siteplan: this.site.file
       ? { folder: this.site.folder, pdf: this.site.file, slug: '00-site' } : null, buildings: {} };
-    // Two floor-contributing buildings bound to the SAME site slug would produce colliding floor
-    // keys (`siteSlug/(abbr+token)`, see `preprocess.build`) and silently clobber each other's
-    // floors (and rooms). Reject at the boundary before any render — the per-building empty-slug
-    // guard below still catches a blank slug.
-    const bySlug = {};
+    // Two floor-contributing buildings that resolve to the SAME **anchor** would produce colliding
+    // floor keys (`<dir>/(abbr+token)`, see `preprocess.build`) and silently clobber each other's
+    // floors (and rooms). The anchor is the site slug for a Site anchor, or `siteSlug/buildingSlug`
+    // for a Location anchor (MODEL-4) — so two buildings may share a site slug iff they anchor to
+    // *distinct* building Locations (the Site = campus case). Reject at the boundary before any
+    // render — the per-building empty-slug guard below still catches a blank slug.
+    const byAnchor = {};
     for (const b of this._floorBuildings()) {
       const s = b.slug.trim();
-      if (s) (bySlug[s] = bySlug[s] || []).push(b.name || b.folder);
+      if (!s) continue;
+      const anchor = b.nbBuilding ? s + '/' + b.nbBuilding.slug : s;
+      (byAnchor[anchor] = byAnchor[anchor] || []).push(b.name || b.folder);
     }
-    const collision = Object.entries(bySlug).find(([, names]) => names.length > 1);
+    const collision = Object.entries(byAnchor).find(([, names]) => names.length > 1);
     if (collision) {
-      Toast.show('Two buildings share the site slug “' + collision[0] + '” ('
-        + collision[1].join(', ') + '). Bind each building to its own NetBox site.', true);
+      Toast.show('Two buildings resolve to the same NetBox anchor “' + collision[0] + '” ('
+        + collision[1].join(', ') + '). Bind each to its own site or building.', true);
       return;
     }
     for (const b of this.buildings) {
@@ -2042,10 +2668,24 @@ class ImportFlow {
           if (a.token) { const l = labelFor(a.token); if (l) labels[p.stem] = l; }
         }
       }
+      // Overlay control points (FMT-6), keyed by stem like `angles`: only a mapped OVERLAY
+      // drawing with enough clean pairs to solve (≥2) is emitted — the backend georeferences
+      // that layer — so an unaligned import writes the same map as before.
+      const overlayAlign = {};
+      for (const p of b.pdfs) {
+        const pairs = ((b.align && b.align[p.stem]) || []).filter(ImportFlow._validAlignPair);
+        if (pairs.length >= 2 && floors[p.stem] && ImportUploader.isOverlay(p.file))
+          overlayAlign[p.stem] = pairs;
+      }
       map.buildings[b.folder] = { slug: b.slug.trim(), name: b.name.trim() || b.folder,
         abbr: usesTokens ? '' : b.abbr.trim(), floors,
+        // A Location anchor (Site = campus, MODEL-4) emits its building Location slug, which
+        // `preprocess.build_building_from_pdfs` nests into `dir` (→ 3-segment floor keys + nested
+        // image paths). Omitted for a Site anchor, so a Site-anchored import-map stays byte-identical.
+        ...(b.nbBuilding ? { buildingSlug: b.nbBuilding.slug } : {}),
         ...(Object.keys(angles).length ? { angles } : {}),
-        ...(Object.keys(labels).length ? { labels } : {}) };
+        ...(Object.keys(labels).length ? { labels } : {}),
+        ...(Object.keys(overlayAlign).length ? { overlayAlign } : {}) };
     }
     if (!Object.keys(map.buildings).length) { Toast.show('Assign at least one floor', true); return; }
     // Carry the site drawing's own straightening angle into the siteplan block.
@@ -2088,16 +2728,20 @@ class ImportFlow {
         return this._stepMap();
     }
 
-    // Reorienting a floor keeps its id (so `_orphanedFloors` won't catch it) but changes how the
-    // drawing sits, desyncing rooms/hotspots already placed against the old orientation. Warn, but
-    // keep them — rotation is reversible, so we never silently delete the user's work.
+    // Rebuilding a floor (or the siteplan) can keep its id (so `_orphanedFloors` won't catch it)
+    // but change the underlying drawing — a different orientation, a different (siteplan) aspect
+    // ratio, or a drawing replaced in place (REPL-1, where even a same-size margin/crop shift is
+    // undetectable from manifest metadata) — desyncing rooms/hotspots already placed against the
+    // old drawing. Warn, but keep them: the change is reversible, so we never silently delete the
+    // user's work.
     const desynced = await this._desyncedFloors(map);
     if (desynced.length) {
       const lines = desynced.map(o => '  • ' + o.label + '  ('
         + o.count + ' ' + (o.count === 1 ? o.unit : o.unit + 's') + ')');
-      if (!confirm('Reorienting these changes how their drawing sits, so the '
-          + (desynced.some(o => o.hotspots) ? 'features' : 'rooms') + ' already drawn on them will '
-          + 'no longer line up and need repositioning:\n\n' + lines.join('\n')
+      if (!confirm('Rebuilding these changes their underlying drawing (a different orientation or '
+          + 'shape, or a replaced plan), so the '
+          + (desynced.some(o => o.hotspots) ? 'features' : 'rooms') + ' already drawn on them may '
+          + 'no longer line up and should be re-checked:\n\n' + lines.join('\n')
           + '\n\nContinue and keep them?'))
         return this._stepMap();
     }
@@ -2107,8 +2751,13 @@ class ImportFlow {
       'Rendering ' + Object.keys(map.buildings).length + ' buildings. This can take a minute.'));
     try {
       const r = await Api.post('/api/import/build', map);
-      if (!r.ok) throw new Error(r.error || 'build failed');
+      // Carry the server's actionable hint (e.g. an HQ render that outran render_mem_mb, HEALTH-3)
+      // onto the Error so the catch can add it to the otherwise-reassuring failure toast.
+      if (!r.ok) { const err = new Error(r.error || 'build failed'); err.hint = r.hint; throw err; }
       await this.app.store.load();
+      // The manifest is now rebuilt from the current drawings, so any replace this session is
+      // reconciled — clear the tracker so a later no-op rebuild doesn't re-warn (REPL-1).
+      this._replaced.clear();
       // Persist the room bookkeeping the rebuild implied in one save through the authoritative,
       // permission-scoped `sync_rooms` (no new endpoint, no loosened scoping): discard the floors
       // the user agreed to orphan, and remap the rooms of each whole→region split onto their new
@@ -2120,7 +2769,43 @@ class ImportFlow {
         for (const r of reprojections) this._applyReprojection(r);
         try { await this.app.store.saveAnnotations(); } catch (_) { /* best effort cleanup */ }
       }
-      Toast.show('Facility imported');
+      // Warn when any imported data overlay is still placed by the approximate fit-to-bounds
+      // default rather than a control-point georeference (FMT-6): a transient heads-up pointing
+      // at the align editor, not a blocking confirm (the overlay is wanted either way). Drives
+      // off the manifest `georeferenced` flag (`!== true`, so a manifest predating the field
+      // reads as approximate); an all-aligned rebuild suppresses it with no extra logic.
+      const approxOverlays = (this.app.store.manifest.buildings || []).some(
+        b => (b.floors || []).some(f => (f.overlays || []).some(ov => ov.georeferenced !== true)));
+      // Placement panels only show gear NetBox has assigned to a room's own Location, but most
+      // installs model racks/devices a level up (Site/building/floor) — so a fresh import's
+      // panels read as empty until the user learns this, one room at a time, from the per-room
+      // empty-state hint (`FloorEditor.openRackPanel`). Say it once, here, up front. Phrasing
+      // mirrors that hint's "Bind this room to a NetBox Location (in Edit mode)" so the two read
+      // as one consistent story; this only points forward to the edit-mode workflow — binding
+      // isn't possible from inside the wizard itself.
+      let msg = 'Facility imported. Bind each room to a NetBox Location (in Edit mode), then '
+        + 'assign racks/devices to that Location in NetBox before placing them.';
+      if (approxOverlays) {
+        msg += ' Data overlays are placed by an approximate fit — to georeference one, open its '
+          + 'drawing card in Edit buildings & floors and use “Align on plan…”.';
+      }
+      // Fold in the build's render diagnostics (HEALTH-3). `unrendered` is a real problem — a
+      // dropped drawing, possibly memory on a small host — so it flips the toast to its warning
+      // style; `hq_clamped` is informational (a large plan capped just below full high quality by
+      // the fixed size limit — raising render_mem_mb won't lift it, and the plan still rendered).
+      // Single toast: `Toast.show` reuses one element, so a second call would clobber this one.
+      const n = r.unrendered || 0;
+      if (n) {
+        msg += ' ' + n + (n === 1 ? ' drawing' : ' drawings') + " couldn't be rendered and "
+          + (n === 1 ? 'was' : 'were') + ' skipped — check the source file'
+          + (n === 1 ? '' : 's') + ', and on a low-memory host raising render_mem_mb may help.';
+      }
+      const c = r.hq_clamped || 0;
+      if (c) {
+        msg += ' ' + c + (c === 1 ? ' large plan' : ' large plans') + ' rendered just below full '
+          + 'high quality (reached the built-in size cap).';
+      }
+      Toast.show(msg, n > 0);
       this.app.go('#/');
     } catch (e) {
       // A failed build never deletes anything: `build()` overwrites the manifest only on success
@@ -2128,8 +2813,12 @@ class ImportFlow {
       // last-good map. Reassure the user rather than toasting a raw render traceback that reads as
       // "everything was wiped", and keep them on the review step to fix a drawing and retry.
       console.error('Facility rebuild failed', e);
-      Toast.show('Rebuild failed. Your existing map is unchanged and still active. '
-        + 'Nothing was lost.', true);
+      // Keep the reassuring "nothing was lost" lead, then append the server's actionable hint when
+      // it named one (an HQ render that outgrew its memory/time budget, HEALTH-3) so the fix is in
+      // front of the user instead of buried in the console.
+      let msg = 'Rebuild failed. Your existing map is unchanged and still active. Nothing was lost.';
+      if (e && e.hint) msg += ' ' + e.hint;
+      Toast.show(msg, true);
       this._stepMap();
     }
   }

@@ -151,28 +151,6 @@ class FormatCapability(Capability):
         return any(f.name in names and f.available() for f in FORMATS)
 
 
-class LocationCreateCapability(Capability):
-    """Inline creation of a room's NetBox Location from the floor bind panel (LOC-1) — the first
-    *feature* add-on (the `FormatCapability`s above only *report* optional filetypes; this one lights
-    up real behaviour). Pure first-party code with no external dependency, so it is switched on by
-    the **feature-flag gate** (`setting_flag`), defaulted **off**: NetBox stays the source of truth
-    for Locations, and installs that model devices against Racks/Sites rather than a Location-per-room
-    opt in to letting a permitted user create the child Location without leaving the map.
-
-    This flag is only the *install-wide* gate. The create endpoint is stricter still — it also
-    enforces the `dcim.add_location` object permission **per user**, server-side (see
-    `frontend_api.NbLocationCreateView`), because this is the plugin's one write into `dcim` core.
-    The two are orthogonal: this flag lights the feature up for the install; the object permission
-    decides which users may actually create."""
-
-    key = "location-create"
-    verbose_name = "Inline NetBox Location creation from the bind panel"
-    setting_flag = "allow_location_create"
-
-    def default_settings(self):
-        return {"allow_location_create": False}
-
-
 class SvgCapability(FormatCapability):
     key = "svg"
     verbose_name = "SVG vector plans"
@@ -206,10 +184,11 @@ class VisioCapability(FormatCapability):
 # The registry: one entry per KNOWN capability (installed/enabled or not). Adding an add-on is a new
 # Capability subclass plus one entry here — the aggregators below wire its contributions into every
 # surface, so nothing else in the package changes. The shipped set is the optional-format extras
-# (the filetype axis, delegating to drawing_formats) plus `location-create`, the first flag-gated
-# *feature* add-on — the pattern any future first-party feature (e.g. notetaking) plugs into.
+# (the filetype axis, delegating to drawing_formats). The feature-flag gate (`setting_flag`) remains
+# available for a future pure first-party *feature* add-on (e.g. notetaking); inline Location creation
+# was the first such feature but moved to the runtime `write_mode` setting in LOC-2, so no shipped
+# capability currently uses the flag gate.
 CAPABILITIES = (
-    LocationCreateCapability(),
     SvgCapability(), CadCapability(), GisCapability(), VisioCapability(),
 )
 
@@ -230,8 +209,9 @@ def enabled_keys():
 def is_enabled(key):
     """True when the capability with `key` is currently enabled (its gates all pass). Lets a backend
     consumer gate a feature endpoint on an install-wide capability flag — the server-side mirror of
-    the frontend's `App.hasCapability(key)` — without re-deriving the probe (e.g. the
-    `location-create` create endpoint refuses the write when the operator hasn't switched it on)."""
+    the frontend's `App.hasCapability(key)` — without re-deriving the probe (the seam a future
+    flag-gated feature endpoint would check, the way `inline_room_creation` gates inline Location
+    creation behind the `write_mode` master gate)."""
     return key in enabled_keys()
 
 

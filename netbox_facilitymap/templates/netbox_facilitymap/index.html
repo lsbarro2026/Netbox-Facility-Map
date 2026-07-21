@@ -4,6 +4,10 @@
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Facility Map</title>
+<link rel="icon" type="image/png" sizes="16x16" href="{% static 'netbox_facilitymap/icon-16.png' %}"/>
+<link rel="icon" type="image/png" sizes="32x32" href="{% static 'netbox_facilitymap/icon-32.png' %}"/>
+<link rel="icon" type="image/png" sizes="500x500" href="{% static 'netbox_facilitymap/icon.png' %}"/>
+<link rel="apple-touch-icon" href="{% static 'netbox_facilitymap/icon-180.png' %}"/>
 <link rel="preload" href="{% static 'netbox_facilitymap/fonts/public-sans.woff2' %}" as="font" type="font/woff2" crossorigin/>
 <link rel="preload" href="{% static 'netbox_facilitymap/fonts/ibm-plex-mono-400.woff2' %}" as="font" type="font/woff2" crossorigin/>
 <link rel="stylesheet" href="{% static 'netbox_facilitymap/style.css' %}"/>
@@ -26,12 +30,18 @@
      embed  -> true in the dashboard-widget iframe (?embed=1): chrome-free; a building click
                opens the full map in the top window (no in-card breadcrumbs to return through).
      interactive -> embed pan/zoom opt-in (?interactive=1); false ⇒ App skips interaction wiring.
+     finder -> search-only embed (?finder=1, FacilitySearchWidget): the SPA shows only the
+                    wayfinding finder — no map, no legend; a result click escapes to the top window.
+     resultTarget -> search-widget result-target (?target=netbox, NAV-16): 'netbox' opens a hit's
+                    NetBox detail page; anything else ('map') deep-links the full map at the target.
      canImport -> holds import_facilitymapblob: may run the import wizard (else it's not offered).
      canReset -> superuser: may reset/wipe the import (else the "Start over" control is hidden).
      drawingExts -> accepted import file extensions, from the server's drawing_formats registry
                     (so the import wizard doesn't hand-maintain its own copy).
      companionExts -> a drawing's sibling files (a shapefile's .shx/.dbf/.prj/.cpg) — uploaded
                     with the drawing but not themselves drawings.
+     overlayExts -> the OVERLAY-role subset of drawingExts (GIS data layers); the wizard keys
+                    overlay-only affordances (the FMT-6 align editor) off it.
      capabilities -> the enabled optional capabilities (keys), from the server's capability
                     registry (the add-on framework); App.hasCapability(key) gates a capability's
                     tool on its presence, the same detect-and-enable model as drawingExts.
@@ -40,7 +50,17 @@
                     PLUGINS_CONFIG setting; the wizard lets the user override it per import.
      defaultFacility -> the operator-pinned facility slug the SPA boots into when the URL hash
                     names none ('' = the default facility); App.init resolves it, the in-app
-                    Settings page pins it (facilities.default_facility, SET-2). -->
+                    Settings page pins it (facilities.default_facility, SET-2).
+     user   -> the signed-in viewer as {id,username,display,initials} (frontend_api.serialize_user,
+                    the same shape a to-do's assignees arrive in, so ids compare directly). The
+                    to-do surfaces sort a user's own to-dos first (TASK-3), which needs an identity
+                    no round-trip could supply before the first sort.
+     apTool / apDeviceRole / apNameTemplate / apCountScope -> the access-point tool's
+                    configuration (DEV-3), from the settings blob via previews.ap_settings; the
+                    Settings page renders and writes it, and the floor editor offers the tool only
+                    when it is fully configured. apDeviceRole is {id,name} (or null when unset,
+                    deleted, or hidden from this user) so the role combobox shows a label with no
+                    round-trip. -->
 <script>
   window.MAP = {
     api:    "{% url 'plugins:netbox_facilitymap:map' %}api/",
@@ -50,14 +70,38 @@
     csrf:   "{{ csrf_token }}",
     embed:  {% if embed %}true{% else %}false{% endif %},
     interactive: {% if interactive %}true{% else %}false{% endif %},
+    finder: {% if finder %}true{% else %}false{% endif %},   {# search-only embed (?finder=1, FacilitySearchWidget): just the finder, no map/legend #}
+    resultTarget: "{{ result_target }}",   {# search-widget result-target (NAV-16): 'netbox' opens a hit's NetBox page, else 'map' deep-links #}
     canImport: {% if can_import %}true{% else %}false{% endif %},   {# holds import_facilitymapblob — may run the import wizard #}
     canReset: {% if can_reset %}true{% else %}false{% endif %},     {# superuser — may reset (wipe) the import #}
-    canCreateLocation: {% if can_create_location %}true{% else %}false{% endif %},   {# holds dcim.add_location — may create a Location inline (LOC-1); the install-wide gate is the 'location-create' capability #}
+    canCreateLocation: {% if can_create_location %}true{% else %}false{% endif %},   {# holds dcim.add_location — may create a Location inline (LOC-1); the install-wide gate is write mode #}
+    writeMode: {% if write_mode %}true{% else %}false{% endif %},   {# install-wide write mode on (LOC-2) — the master gate on every NetBox-core write, flipped on the Settings page #}
+    inlineRoomCreation: {% if inline_room_creation %}true{% else %}false{% endif %},   {# the inline-room-creation add-on on (SET-5) — needs write mode + dcim.add_location too #}
     drawingExts: {{ drawing_exts|safe }},   {# accepted import extensions, from the server's drawing_formats registry #}
     companionExts: {{ companion_exts|safe }},   {# sibling files (shapefile set) accepted with a drawing #}
+    overlayExts: {{ overlay_exts|safe }},   {# OVERLAY-role subset of drawingExts — gates the align-overlay affordance #}
     capabilities: {{ capabilities|safe }},   {# enabled optional capabilities (keys), from the server's capability registry #}
+    canCreateDevice: {% if can_create_device %}true{% else %}false{% endif %},   {# holds dcim.add_device — may create an access point inline (DEV-3); the install-wide gates are the AP tool + write mode #}
+    apTool: {% if ap_tool %}true{% else %}false{% endif %},   {# install-wide access-point tool on (DEV-3) — independent of write mode; both must be on to place an AP #}
+    renderHq: {% if render_hq %}true{% else %}false{% endif %},   {# install-wide high-quality floor-plan rendering on (READ-1) — read by the import build, not the browser; this is the Settings toggle's initial state #}
+    todos: {% if todos %}true{% else %}false{% endif %},   {# install-wide to-do feature on (ADDON-4) — a general (non-write) add-on; gates both to-do pages, the floor panel + compose icon. Re-checked server-side; this is the UX mirror #}
+    {% comment %}
+    Role name + template are operator-typed free text, so they ride |escapejs (a JS *string*
+    context), not json.dumps|safe like the fixed vocabularies below — JSON leaves `/` alone, so
+    a `</script>` in either would otherwise close this block.
+    {% endcomment %}
+    apDeviceRole: {% if ap_device_role %}{ id: {{ ap_device_role.id }}, name: "{{ ap_device_role.name|escapejs }}" }{% else %}null{% endif %},   {# the role new APs get, or null when unconfigured #}
+    apNameTemplate: "{{ ap_name_template|escapejs }}",   {# name template: {room}/{role_short} placeholders #}
+    apCountScope: "{{ ap_count_scope }}",   {# how far the suggested name's -NN counter scopes before it resets #}
     floorLabelField: "{{ floor_label_field }}",   {# default Location field for a floor's label #}
-    defaultFacility: "{{ default_facility }}"   {# pinned boot facility ('' = default facility), SET-2 #}
+    defaultFacility: "{{ default_facility }}",   {# pinned boot facility ('' = default facility), SET-2 #}
+    {% comment %}
+    The signed-in viewer (TASK-3) — the to-do surfaces sort their own to-dos first. Rides
+    |escapejs for the same reason apDeviceRole above does: a display name is user-entered free
+    text, and a JS *string* context is what escapes `</script>` safely.
+    {% endcomment %}
+    user: { id: {{ map_user.id }}, username: "{{ map_user.username|escapejs }}",
+            display: "{{ map_user.display|escapejs }}", initials: "{{ map_user.initials|escapejs }}" }
   };
 </script>
 
@@ -74,16 +118,32 @@
        switches the active facility on change. Empty on single-facility installs. -->
   <div id="facility-picker"></div>
   <button id="settings-gear" title="Settings"></button>
+  <!-- Siteplan-only toggle for the buildings index (NAV-8): a CAD-style toolbar button that
+       shows/hides the .legend panel. SiteplanEditor reveals + wires it on show and reflects the
+       panel's visibility as its .active state; every other route hides it again (App.router). -->
+  <button id="panel-toggle" title="Show or hide the buildings panel"
+          aria-pressed="true" hidden></button>
 </header>
 
-{% if has_orphaned_data and can_import and not embed %}
-{# Read-only pointer (HEALTH-1): the install holds map data parked under a facility no Site resolves
-   to — usually a facility-grouping change that re-scoped the Sites. Without this the map just reads
-   as empty. The reassignment itself is the IMPORT_PERM-gated Settings action this links to. #}
+{% if has_orphaned_data and not embed %}
+{% comment %}
+Read-only pointer (HEALTH-1): the install holds map data parked under a facility no Site resolves
+to — usually a facility-grouping change that re-scoped the Sites. Without this the map just reads
+as empty (annotations parked under the old key; rooms hidden), with no explanation. Shown to
+EVERY map viewer so the blank map is legible, not only to importers (HEALTH-6). The reassignment
+is the IMPORT_PERM-gated Settings action, so only importers get the actionable link; other
+viewers are told the data is intact and an administrator must reassign it. Suppressed in embed.
+{% endcomment %}
 <div id="orphan-banner" style="padding:.6rem 1rem;background:#fff3cd;color:#664d03;border-bottom:1px solid #ffe69c;font-size:.9rem">
-  Some map data isn&rsquo;t assigned to a facility and won&rsquo;t show until you reassign it. This
-  usually follows a facility-grouping change.
+  {% if can_import %}
+  Some map data isn&rsquo;t assigned to a facility, so the map may look empty until you reassign it.
+  This usually follows a facility-grouping change; the data is intact.
   <a href="{% url 'plugins:netbox_facilitymap:settings' %}">Reassign it in Settings</a>.
+  {% else %}
+  Some map data isn&rsquo;t assigned to a facility, so the map may look empty. This usually follows
+  a facility-grouping change; the data is intact, but an administrator needs to reassign it before
+  it reappears.
+  {% endif %}
 </div>
 {% endif %}
 
@@ -102,12 +162,26 @@
 <div id="toast"></div>
 
 <!-- Loaded in dependency order; all classes are globals (no build step). The siteplan
-     first-paint classes ship eagerly (settings-page.js rides along — it's tiny and the
-     #/settings route is directly deep-linkable); the floor editor (device-shapes.js,
-     floor-editor.js) and the import flows (import-preview.js, import-uploader.js, import-flow.js,
+     first-paint classes ship eagerly (settings-page.js + floor-view-menu.js ride along — both
+     are tiny and their routes (#/settings, #/b/<dir>) are directly deep-linkable); the floor
+     editor (device-shapes.js, floor-export.js,
+     floor-todo.js, floor-editor.js) and the import flows (import-preview.js, import-uploader.js, import-flow.js,
      fresh-import-flow.js, edit-import-flow.js) are fetched on first navigation by
-     App.ensureScripts. -->
+     App.ensureScripts.
+     todo-model.js + todo-composer.js ship eagerly for the same reason lib.js does: they are shared
+     to-do primitives with two independent consumers — the lazily-bundled floor panel and the
+     facility-wide to-do page — and a lazy bundle may only depend on an eagerly-loaded class (§10).
+     todo-composer.js follows todo-model.js (it reads TodoModel's vocabularies) and lib.js (Combo).
+     todo-page.js rides along on the settings-page.js rationale (a directly deep-linkable route), and
+     more so: #/todo is a top-level nav destination, so a lazy fetch would sit on its main entry
+     path. It follows the two primitives it hosts.
+     ap-settings-page.js follows settings-page.js on both counts: it SUBCLASSES SettingsPage (so
+     dependency order is not optional here), and #/settings/access-points is deep-linkable like its
+     parent route, so showApSettings() stays synchronous too. -->
 <script src="{% static 'netbox_facilitymap/lib.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/todo-model.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/todo-composer.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/todo-page.js' %}"></script>
 <script src="{% static 'netbox_facilitymap/netbox.js' %}"></script>
 <script src="{% static 'netbox_facilitymap/store.js' %}"></script>
 <script src="{% static 'netbox_facilitymap/grid.js' %}"></script>
@@ -116,6 +190,8 @@
 <script src="{% static 'netbox_facilitymap/editor.js' %}"></script>
 <script src="{% static 'netbox_facilitymap/siteplan-editor.js' %}"></script>
 <script src="{% static 'netbox_facilitymap/settings-page.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/ap-settings-page.js' %}"></script>
+<script src="{% static 'netbox_facilitymap/floor-view-menu.js' %}"></script>
 <script src="{% static 'netbox_facilitymap/app.js' %}"></script>
 </body>
 </html>

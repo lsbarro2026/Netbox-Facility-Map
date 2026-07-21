@@ -43,6 +43,27 @@ def test_upserts_and_binds_location(editor_user):
     assert room.location_id == room_loc.pk
 
 
+def test_sync_rooms_round_trips_alias(editor_user):
+    # The NAV-18 search-terms field persists through a save like `label`; a room posted with no
+    # `alias` key stores the empty default (never NULL), so the finder never sees a stale value.
+    sync_rooms({FLOOR: [
+        {'id': 'r1', 'label': 'R1', 'alias': '2107, Old Server Room', 'polygon': [], 'location': None},
+        {'id': 'r2', 'label': 'R2', 'polygon': [], 'location': None},
+    ]}, user=editor_user)
+    assert Room.objects.get(room_id='r1').alias == '2107, Old Server Room'
+    assert Room.objects.get(room_id='r2').alias == ''
+
+
+def test_serialize_room_includes_alias(rf, editor_user):
+    # `_serialize_room` shapes a Room back into the frontend record; `alias` must ride along so the
+    # composed annotations GET round-trips it into `Store.searchTargets` for the placed-search tier.
+    from netbox_facilitymap.frontend_api import _serialize_room
+    room = Room.objects.create(floor_key=FLOOR, room_id='r1', label='R1', alias='2107')
+    req = rf.get('/')
+    req.user = editor_user
+    assert _serialize_room(room, req)['alias'] == '2107'
+
+
 def test_deletes_absent_rooms_when_user_may(editor_user):
     Room.objects.create(floor_key=FLOOR, room_id='r1', label='R1')
     Room.objects.create(floor_key=FLOOR, room_id='r2', label='R2')
@@ -132,12 +153,133 @@ def test_sync_floor_location_sticky_across_rename(editor_user):
     assert room.floor_location_id == floor.pk  # …but the good FK survived the unresolvable key
 
 
-# --- Optimistic-concurrency guard (CONC-1): the version token echoed on GET must be sent back
-# on POST, and a stale token is rejected with 409 so a concurrent editor's rooms aren't
-# clobbered. Exercised through the real permission-gated views (Django test client). ----------
+# --- Location-anchored floor keys (MODEL-3): a 3-segment key "<site>/<building>/<floor>" resolves
+# the floor Location UNDER the building Location, so two buildings under one campus can share a
+# floor slug without cross-binding. ------------------------------------------------------------
+
+def _campus_two_buildings_same_floor_slug():
+    """A campus Site with two building Locations, each holding a floor Location of the SAME slug
+    (`level-1`) — the ambiguity 3-segment keys must resolve by parent."""
+    from dcim.models import Location, Site
+    campus = Site.objects.create(name='Campus', slug='campus')
+    alpha = Location.objects.create(name='Alpha', slug='alpha-bldg', site=campus)
+    beta = Location.objects.create(name='Beta', slug='beta-bldg', site=campus)
+    a_l1 = Location.objects.create(name='Alpha L1', slug='level-1', site=campus, parent=alpha)
+    b_l1 = Location.objects.create(name='Beta L1', slug='level-1', site=campus, parent=beta)
+    return campus, alpha, beta, a_l1, b_l1
+
+
+def test_sync_resolves_three_segment_key_under_its_building(editor_user):
+    # Each building's 3-segment key must bind its room to the floor under THAT building — not the
+    # same-slug floor under the sibling building.
+    campus, alpha, beta, a_l1, b_l1 = _campus_two_buildings_same_floor_slug()
+
+    sync_rooms({
+        'campus/alpha-bldg/level-1': [{'id': 'ra', 'label': 'A', 'polygon': [], 'location': None}],
+        'campus/beta-bldg/level-1': [{'id': 'rb', 'label': 'B', 'polygon': [], 'location': None}],
+    }, user=editor_user)
+
+    assert Room.objects.get(room_id='ra').floor_location_id == a_l1.pk
+    assert Room.objects.get(room_id='rb').floor_location_id == b_l1.pk
+
+
+def test_sync_three_segment_key_unresolvable_when_building_absent(editor_user):
+    # A 3-segment key whose building slug matches no Location leaves the FK null (the floor exists
+    # under a DIFFERENT parent) — the resolver is scoped by parent, not just (site, floor).
+    campus, alpha, beta, a_l1, b_l1 = _campus_two_buildings_same_floor_slug()
+
+    sync_rooms({'campus/ghost-bldg/level-1': [
+        {'id': 'r1', 'label': '', 'polygon': [], 'location': None}]}, user=editor_user)
+
+    assert Room.objects.get(room_id='r1').floor_location_id is None
+
+
+NB_ROOMS = 'plugins:netbox_facilitymap:api-nb-rooms'
+
+
+def test_nb_rooms_building_param_disambiguates_same_slug_floors(client, superuser):
+    # `?building=` scopes the floor lookup under the building Location, so the same `?floor=level-1`
+    # resolves to a different floor (and its own rooms) per building. Uses `superuser` because the
+    # view reads Locations through `.restrict(user, 'view')` (dcim view is object-perm gated).
+    from dcim.models import Location
+    campus, alpha, beta, a_l1, b_l1 = _campus_two_buildings_same_floor_slug()
+    Location.objects.create(name='Alpha Room', slug='a-room', site=campus, parent=a_l1)
+    Location.objects.create(name='Beta Room', slug='b-room', site=campus, parent=b_l1)
+    client.force_login(superuser)
+
+    ra = client.get(reverse(NB_ROOMS),
+                    {'site': 'campus', 'building': 'alpha-bldg', 'floor': 'level-1'}).json()
+    rb = client.get(reverse(NB_ROOMS),
+                    {'site': 'campus', 'building': 'beta-bldg', 'floor': 'level-1'}).json()
+
+    assert ra['floor']['id'] == a_l1.pk and [r['slug'] for r in ra['rooms']] == ['a-room']
+    assert rb['floor']['id'] == b_l1.pk and [r['slug'] for r in rb['rooms']] == ['b-room']
+
+
+# --- NbBuildingLocationsView (MODEL-4): the Site = campus sibling of NbSitesView. Returns
+# building-anchor Locations — those with child Locations (their floors) — facility-scoped like the
+# Site search (FACIL-1), so the wizard's bind step can offer a building Location as an anchor. --
+
+BUILDING_LOCATIONS = 'plugins:netbox_facilitymap:api-nb-building-locations'
+
+
+def test_nb_building_locations_returns_only_building_like_locations(client, superuser):
+    # A building anchor is a Location that has child Locations (its floors) — the structural signal,
+    # since NetBox 4.x has no LocationType to key off. The two building wrappers are returned; the
+    # floor Locations beneath them (no children of their own) are not.
+    campus, alpha, beta, a_l1, b_l1 = _campus_two_buildings_same_floor_slug()
+    client.force_login(superuser)
+
+    body = client.get(reverse(BUILDING_LOCATIONS)).json()
+    assert {l['slug'] for l in body['locations']} == {'alpha-bldg', 'beta-bldg'}
+    # Each hit carries its campus Site, so the frontend records siteSlug alongside buildingSlug.
+    alpha_row = next(l for l in body['locations'] if l['slug'] == 'alpha-bldg')
+    assert alpha_row['site_slug'] == 'campus' and alpha_row['site_name'] == 'Campus'
+
+
+def test_nb_building_locations_q_filters_by_name_or_slug(client, superuser):
+    campus, alpha, beta, a_l1, b_l1 = _campus_two_buildings_same_floor_slug()
+    client.force_login(superuser)
+
+    by_name = client.get(reverse(BUILDING_LOCATIONS), {'q': 'Alpha'}).json()
+    assert {l['slug'] for l in by_name['locations']} == {'alpha-bldg'}
+    by_slug = client.get(reverse(BUILDING_LOCATIONS), {'q': 'beta-bldg'}).json()
+    assert {l['slug'] for l in by_slug['locations']} == {'beta-bldg'}
+
+
+def test_nb_building_locations_scoped_to_facility(client, superuser):
+    # FACIL-1: a building Location under facility A's campus is never offered when binding under
+    # facility B — its site slug would become the manifest siteSlug, so an out-of-facility bind would
+    # strand the map, exactly as NbSitesView guards for Sites.
+    from dcim.models import Location
+    sa = _grouped_site('ga', 'campus-a')
+    sb = _grouped_site('gb', 'campus-b')
+    a_bldg = Location.objects.create(name='A Building', slug='a-bldg', site=sa)
+    Location.objects.create(name='A L1', slug='a-l1', site=sa, parent=a_bldg)
+    b_bldg = Location.objects.create(name='B Building', slug='b-bldg', site=sb)
+    Location.objects.create(name='B L1', slug='b-l1', site=sb, parent=b_bldg)
+    client.force_login(superuser)
+
+    body = client.get(reverse(BUILDING_LOCATIONS) + '?facility=ga').json()
+    assert {l['slug'] for l in body['locations']} == {'a-bldg'}
+
+
+def test_nb_building_locations_rejects_bad_facility(client, superuser):
+    client.force_login(superuser)
+    assert client.get(reverse(BUILDING_LOCATIONS) + '?facility=../evil').status_code == 400
+
+
+# --- Optimistic-concurrency guard (CONC-1): the version token echoed on GET must be sent back on
+# POST, and a stale token is rejected with 409 so a concurrent editor's work isn't clobbered. The
+# per-floor kinds shard by floor, so their token is a `{floor_key: token}` map and a save carries
+# only the floors it touched — different-floor saves are genuinely non-conflicting; only a real
+# same-floor overlap 409s. Exercised through the real permission-gated views (Django test client). --
 
 ANNOTATIONS = 'plugins:netbox_facilitymap:api-annotations'
 SITEPLAN = 'plugins:netbox_facilitymap:api-siteplan'
+PLACEMENTS = 'plugins:netbox_facilitymap:api-placements'
+LAYOUTS = 'plugins:netbox_facilitymap:api-layouts'
+FLOOR2 = 'test-site/floor-2'
 
 
 def _post_json(client, name, body, version=None):
@@ -146,34 +288,41 @@ def _post_json(client, name, body, version=None):
                        content_type='application/json', headers=headers)
 
 
+def _versions(resp):
+    """The per-floor token map a sharded GET/POST echoes in its header."""
+    return json.loads(resp.headers[VERSION_HEADER])
+
+
 def _room(rid, label='', poly=None):
     return {'id': rid, 'label': label, 'polygon': poly or [], 'location': None}
 
 
 def test_annotations_version_roundtrips_from_get_to_save(client, editor_user):
-    # A first GET on an empty map yields the empty token; POSTing it back writes and mints a new,
-    # non-empty token that the next GET echoes — the happy path a single editor always takes.
+    # A first GET on an empty map yields an empty token map; POSTing a floor's first-write token ('')
+    # writes and mints a fresh per-floor token that the next GET echoes — the single-editor path.
     client.force_login(editor_user)
     r0 = client.get(reverse(ANNOTATIONS))
-    assert r0.headers[VERSION_HEADER] == ''
+    assert _versions(r0) == {}
 
-    r1 = _post_json(client, ANNOTATIONS, {FLOOR: {'rooms': [_room('r1', 'R1')]}}, version='')
+    r1 = _post_json(client, ANNOTATIONS, {FLOOR: {'rooms': [_room('r1', 'R1')]}},
+                    version=json.dumps({FLOOR: ''}))
     assert r1.status_code == 200
-    v1 = r1.headers[VERSION_HEADER]
-    assert v1 != ''
+    v1 = _versions(r1)
+    assert v1[FLOOR] != ''
     assert Room.objects.filter(room_id='r1').exists()
 
-    assert client.get(reverse(ANNOTATIONS)).headers[VERSION_HEADER] == v1
+    assert _versions(client.get(reverse(ANNOTATIONS))) == v1
 
 
 def test_annotations_stale_token_conflicts_and_spares_concurrent_rooms(client, editor_user):
-    # The headline: editor B holds a token from before editor A added r2. B's save (a document
-    # that never had r2) must be rejected with 409 — otherwise sync_rooms, authoritative for the
-    # whole document, would delete r2. r2 must survive and B's own r1 edit must NOT be applied.
+    # The headline same-floor case: editor B holds a token from before editor A added r2, and both
+    # edit the SAME floor. B's save (a floor document that never had r2) must be rejected with 409 —
+    # otherwise sync_rooms, authoritative for the floor, would delete r2. r2 must survive and B's own
+    # r1 edit must NOT be applied.
     client.force_login(editor_user)
     v1 = _post_json(client, ANNOTATIONS,
                     {FLOOR: {'rooms': [_room('r1', 'R1')]}}, version='').headers[VERSION_HEADER]
-    # Editor A adds r2, advancing the version past the token B still holds (v1).
+    # Editor A adds r2, advancing this floor's token past the one B still holds (v1).
     _post_json(client, ANNOTATIONS,
                {FLOOR: {'rooms': [_room('r1', 'R1'), _room('r2', 'R2')]}}, version=v1)
 
@@ -182,6 +331,124 @@ def test_annotations_stale_token_conflicts_and_spares_concurrent_rooms(client, e
     assert stale.status_code == 409
     assert Room.objects.filter(room_id='r2').exists()          # not clobbered
     assert Room.objects.get(room_id='r1').label == 'R1'        # B's edit was rejected, not applied
+
+
+def test_annotations_different_floor_saves_do_not_conflict(client, editor_user):
+    # The CONC-1 headline: two editors on DIFFERENT floors never collide. Both load the same
+    # two-floor doc (so both hold floor-2's token); editor A saves floor-1 (advancing only floor-1),
+    # then editor B saves floor-2 with the token it still holds — this must SUCCEED (not 409), and
+    # both floors' rooms must stand. Under the old whole-document token B's save would have 409'd.
+    client.force_login(editor_user)
+    base = _post_json(client, ANNOTATIONS,
+                      {FLOOR: {'rooms': [_room('r1', 'F1')]}, FLOOR2: {'rooms': [_room('r2', 'F2')]}},
+                      version=json.dumps({FLOOR: '', FLOOR2: ''}))
+    tokens = _versions(base)   # {floor-1: t1, floor-2: t2} — both editors loaded this
+
+    # Editor A edits floor-1 only, advancing floor-1's token; floor-2's token is untouched.
+    _post_json(client, ANNOTATIONS, {FLOOR: {'rooms': [_room('r1', 'F1 edited')]}},
+               version=json.dumps({FLOOR: tokens[FLOOR]}))
+
+    # Editor B, still holding the original floor-2 token, saves floor-2 — no conflict.
+    b = _post_json(client, ANNOTATIONS, {FLOOR2: {'rooms': [_room('r2', 'F2 edited by B')]}},
+                   version=json.dumps({FLOOR2: tokens[FLOOR2]}))
+    assert b.status_code == 200
+    assert Room.objects.get(room_id='r1').label == 'F1 edited'       # A's floor-1 edit stands
+    assert Room.objects.get(room_id='r2').label == 'F2 edited by B'  # B's floor-2 edit stands
+
+
+def test_annotations_per_floor_save_spares_other_floors_rooms(client, editor_user):
+    # A per-floor save carries only the floors it touched, so a floor's ABSENCE from the POST means
+    # "not edited", never "delete its rooms" (sweep_absent=False). Saving floor-1 alone must leave
+    # floor-2's rooms intact.
+    client.force_login(editor_user)
+    _post_json(client, ANNOTATIONS,
+               {FLOOR: {'rooms': [_room('r1')]}, FLOOR2: {'rooms': [_room('r2')]}},
+               version=json.dumps({FLOOR: '', FLOOR2: ''}))
+    tok = _versions(client.get(reverse(ANNOTATIONS)))
+
+    _post_json(client, ANNOTATIONS, {FLOOR: {'rooms': [_room('r1'), _room('r1b')]}},
+               version=json.dumps({FLOOR: tok[FLOOR]}))
+    assert Room.objects.filter(room_id='r2').exists()   # floor-2 untouched by a floor-1-only save
+
+
+def test_annotations_emptied_floor_deletes_its_row_and_rooms(client, editor_user):
+    # A floor emptied of rooms/arrows/notes is sent as `{}` and deleted — its blob row and its rooms
+    # go, the whole-document prune moved server-side.
+    client.force_login(editor_user)
+    v = _post_json(client, ANNOTATIONS, {FLOOR: {'rooms': [_room('r1')]}},
+                   version=json.dumps({FLOOR: ''}))
+    assert FacilityMapBlob.objects.filter(kind='annotations', key=FLOOR).exists()
+
+    _post_json(client, ANNOTATIONS, {FLOOR: {}}, version=json.dumps(_versions(v)))
+    assert not FacilityMapBlob.objects.filter(kind='annotations', key=FLOOR).exists()
+    assert not Room.objects.filter(room_id='r1').exists()
+
+
+def test_placements_different_floor_saves_do_not_conflict(client, editor_user):
+    # The same non-conflict guarantee on a plain sharded kind (placements): A saves floor-1's
+    # placements, B saves floor-2's with the token it still holds — no 409, both stored in their own
+    # rows.
+    client.force_login(editor_user)
+    base = _post_json(client, PLACEMENTS,
+                      {FLOOR: {'placements': [{'room': 'r1'}]}, FLOOR2: {'placements': [{'room': 'r2'}]}},
+                      version=json.dumps({FLOOR: '', FLOOR2: ''}))
+    tokens = _versions(base)
+
+    _post_json(client, PLACEMENTS, {FLOOR: {'placements': [{'room': 'r1', 'id': 9}]}},
+               version=json.dumps({FLOOR: tokens[FLOOR]}))
+    b = _post_json(client, PLACEMENTS, {FLOOR2: {'placements': [{'room': 'r2', 'id': 8}]}},
+                   version=json.dumps({FLOOR2: tokens[FLOOR2]}))
+    assert b.status_code == 200
+    assert FacilityMapBlob.objects.get(kind='placements', key=FLOOR).data['placements'][0]['id'] == 9
+    assert FacilityMapBlob.objects.get(kind='placements', key=FLOOR2).data['placements'][0]['id'] == 8
+
+
+def test_placements_emptied_floor_deletes_its_row(client, editor_user):
+    # An emptied placements floor (`{'placements': []}`) deletes its row (_SHARD_EMPTY).
+    client.force_login(editor_user)
+    v = _post_json(client, PLACEMENTS, {FLOOR: {'placements': [{'room': 'r1'}]}},
+                   version=json.dumps({FLOOR: ''}))
+    assert FacilityMapBlob.objects.filter(kind='placements', key=FLOOR).exists()
+    _post_json(client, PLACEMENTS, {FLOOR: {'placements': []}}, version=json.dumps(_versions(v)))
+    assert not FacilityMapBlob.objects.filter(kind='placements', key=FLOOR).exists()
+
+
+def test_sharded_get_composes_every_floor_row(client, editor_user):
+    # A sharded GET reads all per-floor rows back into the whole-document shape the frontend expects.
+    client.force_login(editor_user)
+    _post_json(client, PLACEMENTS,
+               {FLOOR: {'placements': [{'room': 'r1'}]}, FLOOR2: {'placements': [{'room': 'r2'}]}},
+               version=json.dumps({FLOOR: '', FLOOR2: ''}))
+    doc = client.get(reverse(PLACEMENTS)).json()
+    assert set(doc) == {FLOOR, FLOOR2}
+    assert doc[FLOOR]['placements'] == [{'room': 'r1'}]
+
+
+def test_placements_get_enriches_netbox_urls(client, superuser):
+    # The sharded placements GET surfaces each rack/device placement's NetBox detail URL (NAV-16), so
+    # the search widget's NetBox-target mode can open the object's own page without reconstructing a
+    # /dcim/... path in JS. A placement whose object doesn't exist gets no url (finder falls to map).
+    from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Rack, Site
+    site = Site.objects.create(name='PS', slug='ps-site')
+    rack = Rack.objects.create(name='RK', site=site, status='active')
+    mfr = Manufacturer.objects.create(name='M', slug='m-ps')
+    dtype = DeviceType.objects.create(manufacturer=mfr, model='DT', slug='dt-ps')
+    role = DeviceRole.objects.create(name='Role', slug='role-ps')
+    device = Device.objects.create(name='DV', device_type=dtype, role=role, site=site, status='active')
+    client.force_login(superuser)
+
+    _post_json(client, PLACEMENTS, {FLOOR: {'placements': [
+        {'room': 'r1', 'kind': 'rack', 'id': rack.pk},
+        {'room': 'r1', 'kind': 'device', 'id': device.pk},
+        {'room': 'r1', 'kind': 'rack', 'id': 999999},   # no such object → no url
+    ]}}, version=json.dumps({FLOOR: ''}))
+
+    # Key by (kind, id): Rack and Device are separate tables, so their pks can collide (both 5 here).
+    placements = client.get(reverse(PLACEMENTS)).json()[FLOOR]['placements']
+    by_key = {(p['kind'], p['id']): p for p in placements}
+    assert by_key[('rack', rack.pk)]['url'].endswith(rack.get_absolute_url())
+    assert by_key[('device', device.pk)]['url'].endswith(device.get_absolute_url())
+    assert 'url' not in by_key[('rack', 999999)]
 
 
 def test_annotations_missing_header_still_saves(client, editor_user):
@@ -193,9 +460,17 @@ def test_annotations_missing_header_still_saves(client, editor_user):
     assert Room.objects.filter(room_id='r1').exists()
 
 
+def test_annotations_write_rejects_a_non_object_body(client, editor_user):
+    # A syntactically valid JSON body that isn't an object (BUG-1) is a 400, not a 500 — the view
+    # immediately calls `.get(...)` on the decoded payload.
+    client.force_login(editor_user)
+    assert _post_json(client, ANNOTATIONS, ['not', 'an', 'object']).status_code == 400
+
+
 def test_blob_stale_token_conflicts_and_leaves_data(client, editor_user):
-    # Same guard on the plain blob kinds (siteplan/placements/layouts): a stale token is a 409
-    # and the stored document is left untouched.
+    # The single-row (non-sharded) guard: siteplan is one facility-wide document, so its token stays
+    # a scalar and a stale token is a 409 leaving the stored document untouched. (The sharded kinds'
+    # per-floor conflict behaviour is covered by the annotations/placements tests above.)
     client.force_login(editor_user)
     assert client.get(reverse(SITEPLAN)).headers[VERSION_HEADER] == ''
     v1 = _post_json(client, SITEPLAN,
@@ -270,6 +545,8 @@ def test_rooms_only_annotations_edit_logs_no_blob_change(client, editor_user):
 FACILITIES = 'plugins:netbox_facilitymap:api-nb-facilities'
 FLOOR_LABEL = 'plugins:netbox_facilitymap:api-settings-floor-label-field'
 DEFAULT_FACILITY = 'plugins:netbox_facilitymap:api-settings-default-facility'
+WRITE_MODE = 'plugins:netbox_facilitymap:api-settings-write-mode'
+INLINE_ROOM_CREATION = 'plugins:netbox_facilitymap:api-settings-inline-room-creation'
 
 
 def _import_manifest(workdir, slug):
@@ -325,6 +602,12 @@ def test_blob_endpoint_isolates_facilities(client, editor_user):
 def test_blob_endpoint_rejects_bad_facility(client, editor_user):
     client.force_login(editor_user)
     assert client.get(reverse(SITEPLAN) + '?facility=../evil').status_code == 400
+
+
+def test_blob_write_rejects_a_non_object_body(client, editor_user):
+    # A syntactically valid JSON body that isn't an object (BUG-1) is a 400, not a 500.
+    client.force_login(editor_user)
+    assert _post_json(client, SITEPLAN, 'just a string').status_code == 400
 
 
 def test_annotations_get_scoped_to_facility(client, editor_user):
@@ -393,6 +676,13 @@ def test_set_grouping_rejects_unknown_value(client, editor_user):
                     content_type='application/json')
     assert r.status_code == 400
     assert not FacilityMapBlob.objects.filter(kind='settings').exists()
+
+
+def test_set_grouping_rejects_a_non_object_body(client, editor_user):
+    # A syntactically valid JSON body that isn't an object (BUG-1) is a 400, not a 500.
+    client.force_login(editor_user)
+    r = client.post(reverse(FACILITIES), data=json.dumps([1, 2, 3]), content_type='application/json')
+    assert r.status_code == 400
 
 
 def test_set_grouping_requires_import_permission(client, plain_user):
@@ -478,6 +768,13 @@ def test_floor_label_field_clamps_unknown_value(client, editor_user):
         kind='settings', facility='', key='').data['floor_label_field'] == 'name'
 
 
+def test_floor_label_field_rejects_a_non_object_body(client, editor_user):
+    # A syntactically valid JSON body that isn't an object (BUG-1) is a 400, not a 500.
+    client.force_login(editor_user)
+    r = client.post(reverse(FLOOR_LABEL), data=json.dumps(5), content_type='application/json')
+    assert r.status_code == 400
+
+
 def test_floor_label_field_requires_import_permission(client, plain_user):
     # `plain_user` holds change but not import — the everyday map-write gate must not unlock this
     # admin-tier config write (PERM-1).
@@ -559,6 +856,14 @@ def test_default_facility_clamps_unknown_slug(client, editor_user, workdir):
     assert r.status_code == 200 and r.json()['default_facility'] == ''
 
 
+def test_default_facility_rejects_a_non_object_body(client, editor_user):
+    # A syntactically valid JSON body that isn't an object (BUG-1) is a 400, not a 500.
+    client.force_login(editor_user)
+    r = client.post(reverse(DEFAULT_FACILITY), data=json.dumps(['nope']),
+                    content_type='application/json')
+    assert r.status_code == 400
+
+
 def test_default_facility_requires_import_permission(client, plain_user):
     # `plain_user` holds change but not import — the everyday map-write gate must not unlock this
     # admin-tier config write (PERM-1).
@@ -585,6 +890,134 @@ def test_default_facility_reader_degrades_stale_pin(workdir):
     assert facilities.default_facility() == ''
 
 
+# --- write_mode setting (LOC-2): the runtime, admin-controlled replacement for the redeploy-time
+# `allow_location_create` capability flag. Persisted into the same install-wide settings blob;
+# read back by MapView (window.MAP.writeMode) and enforced by NbLocationCreateView. --------------
+
+
+def test_write_mode_persists_to_settings_blob(client, editor_user):
+    # A POST writes the write_mode boolean onto the single default-facility settings row (MULTI-1).
+    client.force_login(editor_user)
+    r = client.post(reverse(WRITE_MODE), data=json.dumps({'write_mode': True}),
+                    content_type='application/json')
+    assert r.status_code == 200 and r.json() == {'ok': True, 'write_mode': True}
+    assert FacilityMapBlob.objects.get(
+        kind='settings', facility='', key='').data['write_mode'] is True
+
+
+def test_write_mode_toggle_off_persists_false(client, editor_user):
+    # Disabling is a plain POST of False — no confirm on the server side (the consent gate is UX).
+    FacilityMapBlob.objects.create(kind='settings', facility='', key='', data={'write_mode': True})
+    client.force_login(editor_user)
+    r = client.post(reverse(WRITE_MODE), data=json.dumps({'write_mode': False}),
+                    content_type='application/json')
+    assert r.status_code == 200 and r.json()['write_mode'] is False
+    assert FacilityMapBlob.objects.get(
+        kind='settings', facility='', key='').data['write_mode'] is False
+
+
+def test_write_mode_rejects_a_non_object_body(client, editor_user):
+    # A syntactically valid JSON body that isn't an object (BUG-1) is a 400, not a 500.
+    client.force_login(editor_user)
+    r = client.post(reverse(WRITE_MODE), data=json.dumps('nope'), content_type='application/json')
+    assert r.status_code == 400
+
+
+def test_write_mode_preserves_other_settings_keys(client, editor_user):
+    # The write merges onto the existing settings document — sibling keys survive.
+    FacilityMapBlob.objects.create(kind='settings', facility='', key='',
+                                   data={'room_embed_zoom': 3.0, 'floor_label_field': 'slug'})
+    client.force_login(editor_user)
+
+    client.post(reverse(WRITE_MODE), data=json.dumps({'write_mode': True}),
+                content_type='application/json')
+    data = FacilityMapBlob.objects.get(kind='settings', facility='', key='').data
+    assert data == {'room_embed_zoom': 3.0, 'floor_label_field': 'slug', 'write_mode': True}
+
+
+def test_write_mode_requires_import_permission(client, plain_user):
+    # `plain_user` holds change but not import — the everyday map-write gate must not unlock this
+    # admin-tier config write (PERM-1). Flipping write mode is IMPORT_PERM, like the settings beside it.
+    client.force_login(plain_user)
+    r = client.post(reverse(WRITE_MODE), data=json.dumps({'write_mode': True}),
+                    content_type='application/json')
+    assert r.status_code == 403
+    assert not FacilityMapBlob.objects.filter(kind='settings').exists()
+
+
+def test_write_mode_enabled_resolver_reads_blob(db):
+    # previews.write_mode_enabled is the shared server-side gate (MapView context + create endpoint).
+    from netbox_facilitymap.previews import write_mode_enabled
+    assert write_mode_enabled() is False   # no settings row → off
+    FacilityMapBlob.objects.create(kind='settings', facility='', key='', data={'write_mode': True})
+    assert write_mode_enabled() is True
+
+
+# --- inline_room_creation setting (SET-5): the write add-on switch split out of write mode, which
+# is now a pure master gate. Same blob, same IMPORT_PERM tier as its siblings — but it DEFAULTS ON
+# when absent, so an install predating the split keeps the create tile write mode used to imply. ---
+
+
+def test_inline_room_creation_persists_to_settings_blob(client, editor_user):
+    # A POST writes the boolean onto the single default-facility settings row (MULTI-1).
+    client.force_login(editor_user)
+    r = client.post(reverse(INLINE_ROOM_CREATION), data=json.dumps({'inline_room_creation': False}),
+                    content_type='application/json')
+    assert r.status_code == 200 and r.json() == {'ok': True, 'inline_room_creation': False}
+    assert FacilityMapBlob.objects.get(
+        kind='settings', facility='', key='').data['inline_room_creation'] is False
+
+
+def test_inline_room_creation_preserves_other_settings_keys(client, editor_user):
+    # The write merges onto the existing settings document — sibling keys survive. Write mode in
+    # particular: the two are separate switches now, so saving one must never disturb the other.
+    FacilityMapBlob.objects.create(kind='settings', facility='', key='',
+                                   data={'write_mode': True, 'ap_tool': True})
+    client.force_login(editor_user)
+
+    client.post(reverse(INLINE_ROOM_CREATION), data=json.dumps({'inline_room_creation': False}),
+                content_type='application/json')
+    data = FacilityMapBlob.objects.get(kind='settings', facility='', key='').data
+    assert data == {'write_mode': True, 'ap_tool': True, 'inline_room_creation': False}
+
+
+def test_inline_room_creation_rejects_a_non_object_body(client, editor_user):
+    # A syntactically valid JSON body that isn't an object (BUG-1) is a 400, not a 500.
+    client.force_login(editor_user)
+    r = client.post(reverse(INLINE_ROOM_CREATION), data=json.dumps('nope'),
+                    content_type='application/json')
+    assert r.status_code == 400
+
+
+def test_inline_room_creation_requires_import_permission(client, plain_user):
+    # `plain_user` holds change but not import — the everyday map-write gate must not unlock this
+    # admin-tier config write (PERM-1), exactly as for write mode beside it.
+    client.force_login(plain_user)
+    r = client.post(reverse(INLINE_ROOM_CREATION), data=json.dumps({'inline_room_creation': False}),
+                    content_type='application/json')
+    assert r.status_code == 403
+    assert not FacilityMapBlob.objects.filter(kind='settings').exists()
+
+
+def test_inline_room_creation_enabled_defaults_on_when_unset(db):
+    # The upgrade-safety default (SET-5): before the split, write-mode-on meant inline creation was
+    # on. A missing row, or a row predating the key, must therefore read as ON — else an upgrader
+    # with write mode on would silently lose the create tile. This exposes nothing new: write mode
+    # is off by default and gates this.
+    from netbox_facilitymap.previews import inline_room_creation_enabled
+    assert inline_room_creation_enabled() is True                      # no settings row at all
+    row = FacilityMapBlob.objects.create(kind='settings', facility='', key='',
+                                         data={'write_mode': True})    # pre-SET-5 blob
+    assert inline_room_creation_enabled() is True
+    # Only an explicit stored False turns it off — "not configured" is never mistaken for "off".
+    row.data = {'write_mode': True, 'inline_room_creation': False}
+    row.save()
+    assert inline_room_creation_enabled() is False
+    row.data = {'write_mode': True, 'inline_room_creation': True}
+    row.save()
+    assert inline_room_creation_enabled() is True
+
+
 def test_nb_locations_exposes_description(client, editor_user):
     # `_trim` gained `description` so the import wizard's floor-label picker can offer it as an
     # alternative to `name`/`slug` (see views._floor_label_field).
@@ -603,20 +1036,47 @@ def test_nb_locations_exposes_description(client, editor_user):
     assert loc['description'] == 'Sub-basement Storage'
 
 
-# --- Inline Location creation (LOC-1): the plugin's one write into dcim core, gated on the
-# off-by-default `allow_location_create` capability flag + the `dcim.add_location` permission. ----
+# --- Inline Location creation (LOC-1/LOC-2): the plugin's one write into dcim core, gated on the
+# off-by-default runtime `write_mode` master gate + the `inline_room_creation` add-on switch
+# (SET-5) + the `dcim.add_location` permission. -------------------------------------------------
 
 LOCATION_CREATE = 'plugins:netbox_facilitymap:api-nb-location-create'
 
 
+def _set_setting(key, value):
+    """Merge one key into the single install-wide settings blob, creating the row if needed. The
+    runtime gates read it live, so writing the row is all a test needs — no restart, no endpoint."""
+    row = FacilityMapBlob.objects.filter(kind='settings', facility='', key='').first()
+    data = dict(row.data if row else {})
+    data[key] = value
+    if row is None:
+        FacilityMapBlob.objects.create(kind='settings', facility='', key='', data=data)
+    else:
+        row.data = data
+        row.save()
+
+
+def _set_write_mode(enabled):
+    """Set install-wide write mode — the master gate `previews.write_mode_enabled` reads, and so
+    every write endpoint."""
+    _set_setting('write_mode', enabled)
+
+
+def _set_inline_room_creation(enabled):
+    """Set the inline-room-creation add-on switch (SET-5) — the second gate, beyond write mode, that
+    `NbLocationCreateView` checks. Only needed to turn it OFF: it defaults on when the key is absent."""
+    _set_setting('inline_room_creation', enabled)
+
+
 @pytest.fixture
-def location_create_on(monkeypatch):
-    """Switch the install-wide `allow_location_create` capability flag on for a test (it defaults
-    off). `capabilities.is_enabled` reads it live via `get_plugin_config`, so setting the key is
-    enough — no restart needed."""
-    from django.conf import settings
-    monkeypatch.setitem(
-        settings.PLUGINS_CONFIG['netbox_facilitymap'], 'allow_location_create', True)
+def location_create_on(db):
+    """Switch install-wide write mode on for a test (it defaults off). The create endpoint reads it
+    live from the settings blob via `previews.write_mode_enabled`, so writing the row is enough.
+
+    Write mode alone is enough to open the create path: the `inline_room_creation` add-on switch it
+    also answers to (SET-5) defaults on when unset, so leaving that key absent is the ordinary
+    "operator turned write mode on" state."""
+    _set_write_mode(True)
 
 
 def _location_creator(user):
@@ -627,12 +1087,25 @@ def _location_creator(user):
     grant(user, Location, ['view', 'add'])
 
 
-def test_create_location_disabled_returns_403(client, editor_user, location_create_on, monkeypatch):
-    # Even with the perm, the write is refused when the operator hasn't switched the feature on —
-    # NetBox stays the source of truth by default.
-    from django.conf import settings
-    monkeypatch.setitem(
-        settings.PLUGINS_CONFIG['netbox_facilitymap'], 'allow_location_create', False)
+def test_create_location_disabled_returns_403(client, editor_user):
+    # Even with the perm, the write is refused when write mode is off (the default) — NetBox stays
+    # the source of truth until an operator switches it on.
+    _set_write_mode(False)
+    site, floor = _floor_location()
+    _location_creator(editor_user)
+    client.force_login(editor_user)
+
+    r = _post_json(client, LOCATION_CREATE, {'parent': floor.pk, 'name': 'Room 9'})
+    assert r.status_code == 403
+    from dcim.models import Location
+    assert not Location.objects.filter(name='Room 9').exists()
+
+
+def test_create_location_with_the_add_on_off_returns_403(client, editor_user, location_create_on):
+    # Write mode on and the perm held, but the inline-room-creation add-on switched off (SET-5) →
+    # refused. The two switches are independent: an operator can allow the map's other NetBox writes
+    # while keeping Location creation in NetBox's hands.
+    _set_inline_room_creation(False)
     site, floor = _floor_location()
     _location_creator(editor_user)
     client.force_login(editor_user)
@@ -704,6 +1177,15 @@ def test_create_location_blank_name_returns_400(client, editor_user, location_cr
     assert r.status_code == 400
 
 
+def test_create_location_rejects_a_non_object_body(client, editor_user, location_create_on):
+    # A syntactically valid JSON body that isn't an object (BUG-1) is a 400, not a 500.
+    _location_creator(editor_user)
+    client.force_login(editor_user)
+
+    r = _post_json(client, LOCATION_CREATE, [1, 2])
+    assert r.status_code == 400
+
+
 def test_nb_racks_exposes_description(client, editor_user):
     # `_trim_rack` gained `description` (RACK-2) so the rack card in the edit → rack sub-mode
     # sidebar can show a location note (e.g. "east wall") without opening NetBox.
@@ -761,3 +1243,91 @@ def test_nb_sites_rejects_bad_facility(client, superuser):
     client.force_login(superuser)
     r = client.get(reverse(SITES) + '?facility=bad.slug')   # '.' fails the ^[-\w]+$ slug rule
     assert r.status_code == 400
+
+
+# --- NbPlacementNearbyView (PLACE-2): diagnostic gear counts for the *empty* placement panel. When a
+# room's Location has no directly-assigned placeable gear, this read-only endpoint reports where the
+# gear actually lives — an ancestor Location or the Site — so the user can reassign it to this room.
+# It never broadens the exact-Location placement query; it only counts. ---
+
+PLACEMENT_NEARBY = 'plugins:netbox_facilitymap:api-nb-placement-nearby'
+
+
+def _room_hierarchy():
+    """Campus Site › building Location › floor Location › room Location (the room we diagnose)."""
+    from dcim.models import Location, Site
+    site = Site.objects.create(name='Campus', slug='campus')
+    bldg = Location.objects.create(name='Building A', slug='bldg-a', site=site)
+    floor = Location.objects.create(name='Floor 2', slug='floor-2', site=site, parent=bldg)
+    room = Location.objects.create(name='Room 210', slug='room-210', site=site, parent=floor)
+    return site, bldg, floor, room
+
+
+def _rack(site, name, location=None):
+    from dcim.models import Rack
+    return Rack.objects.create(name=name, site=site, location=location, status='active')
+
+
+def _unracked_device(site, name, location=None):
+    from dcim.models import Device, DeviceRole, DeviceType, Manufacturer
+    mfr, _ = Manufacturer.objects.get_or_create(name='M', slug='m')
+    dtype, _ = DeviceType.objects.get_or_create(manufacturer=mfr, model='DT', slug='dt')
+    role, _ = DeviceRole.objects.get_or_create(name='Role', slug='role')
+    return Device.objects.create(name=name, device_type=dtype, role=role, site=site,
+                                 location=location, status='active')
+
+
+def test_placement_nearby_reports_ancestors_and_site(client, superuser):
+    site, bldg, floor, room = _room_hierarchy()
+    _rack(site, 'FloorRack', location=floor)             # on the floor (ancestor) Location
+    _unracked_device(site, 'BldgDev', location=bldg)     # on the building (ancestor) Location
+    _rack(site, 'SiteRack')                              # site-level, no Location
+    client.force_login(superuser)
+
+    body = client.get(reverse(PLACEMENT_NEARBY), {'location': room.pk}).json()
+    scopes = {s['name']: s for s in body['nearby']}
+    assert set(scopes) == {'Floor 2', 'Building A', 'Campus'}
+    assert scopes['Floor 2']['racks'] == 1 and scopes['Floor 2']['devices'] == 0
+    assert scopes['Building A']['devices'] == 1 and scopes['Building A']['racks'] == 0
+    assert scopes['Campus']['kind'] == 'site' and scopes['Campus']['racks'] == 1
+    # Nearest ancestor first, Site (broadest) last.
+    assert [s['name'] for s in body['nearby']] == ['Floor 2', 'Building A', 'Campus']
+    # A non-zero count links to its NetBox filtered list; a zero count carries no link.
+    assert 'location_id=%d' % floor.pk in scopes['Floor 2']['racks_url']
+    assert scopes['Floor 2']['devices_url'] is None
+    assert 'site_id=%d' % site.pk in scopes['Campus']['racks_url']
+
+
+def test_placement_nearby_site_scope_excludes_ancestor_located_gear(client, superuser):
+    # A rack on an ancestor Location is reported under that Location, never doubled at the Site
+    # (site-level counts require location IS NULL), so with no true site-level gear the Site scope is
+    # omitted entirely.
+    site, bldg, floor, room = _room_hierarchy()
+    _rack(site, 'FloorRack', location=floor)
+    client.force_login(superuser)
+
+    scopes = {s['name']: s for s in
+              client.get(reverse(PLACEMENT_NEARBY), {'location': room.pk}).json()['nearby']}
+    assert 'Campus' not in scopes
+    assert scopes['Floor 2']['racks'] == 1
+
+
+def test_placement_nearby_excludes_rooms_own_gear(client, superuser):
+    # Gear ON the room's own Location is placeable directly (the panel would not be empty), so it is
+    # not a "nearby" scope — only ancestors + the Site are diagnosed.
+    site, bldg, floor, room = _room_hierarchy()
+    _rack(site, 'RoomRack', location=room)
+    client.force_login(superuser)
+    assert client.get(reverse(PLACEMENT_NEARBY), {'location': room.pk}).json()['nearby'] == []
+
+
+def test_placement_nearby_empty_when_nothing_nearby(client, superuser):
+    _, _, _, room = _room_hierarchy()
+    client.force_login(superuser)
+    assert client.get(reverse(PLACEMENT_NEARBY), {'location': room.pk}).json()['nearby'] == []
+
+
+def test_placement_nearby_blank_or_unknown_location(client, superuser):
+    client.force_login(superuser)
+    assert client.get(reverse(PLACEMENT_NEARBY)).json()['nearby'] == []
+    assert client.get(reverse(PLACEMENT_NEARBY), {'location': 999999}).json()['nearby'] == []

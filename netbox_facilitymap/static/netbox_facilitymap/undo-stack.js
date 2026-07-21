@@ -3,10 +3,11 @@
 
    Each editor owns one (see Editor). It knows nothing about what a snapshot
    contains — the editor builds a snapshot (a JSON-serializable clone of its
-   mutable data plus the store's dirty flags) before a mutation and pushes it here;
-   Ctrl+Z pops the most recent and hands it back for the editor to restore. The only
-   policy this class enforces is a depth cap so a long editing session can't grow the
-   history unbounded (oldest entries fall off the bottom). */
+   mutable data) before a mutation and pushes it here; Ctrl+Z pops the most recent
+   and hands it back for the editor to restore (which re-derives the dirty flags from
+   the store baselines rather than reading them off the snapshot). The only policy this
+   class enforces is a depth cap so a long editing session can't grow the history
+   unbounded (oldest entries fall off the bottom). */
 
 class UndoStack {
   constructor(max = 50) {

@@ -3,13 +3,22 @@
 A NetBox 4.x plugin that adds a navigable siteplan → building → floor → room map of a
 facility, with every room linked to a NetBox **Location**. Import your floor-plan drawings
 from inside NetBox, draw and bind room polygons, and the same map renders natively on NetBox
-Location pages.
+Location pages, alongside a per-room to-do list for tracking work through Planned, In progress,
+and Completed.
 
 ## Compatibility
 
 | Plugin version | NetBox versions |
 |---|---|
 | `1.x` | `4.1.7` to `4.6.x` |
+
+## Requirements
+
+Rooms bind to NetBox **Locations**, so your facility lives in NetBox's DCIM tree. Each building
+maps in one of two ways: as its **own Site**, where the Site *is* the building (the common case),
+or, when a whole **campus is one Site**, as a **building Location beneath that campus Site**. Floors
+are the anchor's child Locations and rooms bind to those. The importer auto-suggests a match and
+lets you pick either kind, so you can keep your existing NetBox topology.
 
 ## Install
 
@@ -50,6 +59,22 @@ python /opt/netbox/netbox/manage.py migrate
 python /opt/netbox/netbox/manage.py collectstatic --no-input
 sudo systemctl restart netbox netbox-rq
 ```
+
+## Permissions
+
+By default any signed-in NetBox user can **view** the map; editing and importing are gated on
+NetBox model permissions, so a viewer without them sees a read-only map.
+
+| To… | Grant this permission on **FacilityMap Blob** |
+|---|---|
+| Draw and bind room polygons, place and save rack markers, edit the room to-do list | `netbox_facilitymap.change_facilitymapblob` |
+| Import or re-render floor-plan drawings, use the Settings page | `netbox_facilitymap.import_facilitymapblob` |
+
+Resetting the map (an irreversible wipe of every upload and rendered image) additionally requires
+a **superuser**.
+
+Grant these under **Admin → Permissions**: create a permission with the relevant action on the
+**FacilityMap Blob** object type and assign it to the user or group.
 
 ## Add-ons
 

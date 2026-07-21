@@ -24,6 +24,8 @@ class PanZoom {
     this.k = 1;               // scale factor
     this.minScale = 0.05;     // zoom floor: 0.85× the whole-wrap fit (set by _setRange)
     this.maxScale = 8;        // zoom ceiling (set with minScale by _setRange)
+    this.onScale = null;      // optional hook(k) fired when the scale changes (not on pure pans)
+    this._lastK = null;       // last scale onScale saw, so a pan (k unchanged) doesn't re-fire it
   }
 
   get scale() { return this.k; }
@@ -36,13 +38,16 @@ class PanZoom {
   }
 
   /** Write the current transform to the wrap. Also publishes the inverse scale
-   *  as `--inv-scale` so node markers can counter-scale to a constant on-screen
-   *  size in CSS (the radius analogue of `non-scaling-stroke`) without a render. */
+   *  as `--inv-scale` so node markers and labels can counter-scale to a constant
+   *  on-screen size in CSS (the radius analogue of `non-scaling-stroke`) without a
+   *  render, and fires `onScale(k)` when the scale actually changed — a pure pan
+   *  (k unchanged) doesn't, so the label LOD toggle stays off the pan hot path. */
   apply() {
     if (!this.wrap) return;
     this.wrap.style.transform =
       `translate(${this.tx}px,${this.ty}px) scale(${this.k})`;
     this.wrap.style.setProperty('--inv-scale', 1 / this.k);
+    if (this.onScale && this.k !== this._lastK) { this._lastK = this.k; this.onScale(this.k); }
   }
 
   /** Set the zoom range. Floor = 0.85× the whole-wrap fit: a full zoom-out shows the

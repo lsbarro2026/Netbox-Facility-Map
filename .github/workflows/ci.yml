@@ -1,0 +1,111 @@
+name: CI
+
+# Runs the plugin's pytest suite against a real NetBox install, in the PUBLIC repo. The public
+# repo is a flattened snapshot of this netbox-facilitymap/ subtree, so at the repo root the
+# package (netbox_facilitymap/) and pyproject.toml sit at the top level — hence repo-root paths
+# throughout (`pip install -e '.[dev]'`, tests from the root), with no `plugin/` prefix. NetBox
+# itself is cloned into netbox-src/ at the matrixed tag and put on PYTHONPATH so pytest-django can
+# load netbox.settings.
+#
+# The private dev repo keeps its own copy of this workflow at the wrapper-repo root
+# (.github/workflows/ci.yml), which uses `plugin/`-prefixed paths for the netbox-facilitymap/
+# subdirectory. Keep the two in lockstep: a change to the NetBox×Python matrix, the services, or
+# the psycopg swap belongs in both.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: pytest (NetBox ${{ matrix.netbox-version }}, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Spans the supported range (min_version 4.1.7 .. max_version 4.6.99 in
+        # netbox_facilitymap/__init__.py). v4.6.4 is verified locally; the v4.1.7 leg proves the
+        # lower bound and is best-effort — if NetBox-side test-API drift breaks it, pin/adjust here
+        # rather than narrowing the plugin's supported range.
+        netbox-version: ['v4.1.7', 'v4.6.4']
+        # Exercise the whole advertised Python range (pyproject requires-python >=3.10 +
+        # classifiers 3.10/3.11/3.12). The two NetBox minors differ in Python floor: 4.1.7 runs on
+        # 3.10–3.12, but 4.6.4 sets requires-python ">=3.12" — so its 3.10/3.11 legs can't install
+        # and are excluded below. The v4.1.7 legs cover the lower Python bounds instead.
+        python-version: ['3.10', '3.11', '3.12']
+        exclude:
+          - netbox-version: 'v4.6.4'
+            python-version: '3.10'
+          - netbox-version: 'v4.6.4'
+            python-version: '3.11'
+
+    services:
+      postgres:
+        image: postgres:16
+        # Credentials match NetBox's own netbox/configuration_testing.py (netbox/netbox/netbox).
+        # POSTGRES_USER is a superuser of the container, so it has CREATEDB for the throwaway
+        # test_netbox database the DB-backed tier builds.
+        env:
+          POSTGRES_USER: netbox
+          POSTGRES_PASSWORD: netbox
+          POSTGRES_DB: netbox
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U netbox"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out the plugin
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Clone NetBox ${{ matrix.netbox-version }}
+        run: git clone --depth 1 --branch ${{ matrix.netbox-version }} https://github.com/netbox-community/netbox.git netbox-src
+
+      - name: Write CI configuration
+        # Inherit the version-matched testing config NetBox ships (localhost Postgres/Redis +
+        # test SECRET_KEY, in whatever DATABASE(S) shape that minor uses) and only enable our
+        # plugin on top. settings.py reads netbox.configuration by default.
+        run: |
+          cat > netbox-src/netbox/netbox/configuration.py <<'EOF'
+          from netbox.configuration_testing import *  # noqa: F401,F403
+
+          PLUGINS = ['netbox_facilitymap']
+          EOF
+
+      - name: Install NetBox and the plugin
+        run: |
+          python -m pip install --upgrade pip
+          # NetBox pins psycopg[c,pool], which source-builds the psycopg-c C extension. The latest
+          # psycopg-c no longer compiles against the CI toolchain (numutils.c "must have a working
+          # 64-bit integer datatype" #error), so swap the C extra for the prebuilt binary wheel —
+          # no compiler, no libpq-dev, and the driver is identical for our purposes. Handles the
+          # [c,pool] and bare [c] spellings across NetBox minors; fail loudly if it matched nothing.
+          sed -i -E 's/psycopg\[c(,pool)?\]/psycopg[binary\1]/' netbox-src/requirements.txt
+          grep -q 'psycopg\[binary' netbox-src/requirements.txt || { echo "psycopg extra swap did not match"; exit 1; }
+          pip install -r netbox-src/requirements.txt
+          pip install -e '.[dev]'
+
+      - name: Run tests
+        env:
+          # NetBox's source tree must be importable so pytest-django can load netbox.settings.
+          PYTHONPATH: ${{ github.workspace }}/netbox-src/netbox
+        run: python -m pytest -v

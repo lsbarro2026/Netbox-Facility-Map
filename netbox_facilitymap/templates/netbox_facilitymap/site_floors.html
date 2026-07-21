@@ -9,24 +9,33 @@
 <div class="card">
   <h5 class="card-header">Facility Map: Floors</h5>
   <div class="card-body">
-    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px">
+    {% comment %}
+      Horizontal cards (thumbnail left, floor info right) in an auto-fit grid, kept deliberately in
+      sync with the SPA's App.renderBuilding redesign (§10 multi-sheet-floors). auto-fit lets a few
+      floors fill the panel width. The single-floor shortcut is intentionally NOT mirrored here:
+      these cards link to NetBox Location pages, not the SPA hash, and this is a passive panel.
+    {% endcomment %}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:12px">
       {% for c in cards %}
         {% if c.url %}<a href="{{ c.url }}" style="text-decoration:none;color:inherit">{% endif %}
-        <div style="border:1px solid #ccc;border-radius:6px;overflow:hidden;background:#f4f5f7;height:100%">
+        <div style="display:grid;grid-template-columns:clamp(96px,32%,150px) 1fr;min-height:92px;
+                    border:1px solid #ccc;border-radius:6px;overflow:hidden;background:#f4f5f7;height:100%">
           {% if c.image %}
             <img src="{{ c.image }}" loading="lazy"
-                 style="display:block;width:100%;height:140px;object-fit:contain;background:#fff">
+                 style="display:block;width:100%;height:100%;object-fit:cover;background:#fff;border-right:1px solid #ddd">
           {% endif %}
-          <div style="padding:6px 8px">
-            <div style="font-weight:600;margin-bottom:4px">{{ c.label }}</div>
-            <span style="display:inline-block;padding:1px 6px;border-radius:8px;font-size:11px;
-                         {% if c.rooms %}background:#2fa84f22;color:#1f7a37{% else %}background:#e0e0e0;color:#666{% endif %}">
-              {% if c.rooms %}{{ c.rooms }} room{{ c.rooms|pluralize }}{% else %}unmapped{% endif %}
-            </span>
-            {% if c.sheets > 1 %}
+          <div style="padding:8px 10px;display:flex;flex-direction:column;justify-content:center;gap:6px;min-width:0">
+            <div style="font-weight:600">{{ c.label }}</div>
+            <div style="display:flex;flex-wrap:wrap;gap:6px">
               <span style="display:inline-block;padding:1px 6px;border-radius:8px;font-size:11px;
-                           background:#e6effa;color:#2c5f9e">{{ c.sheets }} sheets</span>
-            {% endif %}
+                           {% if c.rooms %}background:#2fa84f22;color:#1f7a37{% else %}background:#e0e0e0;color:#666{% endif %}">
+                {% if c.rooms %}{{ c.rooms }} room{{ c.rooms|pluralize }}{% else %}unmapped{% endif %}
+              </span>
+              {% if c.sheets > 1 %}
+                <span style="display:inline-block;padding:1px 6px;border-radius:8px;font-size:11px;
+                             background:#e6effa;color:#2c5f9e">{{ c.sheets }} sheets</span>
+              {% endif %}
+            </div>
           </div>
         </div>
         {% if c.url %}</a>{% endif %}

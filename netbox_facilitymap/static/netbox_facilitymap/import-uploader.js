@@ -33,9 +33,20 @@ class ImportUploader {
   /** Everything the file inputs accept + `accepts()` admits: drawings plus their companions. */
   static EXTS = [...ImportUploader.DRAWING_EXTS, ...ImportUploader.COMPANION_EXTS];
 
+  /** The OVERLAY-role subset of the accepted drawings (GIS data layers drawn atop a base plan),
+   *  from `window.MAP.overlayExts` (same registry gating as DRAWING_EXTS). The wizard keys its
+   *  overlay-only affordances — the FMT-6 align editor — off `isOverlay`. Fallback empty: every
+   *  overlay format is an optional `[gis]` extra the base install doesn't carry. */
+  static OVERLAY_EXTS = (window.MAP && window.MAP.overlayExts) || [];
+
   static isDrawing(name) {
     const n = (name || '').toLowerCase();
     return ImportUploader.DRAWING_EXTS.some(ext => n.endsWith(ext));
+  }
+
+  static isOverlay(name) {
+    const n = (name || '').toLowerCase();
+    return ImportUploader.OVERLAY_EXTS.some(ext => n.endsWith(ext));
   }
 
   static isCompanion(name) {

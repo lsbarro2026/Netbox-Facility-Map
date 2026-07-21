@@ -3,6 +3,12 @@
    rack/device markers placed inside rooms. Pure static (no instances, no
    state), in the spirit of Icons/Geom in lib.js; depends only on Dom.svg.
 
+   LOCKSTEP with the server-side port `netbox_facilitymap/device_shapes.py`, which draws these
+   same glyphs into the NetBox-page embeds/exports (there is no build step, so the logic is
+   duplicated, not shared). The keyword rules (typeFor), per-type footprints (box) and glyph
+   geometry (glyph) must stay identical in both files, or an embed and the live map disagree —
+   a change here must be mirrored there and vice-versa.
+
    Every glyph is drawn CENTERED AT THE ORIGIN and sized to a wpx×hpx box — the marker
    <g> in FloorEditor._drawPlacement already carries `translate(centre) rotate(rot)`, so
    shapes need no transform of their own. Primitives are classed (`dev-body` body,
@@ -24,6 +30,10 @@ class DeviceShapes {
       [/patch|panel/,                  'patchpanel'],
       [/switch|leaf|spine|\btor\b/,    'switch'],
       [/rout|gateway|\bgw\b/,          'router'],
+      // No existing keyword is a standalone "ap" token, so this can't shadow or be
+      // shadowed by another rule; placed ahead of the broad server/storage catch-alls
+      // (host, node, disk, array, filer) so e.g. "Wireless Host Controller" resolves here.
+      [/wifi|wireless|access ?point|\bap\b|\bwap\b/, 'ap'],
       [/ups|battery/,                  'ups'],
       [/pdu|outlet|power|\brpp\b|busway/, 'pdu'],
       [/storage|disk|\bnas\b|\bsan\b|array|filer/, 'storage'],
@@ -46,6 +56,7 @@ class DeviceShapes {
       router:     { w: 22, h: 16 },
       server:     { w: 28, h: 14 },
       firewall:   { w: 22, h: 17 },
+      ap:         { w: 16, h: 16 },
       ups:        { w: 18, h: 26 },
       pdu:        { w: 26, h: 9 },
       storage:    { w: 24, h: 18 },
@@ -96,6 +107,14 @@ class DeviceShapes {
           const y0 = -hh + r * rh, off = (r % 2) ? wpx / 4 : wpx / 2;
           for (let x = -hw + off; x < hw - 0.5; x += wpx / 2) els.push(L(x, y0, x, y0 + rh));
         }
+        break;
+      }
+      case 'ap': {                         // ceiling-mount puck + concentric broadcast rings;
+                                            // fully radial (not a one-sided cone) so it reads
+                                            // the same at any placement rotation
+        const r = Math.min(hw, hh);
+        els.push(C(0, 0, r * 0.3, 'dev-body'));
+        for (const f of [0.55, 0.8, 1.0]) els.push(C(0, 0, r * f));
         break;
       }
       case 'ups': {                        // battery body + terminal + bolt

@@ -34,8 +34,21 @@ def _set_grouping(value):
         kind='settings', facility='', key='', defaults={'data': {'facility_grouping': value}})
 
 
+_SHARDED = {'annotations', 'placements', 'layouts'}
+
+
 def _blob(kind, facility, data=None):
-    return FacilityMapBlob.objects.create(kind=kind, facility=facility, key='', data=data or {})
+    """Create blob row(s) for `kind`, matching production shape. The per-floor kinds
+    (annotations/placements/layouts) are sharded one row per floor (`key=floor_key`, CONC-1), so a
+    floor-keyed `data` dict is split into per-floor rows; the single-row kinds (siteplan/settings)
+    get one `key=''` row. Returns the last row created (or None if a sharded `data` was empty)."""
+    data = data or {}
+    if kind in _SHARDED:
+        row = None
+        for floor_key, floor_data in data.items():
+            row = FacilityMapBlob.objects.create(kind=kind, facility=facility, key=floor_key, data=floor_data)
+        return row
+    return FacilityMapBlob.objects.create(kind=kind, facility=facility, key='', data=data)
 
 
 # --- reachable_facilities ------------------------------------------------------------------------
@@ -158,7 +171,7 @@ def test_reassign_rekeys_editor_blobs_and_preserves_settings(workdir):
     _site('a', group=west)
     _blob('annotations', '', {'a/f1': {}})
     _blob('siteplan', '', {'hotspots': []})
-    _blob('placements', '', {})
+    _blob('placements', '', {'a/f1': {'placements': [{'room': 'r'}]}})
     _set_grouping('sitegroup')  # settings row at '' — must NOT move
 
     kinds = facilities.reassign_facility('', 'west')
@@ -176,7 +189,8 @@ def test_reassign_refuses_when_target_holds_same_kind(workdir):
     _blob('annotations', 'west', {'b/f1': {}})   # collision — must not clobber
     with pytest.raises(ValueError):
         facilities.reassign_facility('', 'west')
-    assert FacilityMapBlob.objects.get(facility='', kind='annotations').data == {'a/f1': {}}
+    # Source unchanged — the collision refusal happened before any re-key (its per-floor row stays).
+    assert FacilityMapBlob.objects.get(facility='', kind='annotations').key == 'a/f1'
 
 
 def test_reassign_refuses_when_target_has_rendered_content(workdir):
@@ -235,3 +249,20 @@ def test_facility_floor_scope_matches_renamed_site_room_via_fk():
     scope = facilities.facility_floor_scope('ga')
     assert not room.floor_key.startswith('sa/')          # the slug clause genuinely can't match
     assert Room.objects.filter(scope).filter(pk=room.pk).exists()
+
+
+def test_facility_floor_scope_matches_three_segment_key():
+    # MODEL-3: a Location-anchored 3-segment key "<site>/<building>/<floor>" keeps the site slug as
+    # segment 1, so the `startswith '<slug>/'` scoping selects it exactly like a 2-segment key —
+    # no change to the MULTI-2 scoping invariant.
+    from netbox_facilitymap.models import Room
+
+    group = _sitegroup('ga')
+    _site('sa', group=group)                             # facility 'ga' owns site slug 'sa'
+    _site('sb')                                          # ungrouped -> a different facility ('')
+    in_scope = Room.objects.create(floor_key='sa/alpha-bldg/level-1', room_id='r1')
+    out_scope = Room.objects.create(floor_key='sb/beta-bldg/level-1', room_id='r2')
+
+    scope = facilities.facility_floor_scope('ga')
+    matched = set(Room.objects.filter(scope).values_list('pk', flat=True))
+    assert in_scope.pk in matched and out_scope.pk not in matched

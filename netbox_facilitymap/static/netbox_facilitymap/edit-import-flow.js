@@ -108,7 +108,7 @@ class EditImportFlow extends ImportFlow {
       const unassigned = drawings.filter(p => this._cardUnassigned(b, p)).length;
 
       const state = b.nbSite
-        ? Dom.el('span', { class: 'imp-bind-ok' }, '✓ ' + b.nbSite.name + ' (' + b.nbSite.slug + ')')
+        ? Dom.el('span', { class: 'imp-bind-ok' }, '✓ ' + this._anchorSummary(b))
         : Dom.el('span', { class: 'imp-bind-warn' }, '⚠ not bound to a NetBox site');
       const floors = Dom.el('span', { class: 'imp-hub-meta' + (unassigned ? ' warn' : '') },
         drawings.length + (drawings.length === 1 ? ' drawing' : ' drawings')

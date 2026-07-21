@@ -20,10 +20,14 @@ A handler has one of two **roles** (its `role` attribute):
     draws them as a read-only overlay layer. This is the FMT-9 overlay model: `ShapefileFormat`
     (FMT-6), `GeoJsonFormat` (FMT-7), and `KmlFormat`/`KmzFormat` (FMT-8) ship this role today.
 
-Overlay handlers project their source coordinates into the floor's 0..1 frame with the shared
-`unit_projector` fit-to-bounds primitive below, so the whole model stays resolution-independent
-(same convention as `Room.polygon`). A true georeference (control points aligning to the base
-plan's real-world extent) is a future extension.
+Overlay handlers project their source coordinates into the floor's 0..1 frame through the shared
+`OverlayProjector` below, so the whole model stays resolution-independent (same convention as
+`Room.polygon`). It places a layer one of two ways: **fit-to-bounds** (the `unit_projector`
+primitive — the approximate default, flagged `georeferenced: false`) or a **control-point
+georeference** (FMT-6) solved from operator-placed source↔plan pairs (the import map's
+`overlayAlign`), which flips the flag true. Both tiers are CRS-aware: a geographic (lon/lat)
+source is first pressed through a local equirectangular projection so its aspect is metrically
+correct — see the class docstring.
 
 **Companion (multi-file) formats.** Most sources are one self-contained file, but a Shapefile is a
 *set* — a `.shp` main file plus sibling `.shx`/`.dbf`/`.prj`/`.cpg` that its parser reads by shared
@@ -56,6 +60,7 @@ restart (the same reload the deployment already requires after any Python change
 
 import importlib.util
 import io
+import math
 import os
 import shutil
 import sys
@@ -80,10 +85,11 @@ def _module_installed(name):
 
 def unit_projector(points, keep_aspect=True):
     """Build a callable mapping source `(x, y)` coordinates into the floor's normalized 0..1
-    frame by fitting the bounding box of `points`. This is the shared 'fit-to-bounds' projection
-    every OVERLAY handler (FMT-6/7/8) uses to place features on a plan without a manual
-    georeference — gather all of an overlay's raw coordinates, build one projector, then map
-    every feature through it so they share a single frame.
+    frame by fitting the bounding box of `points`. This is the 'fit-to-bounds' primitive —
+    `OverlayProjector`'s fallback tier when a layer carries no control-point georeference —
+    used to place features on a plan without any alignment input: gather all of an overlay's
+    coordinates, build one projector, then map every feature through it so they share a single
+    frame.
 
     `points` is any iterable of `(x, y)` in the source's planar units (already projected from a
     CRS by the caller; lon/lat is accepted as planar for the fit). Returns `project(x, y) ->
@@ -119,6 +125,198 @@ def unit_projector(points, keep_aspect=True):
         return (nx, 1.0 - ny)   # flip Y: source up -> image down
 
     return project
+
+
+class OverlayProjector:
+    """The source→0..1 projection for one overlay layer — the georeference seam (FMT-6) every
+    OVERLAY handler builds once per layer and maps every feature through.
+
+    Places the layer one of two ways:
+
+      * **fit-to-bounds** (the default): the `unit_projector` primitive over the layer's own
+        points — lands any dataset on the plan, but only approximately (`georeferenced` False,
+        which drives the frontend's approximate-alignment warnings).
+      * **control-point georeference**: `align` carries operator-placed pairs
+        (`[{"src": [sx, sy], "dst": [nx, ny]}, …]`, the import map's `overlayAlign` entry) tying
+        a source coordinate to its true spot on the plan's 0..1 canvas. Two valid pairs solve a
+        similarity (rotate / uniform-scale / translate); three or more a least-squares affine
+        (`georeferenced` True, suppressing the warnings). Malformed pairs are dropped; fewer
+        than two survivors, or a degenerate solve (coincident points), falls back to fit.
+
+    Both tiers are **CRS-aware** via `crs` ("geographic" | "projected" | "unknown"): a
+    geographic (lon/lat degrees) source is first pressed through a local equirectangular
+    projection — `x' = lon·cos(lat0)`, `lat0` the layer's mid-latitude — so east–west spans
+    stop being stretched by 1/cos(lat0). That fixes the fit tier's aspect away from the equator
+    and makes the 2-point similarity solve geometrically meaningful; projected/unknown sources
+    pass through planar, as before.
+
+    Every path composes to an **affine** raw-source→unit map, exposed by `meta()` as the
+    6-coefficient `srcTransform` (`nx = a·x + b·y + c`, `ny = d·x + e·y + f`). The wizard's
+    align editor inverts it to recover the raw source coordinate behind a clicked feature
+    vertex, and mirrors the solve for its live preview — keep the two implementations in
+    lockstep (see architecture §10). Pure stdlib (`math` only), honouring the module isolation
+    contract."""
+
+    GEOGRAPHIC = "geographic"
+
+    def __init__(self, all_points, crs="unknown", align=None):
+        self.crs = crs
+        # cos(mid-latitude) pre-scale for a geographic source (1.0 = planar pass-through).
+        self._k = self._equirect_k(all_points) if crs == self.GEOGRAPHIC else 1.0
+        pairs = self._clean_pairs(align)
+        affine = self._solve_pairs(pairs) if len(pairs) >= 2 else None
+        self.georeferenced = affine is not None
+        self._affine = affine if affine is not None else self._fit_affine(all_points)
+
+    def project(self, x, y):
+        """Map one raw source coordinate into the plan's normalized 0..1 frame."""
+        a, b, c, d, e, f = self._affine
+        return (a * x + b * y + c, d * x + e * y + f)
+
+    def meta(self):
+        """The manifest overlay-entry metadata: the placement tier actually used, the CRS
+        family, and the exact raw-source→unit transform for the frontend to invert."""
+        return {"georeferenced": self.georeferenced, "crs": self.crs,
+                "srcTransform": list(self._affine)}
+
+    # ---- geographic pre-projection ----
+    @classmethod
+    def _equirect_k(cls, all_points):
+        """The local equirectangular x-scale for a lon/lat layer: cos of the layer's
+        mid-latitude, clamped away from the poles so a (junk) polar latitude can't collapse
+        the x axis to zero. 1.0 for an empty layer."""
+        lats = [p[1] for p in all_points]
+        if not lats:
+            return 1.0
+        lat0 = (min(lats) + max(lats)) / 2.0
+        return math.cos(math.radians(max(-89.0, min(89.0, lat0))))
+
+    def _pre(self, x, y):
+        """The CRS pre-projection into the local working plane (equirectangular x-scale for a
+        geographic source; identity otherwise). Y stays raw — and Y-up — here; each tier below
+        owns its own Y handling."""
+        return (x * self._k, y)
+
+    # ---- the two placement tiers, each expressed as a raw-source→unit affine ----
+    def _fit_affine(self, all_points):
+        """Fit-to-bounds over the pre-projected points, as a raw-source affine."""
+        fit = unit_projector([self._pre(x, y) for x, y in all_points])
+        return self._affine_from(lambda x, y: fit(*self._pre(x, y)))
+
+    def _solve_pairs(self, pairs):
+        """Solve the control-point tier from >=2 clean pairs, or None when the solve is
+        degenerate (coincident/collinear sources — the caller then falls back to fit). Works in
+        a Y-**down** pre-projected plane (`v = -y`): the plan frame is Y-down while source
+        coordinates are Y-up, and folding that flip into the working plane keeps it out of the
+        similarity, which (unlike a full affine) cannot express a reflection and would absorb
+        it as a bogus rotation."""
+        src = [self._pre(sx, sy) for (sx, sy), _ in pairs]
+        uv = [(x, -y) for x, y in src]
+        dst = [d for _, d in pairs]
+        plane = (self._similarity(uv, dst) if len(pairs) == 2
+                 else self._lsq_affine(uv, dst))
+        if plane is None or not all(math.isfinite(v) for v in plane):
+            return None
+        # Compose the working-plane affine with the pre-projection (u = k·x, v = -y).
+        p, q, r, s, t, w = plane
+        return (p * self._k, -q, r, s * self._k, -t, w)
+
+    @staticmethod
+    def _similarity(uv, dst):
+        """Exact 2-point similarity in the working plane, via complex arithmetic: find A, B
+        with `dst = A·uv + B` (A encodes rotation + uniform scale). None when the two source
+        points coincide (no scale is defined)."""
+        s0, s1 = (complex(*p) for p in uv)
+        d0, d1 = (complex(*p) for p in dst)
+        span = s1 - s0
+        if abs(span) < 1e-12:
+            return None
+        a = (d1 - d0) / span
+        b = d0 - a * s0
+        return (a.real, -a.imag, b.real, a.imag, a.real, b.imag)
+
+    @classmethod
+    def _lsq_affine(cls, uv, dst):
+        """Least-squares affine (6 dof) in the working plane: two independent 3-unknown
+        normal-equation systems (one per output axis) over rows `[u, v, 1]`. None when the
+        normal matrix is singular (collinear source points can't pin an affine)."""
+        m = [[0.0] * 3 for _ in range(3)]
+        rx, ry = [0.0] * 3, [0.0] * 3
+        for (u, v), (dx, dy) in zip(uv, dst):
+            row = (u, v, 1.0)
+            for i in range(3):
+                for j in range(3):
+                    m[i][j] += row[i] * row[j]
+                rx[i] += row[i] * dx
+                ry[i] += row[i] * dy
+        top = cls._solve3(m, rx)
+        bot = cls._solve3(m, ry)
+        if top is None or bot is None:
+            return None
+        return (*top, *bot)
+
+    @staticmethod
+    def _solve3(m, rhs):
+        """Solve a 3×3 linear system by Gaussian elimination with partial pivoting, or None
+        when singular. `m`/`rhs` are left unmodified (worked on copies — `_lsq_affine` reuses
+        the normal matrix for both axes)."""
+        a = [list(m[i]) + [rhs[i]] for i in range(3)]
+        for col in range(3):
+            pivot = max(range(col, 3), key=lambda r: abs(a[r][col]))
+            if abs(a[pivot][col]) < 1e-12:
+                return None
+            a[col], a[pivot] = a[pivot], a[col]
+            for r in range(3):
+                if r != col:
+                    factor = a[r][col] / a[col][col]
+                    for c in range(col, 4):
+                        a[r][c] -= factor * a[col][c]
+        return tuple(a[i][3] / a[i][i] for i in range(3))
+
+    # ---- helpers ----
+    @staticmethod
+    def _affine_from(fn):
+        """Recover the 6-tuple of an affine map by evaluating it at the basis points — every
+        placement path here is affine, so three evaluations pin it exactly."""
+        ox, oy = fn(0.0, 0.0)
+        x1, y1 = fn(1.0, 0.0)
+        x2, y2 = fn(0.0, 1.0)
+        return (x1 - ox, x2 - ox, ox, y1 - oy, y2 - oy, oy)
+
+    @classmethod
+    def _clean_pairs(cls, align):
+        """The structurally-valid pairs in `align`: each a `{"src": [x, y], "dst": [nx, ny]}`
+        of finite numbers. `align` is operator input riding the import map, so anything else —
+        wrong container, short lists, NaN/bool — is dropped rather than trusted."""
+        if not isinstance(align, list):
+            return []
+        pairs = []
+        for entry in align:
+            if not isinstance(entry, dict):
+                continue
+            src = cls._point(entry.get("src"))
+            dst = cls._point(entry.get("dst"))
+            if src and dst:
+                pairs.append((src, dst))
+        return pairs
+
+    @staticmethod
+    def _point(v):
+        """`v` as a finite `(x, y)` tuple, or None when it isn't a valid numeric pair."""
+        if (isinstance(v, (list, tuple)) and len(v) >= 2
+                and all(isinstance(c, (int, float)) and not isinstance(c, bool)
+                        and math.isfinite(c) for c in v[:2])):
+            return (float(v[0]), float(v[1]))
+        return None
+
+
+def _scaled_px(base_px, quality):
+    """A vector handler's target pixel size for the operator's render-quality multiplier — the
+    `RENDER_PX` analogue of `PdfFormat._render_scale`, shared by the SVG and DXF handlers. A
+    falsy/negative multiplier (a malformed `--scale`) falls back to standard rather than rendering
+    a degenerate 0-px image."""
+    quality = quality if quality and quality > 0 else 1.0
+    return max(1, int(base_px * quality))
 
 
 def save_kwargs(fmt):
@@ -205,12 +403,20 @@ class DrawingFormat:
         everything — a format without `companions` never reaches here."""
         return False
 
-    def render_full(self, path, fmt="WEBP", page=0):
+    def render_full(self, path, fmt="WEBP", page=0, quality=1.0):
         """(BASE_RASTER) Render the drawing to encoded `(raw, w, h)` at full scale, or None when
         the decoder is missing or the file can't be decoded. `fmt` is the output encoding (WEBP for
         build artifacts, PNG for the wizard's preview cache). `page` is the 0-based page index for a
         multi-page source (only PDFs have >1 page — see `page_count`); every single-page format
-        ignores it."""
+        ignores it.
+
+        `quality` is the operator's render-quality multiplier (1.0 = standard; the `render_hq`
+        setting sends 1.5, ~216 vs ~144 DPI — see `imports.RenderRunner`). It only means anything
+        for a source the renderer **rasterizes from vectors**, where more pixels resolve more
+        detail: a PDF/SVG/DXF honours it, a `RasterFormat` scan has fixed pixels and ignores it.
+        Every handler bounds the result by its own `MAX_IMAGE_PX`, so a raised quality can never
+        grow a sheet without limit (the render subprocess is address-space-capped — see
+        `imports.RenderRunner._effective_mem_mb`)."""
         raise NotImplementedError
 
     def render_thumb(self, path, out_path):
@@ -218,18 +424,24 @@ class DrawingFormat:
         Returns True on success. Only the first page/frame is thumbnailed."""
         raise NotImplementedError
 
-    def extract_overlay(self, path):
-        """(OVERLAY) Parse a data/overlay source into a list of features projected into the floor's
-        normalized 0..1 frame (via `unit_projector`), or None when the parser is missing or the
-        file can't be decoded. Each feature is a dict:
+    def extract_overlay(self, path, align=None):
+        """(OVERLAY) Parse a data/overlay source into its manifest overlay payload, or None when
+        the parser is missing or the file can't be decoded. `align` is the layer's optional
+        control-point georeference (the import map's `overlayAlign` pairs); with none the layer
+        is placed fit-to-bounds. Returns a dict:
 
-            {"type": "point" | "line" | "polygon",
-             "coords": [nx, ny]              # point
-                     | [[nx, ny], ...],      # line / polygon (0..1)
-             "props": { ... }}               # arbitrary source attributes (frontend hover title)
+            {"features": [{"type": "point" | "line" | "polygon",
+                           "coords": [nx, ny]              # point
+                                   | [[nx, ny], ...],      # line / polygon (0..1)
+                           "props": { ... }},              # source attributes (hover title)
+                          ...],
+             "georeferenced": bool,          # control-point tier actually used?
+             "crs": "geographic" | "projected" | "unknown",
+             "srcTransform": [a, b, c, d, e, f]}   # raw-source→unit affine (see OverlayProjector)
 
-        Lazy-import the parser inside this method (the module isolation contract): it runs only in
-        the render subprocess, never in the NetBox worker."""
+        Features are projected into the floor's normalized 0..1 frame through one shared
+        `OverlayProjector`. Lazy-import the parser inside this method (the module isolation
+        contract): it runs only in the render subprocess, never in the NetBox worker."""
         raise NotImplementedError
 
     def page_count(self, path):
@@ -252,6 +464,15 @@ class PdfFormat(DrawingFormat):
 
     RENDER_SCALE = 2.0   # full floor-plan render scale; coords are normalized 0..1 downstream
     THUMB_SCALE = 0.6    # wizard thumbnail scale (legible enough to identify a plan)
+    # Ceiling on a rendered page's longest side, in pixels. A PDF is the one format whose output
+    # size is decided purely by a scale factor (a raster's is its own pixels), so without this
+    # nothing downstream bounds a sheet: area grows with the SQUARE of the scale, and a big E-size
+    # sheet at raised quality would blow past the render subprocess's RLIMIT_AS and surface as a
+    # failed import. Enforced by *lowering the scale before rendering* (see `_render_scale`) —
+    # downscaling after the fact would already have spent the memory. Sized so standard quality is
+    # untouched: the largest common sheet (E-size, 2448x3168pt) renders 4896x6336 at RENDER_SCALE,
+    # comfortably under; only a raised `quality` (or a genuinely enormous page) ever clamps.
+    MAX_IMAGE_PX = 8000
 
     def sniff(self, head):
         return head.startswith(b"%PDF-")
@@ -261,6 +482,27 @@ class PdfFormat(DrawingFormat):
         import pypdfium2 as pdfium
         return pdfium.PdfDocument(path)[page]
 
+    def _render_scale(self, page, quality):
+        """The PDFium render scale to actually use for `page` at `quality` — `RENDER_SCALE` scaled
+        by the operator's multiplier, then lowered just enough to keep the longest side within
+        `MAX_IMAGE_PX`.
+
+        Deriving the clamp from the page's own **point size** (rather than capping the pixels after
+        the fact) is what makes a raised quality safe: the oversized bitmap is never allocated. It
+        also evens out pixel density across sheet sizes — a letter sheet gets the full multiplier
+        while a huge E-size sheet, which was already dense in absolute pixels, gives some of it
+        back. A page whose size can't be read (a damaged/odd PDF) renders at the unclamped scale and
+        is left to the subprocess's rlimits, the same backstop as before."""
+        quality = quality if quality and quality > 0 else 1.0
+        scale = self.RENDER_SCALE * quality
+        try:
+            longest_px = max(page.get_size()) * scale
+        except Exception:
+            return scale
+        if longest_px > self.MAX_IMAGE_PX:
+            scale *= self.MAX_IMAGE_PX / longest_px
+        return scale
+
     def page_count(self, path):
         try:
             import pypdfium2 as pdfium
@@ -268,9 +510,10 @@ class PdfFormat(DrawingFormat):
         except Exception:
             return 1
 
-    def render_full(self, path, fmt="WEBP", page=0):
+    def render_full(self, path, fmt="WEBP", page=0, quality=1.0):
         try:
-            pil = self._page(path, page).render(scale=self.RENDER_SCALE).to_pil().convert("RGB")
+            pg = self._page(path, page)
+            pil = pg.render(scale=self._render_scale(pg, quality)).to_pil().convert("RGB")
             buf = io.BytesIO()
             pil.save(buf, fmt, **save_kwargs(fmt))
             return buf.getvalue(), pil.width, pil.height
@@ -296,16 +539,23 @@ class RasterFormat(DrawingFormat):
 
     The size-cap + encode / thumbnail pipeline below is shared through the `_load` seam: a
     subtype that decodes a *non-raster* source (e.g. SVG rasterized via CairoSVG) overrides
-    `_load` to return an upright RGB PIL image and inherits the rest unchanged."""
+    `_load` to return an upright RGB PIL image and inherits the rest unchanged. `_load` is also
+    where the render-quality multiplier lands: a true raster ignores it (see `_load` below), while
+    a vector subtype scales its target size by it."""
 
     requires = "Pillow"
     requires_module = ("PIL",)   # Pillow's import name; a core dep — rasters are always available
     MAX_IMAGE_PX = 4000  # cap the longest side of a rendered raster (downscale only)
 
-    def _load(self, path):
+    def _load(self, path, quality=1.0):
         """Return an upright, RGB-flattened PIL image for `path`, or raise. EXIF transpose is the
         raster analogue of the PDF renderer honoring page rotation, so camera/scanner JPEGs land
-        upright (no-op without the tag). Subtypes decoding a non-raster source override this."""
+        upright (no-op without the tag). Subtypes decoding a non-raster source override this.
+
+        `quality` is **deliberately ignored here**: a scan's detail is fixed at its own pixel grid,
+        so re-rendering it "higher quality" would only upsample — more bytes, no more legibility.
+        The parameter exists for the vector subtypes below (SVG/DXF), which rasterize from source
+        geometry and genuinely resolve more at a larger target size."""
         from PIL import Image, ImageOps
         with Image.open(path) as im:
             return ImageOps.exif_transpose(im).convert("RGB")
@@ -325,10 +575,12 @@ class RasterFormat(DrawingFormat):
                                background_color="white", unsafe=False)
         return Image.open(io.BytesIO(png)).convert("RGB")
 
-    def render_full(self, path, fmt="WEBP", page=0):
+    def render_full(self, path, fmt="WEBP", page=0, quality=1.0):
         # A raster is a single frame — `page` is accepted for a uniform render interface but ignored.
+        # `quality` reaches the `_load` seam, where a true raster drops it and a vector subtype
+        # (SVG/DXF) scales its target size by it; MAX_IMAGE_PX below bounds either way.
         try:
-            im = self._load(path)
+            im = self._load(path, quality)
             if max(im.size) > self.MAX_IMAGE_PX:
                 im.thumbnail((self.MAX_IMAGE_PX, self.MAX_IMAGE_PX))
             buf = io.BytesIO()
@@ -417,10 +669,12 @@ class SvgFormat(RasterFormat):
         s = head.lstrip(b"\xef\xbb\xbf").lstrip().lower()
         return s.startswith((b"<?xml", b"<svg", b"<!doctype"))
 
-    def _load(self, path):
+    def _load(self, path, quality=1.0):
         # Force a legible width (SVG declared units are unreliable for a floor plan); the shared
-        # seam does the CairoSVG rasterize + white flatten (and lazy-imports the decoder).
-        return self._svg_to_rgb(self.RENDER_PX, url=path)
+        # seam does the CairoSVG rasterize + white flatten (and lazy-imports the decoder). An SVG
+        # rasterizes from vectors, so `quality` genuinely buys detail here — it scales the target
+        # width, and RasterFormat.render_full's MAX_IMAGE_PX still bounds the result.
+        return self._svg_to_rgb(_scaled_px(self.RENDER_PX, quality), url=path)
 
 
 class DxfFormat(RasterFormat):
@@ -457,18 +711,20 @@ class DxfFormat(RasterFormat):
         s = head.lstrip(b"\xef\xbb\xbf")
         return b"SECTION" in s and b"\x00" not in s
 
-    def _load(self, path):
+    def _load(self, path, quality=1.0):
         # Lazy-import ezdxf inside the render path (module isolation contract): it loads only in the
         # render subprocess, never in the NetBox worker. Render the modelspace (the plan) to an SVG
         # string with ezdxf's native SVG backend (NOT the Matplotlib one), fit to a single auto-sized
-        # page, then hand it to the shared CairoSVG seam.
+        # page, then hand it to the shared CairoSVG seam at a `quality`-scaled target size (CAD is
+        # vectors, so the extra pixels resolve real detail — same reasoning as SvgFormat).
         import ezdxf
         from ezdxf.addons.drawing import Frontend, RenderContext, layout, svg
         doc = ezdxf.readfile(path)
         backend = svg.SVGBackend()
         Frontend(RenderContext(doc), backend).draw_layout(doc.modelspace())
         svg_str = backend.get_string(layout.Page(0, 0))   # 0, 0 -> auto-fit to content extents
-        return self._svg_to_rgb(self.RENDER_PX, bytestring=svg_str.encode("utf-8"))
+        return self._svg_to_rgb(_scaled_px(self.RENDER_PX, quality),
+                                bytestring=svg_str.encode("utf-8"))
 
 
 class SofficeFormat(DrawingFormat):
@@ -512,11 +768,13 @@ class SofficeFormat(DrawingFormat):
         pdfs = glob.glob(os.path.join(out_dir, "*.pdf"))
         return pdfs[0] if pdfs else None
 
-    def render_full(self, path, fmt="WEBP", page=0):
+    def render_full(self, path, fmt="WEBP", page=0, quality=1.0):
+        # Visio converts to PDF, so `quality` rides through to the hardened PDF renderer — and with
+        # it that renderer's point-size-derived MAX_IMAGE_PX clamp.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             pdf = self._convert(path, tmp)
-            return self._pdf.render_full(pdf, fmt, page) if pdf else None
+            return self._pdf.render_full(pdf, fmt, page, quality) if pdf else None
 
     def render_thumb(self, path, out_path):
         import tempfile
@@ -562,11 +820,13 @@ class ShapefileFormat(DrawingFormat):
     sibling `.shx` (index), `.dbf` (attributes), and optional `.prj` (CRS) / `.cpg` (encoding),
     declared as `companions` so the upload layer keeps the set together (see the module docstring).
 
-    Coordinates are projected into the floor's 0..1 frame with the shared fit-to-bounds
-    `unit_projector` — treated as **planar**, with no CRS reprojection. The `.prj` is accepted for
-    completeness but not consulted; a true georeference to the base plan's real-world extent is a
-    future extension. pyshp is pure-Python (no GDAL/native deps); like every decoder it is
-    lazy-imported inside `extract_overlay`, so it loads only in the render subprocess."""
+    Coordinates are projected into the floor's 0..1 frame through the shared `OverlayProjector`
+    (fit-to-bounds by default; a control-point georeference when the import map carries
+    `overlayAlign` pairs, FMT-6). The `.prj` sibling is consulted only for its CRS *family*
+    (`_crs_kind`: geographic lon/lat vs projected planar — driving the projector's
+    equirectangular pre-scale), never for a full CRS reprojection, which would need a heavy GIS
+    runtime. pyshp is pure-Python (no GDAL/native deps); like every decoder it is lazy-imported
+    inside `extract_overlay`, so it loads only in the render subprocess."""
 
     name = "shp"
     exts = (".shp",)
@@ -591,7 +851,7 @@ class ShapefileFormat(DrawingFormat):
         # non-empty file that isn't binary — the parser downstream is the real check.
         return bool(head) and b"\x00" not in head
 
-    def extract_overlay(self, path):
+    def extract_overlay(self, path, align=None):
         # Lazy-import the parser inside the extract path (module isolation contract): pyshp loads
         # only in the render subprocess, never in the NetBox worker.
         try:
@@ -603,23 +863,49 @@ class ShapefileFormat(DrawingFormat):
             shapes = reader.shapes()
         except Exception:
             return None
-        # One fit-to-bounds projector shared by every feature, built from all points at once, so
-        # the whole layer lands in a single frame (see unit_projector). Y is flipped there.
+        # One projector shared by every feature, built from all points at once, so the whole
+        # layer lands in a single frame (see OverlayProjector). Y is flipped there.
         all_points = [pt for shp in shapes for pt in (shp.points or ())]
         if not all_points:
             return None
-        project = unit_projector(all_points)
+        proj = OverlayProjector(all_points, crs=self._crs_kind(path), align=align)
         feats = []
         for i, shp in enumerate(shapes):
             if len(feats) >= self.MAX_FEATURES:
                 break
             props = self._record_props(reader, i)
-            for feat in self._shape_features(shp, project):
+            for feat in self._shape_features(shp, proj.project):
                 feat["props"] = props
                 feats.append(feat)
                 if len(feats) >= self.MAX_FEATURES:
                     break
-        return feats or None
+        if not feats:
+            return None
+        return {"features": feats, **proj.meta()}
+
+    @staticmethod
+    def _crs_kind(path):
+        """The layer's CRS *family* from its sibling `.prj` — "geographic" (lon/lat degrees,
+        gets the equirectangular pre-scale) vs "projected" (planar units), read off the WKT
+        root keyword only (`GEOGCS`/`GEOGCRS` vs `PROJCS`/`PROJCRS`, WKT1 and WKT2 spellings).
+        "unknown" — treated planar — when the `.prj` is absent or unrecognized: guessing
+        geographic from coordinate ranges would misread a small local planar grid, and the
+        cost of "unknown" is only the pre-1.x planar behaviour."""
+        base = os.path.splitext(path)[0]
+        for ext in (".prj", ".PRJ"):
+            try:
+                with open(base + ext, encoding="utf-8", errors="replace") as fh:
+                    head = fh.read(64)
+            except OSError:
+                continue
+            token = head.lstrip("\ufeff").lstrip()
+            token = token.split("[", 1)[0].split("(", 1)[0].strip().upper()
+            if token in ("GEOGCS", "GEOGCRS"):
+                return OverlayProjector.GEOGRAPHIC
+            if token in ("PROJCS", "PROJCRS"):
+                return "projected"
+            return "unknown"
+        return "unknown"
 
     @staticmethod
     def _record_props(reader, i):
@@ -672,11 +958,12 @@ class GeoJsonFormat(DrawingFormat):
     GeoJSON is already installed, so a parse failure is a malformed source, not a missing dep — see
     `preprocess._render_hint`.)
 
-    Coordinates are GeoJSON positions `[lon, lat]` (WGS84), projected into the floor's 0..1 frame
-    with the shared fit-to-bounds `unit_projector` — treated as **planar** (lon→x, lat→y), no CRS
-    reprojection, so a true georeference to the base plan's real-world extent stays a future
-    extension (same convention as Shapefile). `json` is lazy-imported inside `extract_overlay`
-    (module isolation contract), so it loads only in the render subprocess."""
+    Coordinates are GeoJSON positions `[lon, lat]` — WGS84 by spec (RFC 7946), so the layer is
+    always CRS-family **geographic** — projected into the floor's 0..1 frame through the shared
+    `OverlayProjector` (equirectangular pre-scale + fit-to-bounds by default; a control-point
+    georeference when the import map carries `overlayAlign` pairs, FMT-6 — same convention as
+    Shapefile). `json` is lazy-imported inside `extract_overlay` (module isolation contract), so
+    it loads only in the render subprocess."""
 
     name = "geojson"
     exts = (".geojson",)
@@ -701,7 +988,7 @@ class GeoJsonFormat(DrawingFormat):
         s = head.lstrip(b"\xef\xbb\xbf").lstrip()
         return s.startswith(b"{") and b"\x00" not in head
 
-    def extract_overlay(self, path):
+    def extract_overlay(self, path, align=None):
         # Lazy-import inside the extract path (module isolation contract); stdlib, but kept off the
         # module top level so this module stays import-safe for the worker like every handler.
         import json
@@ -711,20 +998,22 @@ class GeoJsonFormat(DrawingFormat):
         except (OSError, ValueError, UnicodeDecodeError):
             return None
         geoms = list(self._iter_geoms(data, {}))
-        # One fit-to-bounds projector shared by every feature, built from all points at once, so
-        # the whole layer lands in a single frame (see unit_projector). Y is flipped there.
+        # One projector shared by every feature, built from all points at once, so the whole
+        # layer lands in a single frame (see OverlayProjector). Y is flipped there.
         all_points = [pt for geom, _ in geoms for pt in self._positions(geom.get("coordinates"))]
         if not all_points:
             return None
-        project = unit_projector(all_points)
+        proj = OverlayProjector(all_points, crs=OverlayProjector.GEOGRAPHIC, align=align)
         feats = []
         for geom, props in geoms:
-            for feat in self._geom_features(geom, project):
+            for feat in self._geom_features(geom, proj.project):
                 feat["props"] = props
                 feats.append(feat)
                 if len(feats) >= self.MAX_FEATURES:
-                    return feats
-        return feats or None
+                    return {"features": feats, **proj.meta()}
+        if not feats:
+            return None
+        return {"features": feats, **proj.meta()}
 
     def _iter_geoms(self, node, props):
         """Flatten a GeoJSON tree into `(geometry, props)` pairs of concrete geometries. Descends
@@ -832,10 +1121,11 @@ class KmlFormat(DrawingFormat):
 
     A `<Placemark>`'s `<Point>`/`<LineString>`/`<LinearRing>`/`<Polygon>`/`<MultiGeometry>` is split
     into point/line/polygon features (one polygon per boundary ring, mirroring how the Shapefile /
-    GeoJSON handlers split a multipart geometry). Coordinates are KML `lon,lat[,alt]` tuples
-    (WGS84), projected into the floor's 0..1 frame with the shared fit-to-bounds `unit_projector` —
-    treated as **planar** (lon→x, lat→y), no CRS reprojection, so a true georeference stays a future
-    extension (same convention as Shapefile/GeoJSON). Namespaces are ignored by matching each tag's
+    GeoJSON handlers split a multipart geometry). Coordinates are KML `lon,lat[,alt]` tuples —
+    WGS84 by spec, so the layer is always CRS-family **geographic** — projected into the floor's
+    0..1 frame through the shared `OverlayProjector` (equirectangular pre-scale + fit-to-bounds by
+    default; a control-point georeference when the import map carries `overlayAlign` pairs, FMT-6 —
+    same convention as Shapefile/GeoJSON). Namespaces are ignored by matching each tag's
     local name (KML tags are namespaced, e.g. `{http://www.opengis.net/kml/2.2}Placemark`).
 
     **Untrusted-XML safety.** KML is the first *real* XML the plugin parses itself (SVG is handled
@@ -864,13 +1154,13 @@ class KmlFormat(DrawingFormat):
         s = head.lstrip(b"\xef\xbb\xbf").lstrip().lower()
         return s.startswith((b"<?xml", b"<kml")) and b"\x00" not in head
 
-    def extract_overlay(self, path):
+    def extract_overlay(self, path, align=None):
         try:
             with open(path, "rb") as fh:
                 data = fh.read()
         except OSError:
             return None
-        return self._features_from_kml(data)
+        return self._features_from_kml(data, align)
 
     @staticmethod
     def _reject_dtd(data):
@@ -900,7 +1190,7 @@ class KmlFormat(DrawingFormat):
                 return                                  # unterminated prolog token -> let ET report it
             i = end + step
 
-    def _features_from_kml(self, data):
+    def _features_from_kml(self, data, align=None):
         # Lazy-import inside the extract path (module isolation contract); stdlib, but kept off the
         # module top level so this module stays import-safe for the worker like every handler.
         import xml.etree.ElementTree as ET
@@ -912,8 +1202,8 @@ class KmlFormat(DrawingFormat):
             # and a pathological one could raise otherwise — any parse failure degrades to None (the
             # "could not read" path), never a crash, like the other overlay decoders.
             return None
-        # Collect (kind, raw_pts, props) across every placemark first, so one fit-to-bounds
-        # projector spans the whole layer (see unit_projector); pts are source (lon, lat).
+        # Collect (kind, raw_pts, props) across every placemark first, so one projector spans
+        # the whole layer (see OverlayProjector); pts are source (lon, lat).
         items = []
         for pm in root.iter():
             if self._local(pm.tag) != "Placemark":
@@ -924,18 +1214,20 @@ class KmlFormat(DrawingFormat):
         all_points = [pt for _, pts, _ in items for pt in pts]
         if not all_points:
             return None
-        project = unit_projector(all_points)
+        proj = OverlayProjector(all_points, crs=OverlayProjector.GEOGRAPHIC, align=align)
         feats = []
         for kind, pts, props in items:
             if kind == "point":
-                feat = {"type": "point", "coords": list(project(*pts[0]))}
+                feat = {"type": "point", "coords": list(proj.project(*pts[0]))}
             else:
-                feat = {"type": kind, "coords": [list(project(x, y)) for x, y in pts]}
+                feat = {"type": kind, "coords": [list(proj.project(x, y)) for x, y in pts]}
             feat["props"] = props
             feats.append(feat)
             if len(feats) >= self.MAX_FEATURES:
                 break
-        return feats or None
+        if not feats:
+            return None
+        return {"features": feats, **proj.meta()}
 
     @staticmethod
     def _local(tag):
@@ -1054,9 +1346,9 @@ class KmzFormat(KmlFormat):
         # (shared with VSDX; routing is by extension). The real validation is the unzip + KML parse.
         return head.startswith(b"PK\x03\x04")
 
-    def extract_overlay(self, path):
+    def extract_overlay(self, path, align=None):
         data = self._read_kml_from_kmz(path)
-        return self._features_from_kml(data) if data is not None else None
+        return self._features_from_kml(data, align) if data is not None else None
 
     def _read_kml_from_kmz(self, path):
         """Return the root KML member's bytes from a `.kmz`, or None when the archive is
@@ -1113,6 +1405,11 @@ DRAWING_EXTS = tuple(ext for fmt in FORMATS if fmt.available() for ext in fmt.ex
 # the primary drawing. Only an *available* format's companions are accepted. Not a source of
 # drawings — never fold this into DRAWING_EXTS.
 COMPANION_EXTS = tuple(ext for fmt in FORMATS if fmt.available() for ext in fmt.companions)
+
+# The OVERLAY-role subset of DRAWING_EXTS — injected into `window.MAP.overlayExts` so the wizard
+# can offer overlay-only affordances (the FMT-6 align editor) without hand-mirroring the registry.
+OVERLAY_EXTS = tuple(ext for fmt in FORMATS
+                     if fmt.available() and fmt.role == OVERLAY for ext in fmt.exts)
 
 
 def companion_owner(ext):

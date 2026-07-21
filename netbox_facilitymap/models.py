@@ -7,11 +7,34 @@ holding the authoritative, relational room geometry bound to a `dcim.Location`; 
 two compose.
 """
 
+from django.conf import settings
 from django.db import models
 from django.urls import reverse
 
 from netbox.models import NetBoxModel
 from netbox.models.features import ChangeLoggingMixin
+
+
+def parse_floor_key(floor_key):
+    """Split a `Room.floor_key` into ``(site_slug, building_slug, floor_slug)`` — the one place
+    that knows the two building-anchor key shapes (MODEL-3), shared by every backend resolver so the
+    convention can't drift.
+
+      * 2-segment ``"<site>/<floor>"``          -> ``(site, '', floor)``  (Site-anchored, today).
+      * 3-segment ``"<site>/<building>/<floor>"`` -> ``(site, building, floor)``  (Location-anchored).
+
+    `site_slug` is always the **first** segment and `floor_slug` the **last**; the building slug (if
+    any) is the second-to-last. Written that way to *tolerate* an unexpected extra segment (deeper
+    nesting is out of scope, but the parser must not choke on it — BUILDING-ANCHOR-DESIGN §8 open-q 2)
+    rather than hard-coding "exactly 3". A malformed key (fewer than 2 segments) yields
+    ``('', '', '')`` so callers uniformly reject it by an empty `site`/`floor`."""
+    parts = floor_key.split('/')
+    if len(parts) < 2:
+        return ('', '', '')
+    site_slug = parts[0]
+    floor_slug = parts[-1]
+    building_slug = parts[-2] if len(parts) >= 3 else ''
+    return (site_slug, building_slug, floor_slug)
 
 
 class FacilityMapBlob(ChangeLoggingMixin, models.Model):
@@ -70,6 +93,10 @@ class FacilityMapBlob(ChangeLoggingMixin, models.Model):
     # or `dcim.SiteGroup` slug once multi-facility ships; 120 leaves room for an optional
     # "<type>:<slug>" prefix to disambiguate a Region and SiteGroup sharing a slug.
     facility = models.CharField(max_length=120, blank=True, default='')
+    # Per-floor shard discriminator, orthogonal to `facility` (MULTI-1). '' for the facility-wide
+    # single-row kinds (`siteplan`/`settings`); the `floor_key` (`"<site.slug>/<floor.id>"`) for the
+    # per-floor kinds (`annotations`/`placements`/`layouts`), so a different-floor save conflicts
+    # only on its own floor (CONC-1). 120 matches `Room.floor_key`, so any floor_key fits.
     key = models.CharField(max_length=120, blank=True, default='')
     data = models.JSONField(default=dict)
     updated = models.DateTimeField(auto_now=True)
@@ -116,13 +143,34 @@ class Room(NetBoxModel):
     `Room` is the source of truth for room geometry: `AnnotationsView` composes these
     rows back into the whole-document annotations shape on GET and decomposes a POSTed
     document into rows, so the framework-free frontend round-trips byte-for-byte.
+
+    `Room` is also exposed over the NetBox REST API (`api/`), but the **map editor stays
+    authoritative for a floor's room set**: a row *created* through REST is swept by the next
+    editor Save of that floor (`frontend_api.sync_rooms`, `restrict(user,'delete')`-scoped), since
+    that POST is the floor's authoritative snapshot and the editor can't tell a REST-authored room
+    from one the user deleted. REST writes are durable when they edit `label`/`location`/`tags` on
+    rooms the editor already owns — see the sweep-on-save caveat in `api/serializers.py`.
     """
 
-    # "<dir>/<floorId>" — the annotations document key (== "<site.slug>/<floorLocation.slug>").
+    # "<dir>/<floorId>" — the annotations document key. Two shapes (building anchor, MODEL-3),
+    # told apart by segment count via `parse_floor_key`:
+    #   * Site-anchored (the building *is* a Site):     "<site.slug>/<floorLocation.slug>" — 2 segments.
+    #   * Location-anchored (Site=campus, building is a  "<site.slug>/<buildingLocation.slug>/<floorLocation.slug>"
+    #     Location under it):                            — 3 segments, only ever written by a fresh
+    #                                                      Site=campus import.
+    # `<site.slug>` is always segment 1, so `facilities.facility_floor_scope`'s startswith-prefix
+    # scoping and the SEC-1 media gate stay correct for both. Older installs keep their exact
+    # 2-segment keys untouched — the scheme is additive, no data migration (see BUILDING-ANCHOR-DESIGN).
     floor_key = models.CharField(max_length=120)
     # The editor's per-room uid (e.g. "rabc1234"); stable identity for upsert within a floor.
     room_id = models.CharField(max_length=40)
     label = models.CharField(max_length=200, blank=True)
+    # Free-text search synonyms so wayfinding search matches what's *printed on the floor plan* (a
+    # room number `2107`) even when the bound Location uses a different scheme (`IDF-2A`) — NAV-18.
+    # Comma/newline-separated; a **search aid only**, never drawn (floor rooms stay unlabelled, §10),
+    # so it's distinct from `label` (the on-plan label). Both finder tiers match it: the client-side
+    # placed index (`Store.searchTargets`) and the server `NbInventoryView` unplaced search.
+    alias = models.TextField(blank=True, default='')
     polygon = models.JSONField(default=list)  # [[nx, ny], ...] normalized 0..1
     # The bound *room* Location (a child of the floor Location). Null = unbound.
     location = models.ForeignKey(
@@ -153,3 +201,72 @@ class Room(NetBoxModel):
         if self.location_id:
             return self.location.get_absolute_url()
         return reverse('plugins:netbox_facilitymap:map')
+
+
+class RoomTodo(ChangeLoggingMixin, models.Model):
+    """One to-do item attached to a floor-plan room (the floor to-do list feature).
+
+    The floor page carries a per-room to-do list: a note the user can walk through the
+    Planned → In progress → Completed workflow. Each note is one of these rows, tied to the
+    `Room` it belongs to. The frontend `FloorTodo` panel groups them by room and buckets the
+    completed ones into a per-room "Completed" subfolder; a completed item is *kept* (not
+    deleted) until the user explicitly clears it, so this is durable user data.
+
+    **Resync-safety (the reason it's an FK to `Room`, not a loose `(floor_key, room_id)`).**
+    `frontend_api.sync_rooms` is authoritative for room geometry, but it **upserts** rows with
+    `update_or_create(floor_key, room_id)`, so a room's PK is stable across every editor save —
+    the FK below survives a resync untouched. `on_delete=CASCADE` means a to-do disappears only
+    when its room is *genuinely* removed from the floor (its polygon deleted), which is the
+    correct lifecycle: a note for a room that no longer exists has no home. `sync_rooms` scopes
+    its deletes with `.restrict(user, 'delete')`, so only rooms the caller may delete — and thus
+    only their to-dos — are ever removed.
+
+    Besides the `text` and its workflow `status`, a to-do carries the scheduling detail the panel
+    shows: a `priority`, free-text `notes`, a `due` date, and its `assignees`. Assignment is
+    **many-to-many** — a job is routinely shared — so `assignees` points at NetBox's user model via
+    `settings.AUTH_USER_MODEL` (NetBox swaps in its own `users.User`; never hard-code `auth.User`).
+    The M2M is an assignment record and nothing more: it uses `related_name='+'` because no code
+    walks from a user back to their to-dos, and deleting a user drops their through-table rows while
+    the to-do itself survives — an unassigned to-do is still a job that needs doing.
+
+    Like `FacilityMapBlob`, it carries `ChangeLoggingMixin` (change logging only, not the full
+    `NetBoxModel` stack) so every to-do write lands in the global Change Log; the mixin also
+    supplies the `created`/`last_updated` timestamps the ordering and the API serialization use.
+    To-dos are edited only through the plugin's own permission-gated JSON endpoints (writes gate
+    on `change_facilitymapblob`), never a generic NetBox object UI, so they need no nav/table/REST
+    surface of their own.
+    """
+
+    STATUS_PLANNED = 'planned'
+    STATUS_IN_PROGRESS = 'in_progress'
+    STATUS_COMPLETED = 'completed'
+    STATUS_CHOICES = (
+        (STATUS_PLANNED, 'Planned'),
+        (STATUS_IN_PROGRESS, 'In progress'),
+        (STATUS_COMPLETED, 'Completed'),
+    )
+
+    PRIORITY_HIGH = 'high'
+    PRIORITY_MED = 'med'
+    PRIORITY_LOW = 'low'
+    PRIORITY_CHOICES = (
+        (PRIORITY_HIGH, 'High'),
+        (PRIORITY_MED, 'Medium'),
+        (PRIORITY_LOW, 'Low'),
+    )
+
+    room = models.ForeignKey('Room', on_delete=models.CASCADE, related_name='todos')
+    text = models.CharField(max_length=500)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PLANNED)
+    priority = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default=PRIORITY_MED)
+    assignees = models.ManyToManyField(settings.AUTH_USER_MODEL, blank=True, related_name='+')
+    notes = models.TextField(blank=True, default='')
+    due = models.DateField(null=True, blank=True)
+
+    class Meta:
+        # Oldest-first within a room (a to-do list reads top-down in creation order); the `id`
+        # tiebreak keeps items added in the same second stably ordered.
+        ordering = ['created', 'id']
+
+    def __str__(self):
+        return self.text

@@ -2,9 +2,11 @@
 
 `FloorRooms` injects a floor-plan + room-polygon panel on a `dcim.Location` page (below);
 `SiteFloors` injects a floor-picker grid on a `dcim.Site` page (mirroring the SPA's building
-view); `ObjectPlacement` injects the *reverse link* on a `dcim.device`/`dcim.rack` page — the
-cropped room embed showing where that object sits on the plan. All read the same runtime render
-artifacts and degrade to no panel when absent.
+view) and `BuildingFloors` injects the same grid on a `dcim.Location` page when that Location is a
+building anchor (Site = campus, MODEL-3), the two sharing `_floor_picker_cards`; `ObjectPlacement`
+injects the *reverse link* on a `dcim.device`/`dcim.rack` page — the cropped room embed showing
+where that object sits on the plan. All read the same runtime render artifacts and degrade to no
+panel when absent.
 
 `FloorRooms` and `ObjectPlacement` share the `RoomPanelExtension` base's `_panel` renderer; they
 differ only in how they resolve the `(floor_key, room)` to draw.
@@ -12,10 +14,11 @@ differ only in how they resolve the `(floor_key, room)` to draw.
 `RoomPanelExtension` / `FloorRooms` — floor plan + room polygons on a NetBox Location page.
 
 A `PluginTemplateExtension` injects a panel onto the `dcim.Location` detail page. When the
-Location is a *floor* — i.e. `floor_key == "<site.slug>/<location.slug>"` has a rendered
-plan — the panel draws that floor's plan image (all sheets, tiled) overlaid with any room
-polygons (each linking to its bound room Location). Rooms drive NetBox-native rendering and
-are object-permission scoped via `Room.objects.restrict(...)`.
+Location is a *floor* — i.e. its `floor_key` (`"<site.slug>/<location.slug>"`, or
+`"<site.slug>/<building.slug>/<location.slug>"` under a Location-anchored building, MODEL-3)
+has a rendered plan — the panel draws that floor's plan image (all sheets, tiled) overlaid
+with any room polygons (each linking to its bound room Location). Rooms drive NetBox-native
+rendering and are object-permission scoped via `Room.objects.restrict(...)`.
 
 Room geometry is normalized 0..1 over the floor's *combined* canvas; `previews.floor_sheets`
 resolves that canvas (tiling every sheet at its grid cell, mirroring the editor) and returns
@@ -31,13 +34,13 @@ from django.urls import reverse
 from dcim.models import Location, Rack
 from netbox.plugins import PluginTemplateExtension
 
-from . import capabilities
+from . import capabilities, health
 from .access import may_view_map, may_view_map_for_site
 from .facilities import facility_for_site
 from .models import Room
 from .previews import (
-    ORIENTATION_ASPECT, RoomEmbedSettings, floor_sheets, placement_for_object, placement_markers,
-    room_arrows, room_viewbox,
+    ORIENTATION_ASPECT, RoomEmbedSettings, contained_map, evenodd_path, floor_sheets,
+    placement_for_object, placement_markers, room_arrows, room_viewbox, sheet_bounds_for_room,
 )
 from .storage import media_url, read_manifest
 
@@ -49,7 +52,8 @@ class RoomPanelExtension(PluginTemplateExtension):
     single renderer both `FloorRooms` (Location pages) and `ObjectPlacement` (device/rack pages)
     delegate to once they've resolved which floor + rooms to draw."""
 
-    def _panel(self, floor_key, rooms, crop_to, user, title='Facility Map — Rooms', facility=''):
+    def _panel(self, floor_key, rooms, crop_to, user, title='Facility Map — Rooms', facility='',
+               all_rooms=None, focus=None):
         """Render the panel for `rooms` over their floor's plan image (all sheets, tiled).
         `crop_to` (a single Room) zooms the SVG `viewBox` to that room's bounding box, drops
         the per-room cross-links and draws the rack/device markers; `None` keeps the
@@ -58,19 +62,33 @@ class RoomPanelExtension(PluginTemplateExtension):
         markers' rack/device detail links. `title` is the card header (defaults to the Location
         page's wording; the device/rack embed passes a plainer "Facility Map"). `facility` (the
         object's facility, resolved by the caller from its site) scopes the manifest/blob reads.
+        `all_rooms` (defaults to `rooms`) is the floor's full room set, used **only** as the
+        candidate pool for the contained-room subtraction below — the single-room embed draws
+        just `[crop_to]`, so it passes the whole floor here to find the siblings sitting inside it.
+        `focus` (a normalized `(x, y)`, only from the device/rack embed) reframes the crop on the
+        device's own marker instead of the room centroid, cropped tighter for a legible glyph
+        (SHOW-3); the room-page embed passes `None` and keeps its room-centred, zoomable crop.
         Returns '' when `floor_key` has no rendered plan, so non-floor Locations show nothing."""
         geom = floor_sheets(floor_key, facility)
         if not geom:
             return ''
         w, h = geom['w'], geom['h']
 
+        # When a smaller room sits fully inside a larger one, punch the smaller room's area out of
+        # the larger room's highlight (and its spotlight hole) so it doesn't double-paint over it.
+        # A render-time, derived relationship (stacking isn't modelled) — `contained_map` returns
+        # each room's contained siblings' polygons, drawn as inner rings of an evenodd `<path>`.
+        holes = contained_map(all_rooms if all_rooms is not None else rooms)
+
         shapes = []
         for room in rooms:
-            pts = ' '.join(f'{x * w:.1f},{y * h:.1f}' for x, y in (room.polygon or []))
-            if not pts:
+            # Outer ring = the room's own polygon; inner rings = any contained smaller rooms,
+            # punched out under `fill-rule="evenodd"` in the template.
+            path = evenodd_path([room.polygon or []] + holes.get(room.room_id, []), w, h)
+            if not path:
                 continue
             shapes.append({
-                'points': pts,
+                'path': path,
                 'label': room.label or room.room_id,
                 # Cross-link to the room's Location only on the floor view; on the room's own
                 # page a self-link would be noise.
@@ -86,10 +104,12 @@ class RoomPanelExtension(PluginTemplateExtension):
         # (a spotlight mask, drawn in the template) so the room reads unambiguously even
         # though the zoomed crop pulls neighbouring rooms into the raster image. Scaled by
         # the same combined-canvas w×h as the shapes; only set when cropping to a room with
-        # geometry — the whole-floor view never dims.
+        # geometry — the whole-floor view never dims. Any smaller room contained in this one is
+        # punched out of the lit hole (evenodd), so a contained office stays dimmed too — it
+        # reads as "not part of this room", matching the highlight subtraction above.
         spotlight = ''
         if crop_to and crop_to.polygon:
-            spotlight = ' '.join(f'{x * w:.1f},{y * h:.1f}' for x, y in crop_to.polygon)
+            spotlight = evenodd_path([crop_to.polygon] + holes.get(crop_to.room_id, []), w, h)
 
         # Deep-link the panel title into the SPA (see `_deep_link`).
         map_url = self._deep_link(floor_key, crop_to, facility)
@@ -107,7 +127,16 @@ class RoomPanelExtension(PluginTemplateExtension):
             embed = RoomEmbedSettings()
             embed_aspect = ORIENTATION_ASPECT[embed.orientation]
             embed_size = embed.size
-            viewbox = room_viewbox(crop_to.polygon, w, h, zoom=embed.zoom, aspect=embed_aspect)
+            # On a multi-sheet floor, scope the crop to the room's own sheet cell so the embed
+            # doesn't frame against — and reveal — the other page(s). `None` on single-sheet
+            # floors leaves the crop against the whole canvas, unchanged.
+            bounds = sheet_bounds_for_room(crop_to.polygon, geom['sheets'], w, h)
+            # `focus` (device/rack embed only) reframes the crop on the device's own marker and
+            # crops tighter for a legible glyph; the room embed passes `focus=None` (room-centred,
+            # honouring `zoom`). Orientation/footprint apply to both — only the crop centre + span
+            # diverge.
+            viewbox = room_viewbox(crop_to.polygon, w, h, zoom=embed.zoom, aspect=embed_aspect,
+                                   bounds=bounds, focus=focus)
         else:
             viewbox = None
 
@@ -166,6 +195,13 @@ class RoomPanelExtension(PluginTemplateExtension):
         seg = crop_to.location.slug if crop_to.location_id else crop_to.room_id
         return f'{base}{prefix}/r/{dir_q}/{fid_q}/{quote(str(seg), safe="")}'
 
+    def _unresolved_panel(self):
+        """Render the "floor plan unavailable" explanation shown in place of a silently-blank floor
+        panel when the floor's plan key has drifted out of resolution (HEALTH-5). Its caller decides
+        *whether* the blank is a drifted floor (via `health.floor_plan_drift`); this just draws the
+        message. Self-contained/inline-styled like `floor_rooms.html` — no plugin CSS on dcim pages."""
+        return self.render('netbox_facilitymap/floor_unresolved.html')
+
 
 class FloorRooms(RoomPanelExtension):
     # Plural `models` is the NetBox 4.x API (the legacy singular `model` was removed);
@@ -193,38 +229,62 @@ class FloorRooms(RoomPanelExtension):
         room = (Room.objects.restrict(request.user, 'view')
                 .filter(location=loc).select_related('location').first())
         if room:
+            # The floor's other rooms (permission-scoped) are the candidate pool for punching a
+            # contained smaller room out of this room's highlight/spotlight — the embed itself
+            # draws only `[room]`, so it wouldn't otherwise know about the siblings sitting inside.
+            floor_rooms = list(Room.objects.restrict(request.user, 'view')
+                               .filter(floor_key=room.floor_key))
             return self._panel(room.floor_key, [room], crop_to=room, user=request.user,
-                               facility=facility)
+                               facility=facility, all_rooms=floor_rooms)
 
         # Otherwise this Location *is a floor* → show every room on the floor, uncropped, each
         # linking to its own room Location. Rooms are matched by the rename-proof `floor_location`
         # FK (BIND-1), not by reconstructing `f'{site.slug}/{loc.slug}'`, so a renamed Site/floor
         # Location keeps resolving its rooms. The plan image still keys off `floor_key` (the
         # manifest/disk key), taken from a matched room; an empty floor has no room to borrow it
-        # from, so it falls back to the slug key — preserving today's plan render for a floor with
-        # no rooms drawn (a rename can still break that empty-floor panel, but no room data is at
-        # risk, and `health` surfaces the drift).
+        # from, so it falls back to a reconstructed slug key — preserving today's plan render for a
+        # floor with no rooms drawn (a rename can still break that empty-floor panel, but no room
+        # data is at risk, and `health` surfaces the drift).
         site = getattr(loc, 'site', None)
         if not site:
             return ''
         rooms = list(
             Room.objects.restrict(request.user, 'view')
             .filter(floor_location=loc).select_related('location'))
-        floor_key = rooms[0].floor_key if rooms else f'{site.slug}/{loc.slug}'
-        # `_panel` returns '' when `floor_key` has no rendered plan (i.e. not a floor at all).
-        return self._panel(floor_key, rooms, crop_to=None, user=request.user, facility=facility)
+        if rooms:
+            floor_key = rooms[0].floor_key
+        elif loc.parent_id:
+            # Location-anchored (Site=campus, MODEL-3): under this topology a floor Location's own
+            # parent *is* its building anchor (mirrors how `BuildingFloors`/`_resolve_floor_location`
+            # key building-anchored floors), so the reconstructed key needs that 3rd segment — a
+            # Site-anchored floor has no parent and keeps the plain 2-segment key below.
+            floor_key = f'{site.slug}/{loc.parent.slug}/{loc.slug}'
+        else:
+            floor_key = f'{site.slug}/{loc.slug}'
+        # `_panel` returns '' when `floor_key` has no rendered plan — which covers BOTH a Location
+        # that isn't a floor at all (legitimately blank) and a floor whose plan key drifted out of
+        # resolution (a Site/floor rename a bulk-edit/manual DB write left un-remapped, the residue
+        # HEALTH-4's signal can't catch). For the second case, explain the blank to the user rather
+        # than showing nothing; `health.floor_plan_drift` distinguishes it from the non-floor case,
+        # so the message never lands on a Location that was never a floor.
+        panel = self._panel(floor_key, rooms, crop_to=None, user=request.user, facility=facility)
+        if not panel and health.floor_plan_drift(loc):
+            return self._unresolved_panel()
+        return panel
 
 
 class ObjectPlacement(RoomPanelExtension):
     """Reverse-link "show on map" panel on a `dcim.device` / `dcim.rack` page (vs `FloorRooms`).
 
-    From an object's detail page, resolve *where it sits on the plan* and draw the same cropped
-    single-room embed the room's Location page shows. `previews.placement_for_object` does the
-    object → `(floor_key, room_id)` lookup (a rack matches its own placement; a racked device
-    resolves via its rack when it has no direct placement of its own); we then resolve that
-    `room_id` back to a `Room`, **permission-scoped**, and delegate to the shared `_panel`. Any
-    miss — unplaced object, no such room, room not viewable, or no rendered plan — yields no panel,
-    exactly as the sibling extensions degrade.
+    From an object's detail page, resolve *where it sits on the plan* and draw the cropped
+    single-room embed, **framed on the object's own marker** rather than the room centroid the
+    room's Location page uses — so the device reads legibly instead of being lost in a large room
+    (SHOW-3). `previews.placement_for_object` does the object → `(floor_key, room_id, focus)` lookup
+    (a rack matches its own placement; a racked device resolves via its rack when it has no direct
+    placement of its own, framing on the rack); we then resolve that `room_id` back to a `Room`,
+    **permission-scoped**, and delegate to the shared `_panel` with `focus`. Any miss — unplaced
+    object, no such room, room not viewable, or no rendered plan — yields no panel, exactly as the
+    sibling extensions degrade.
     """
 
     # Plural `models` is the NetBox 4.x API (the legacy singular `model` was removed).
@@ -252,7 +312,10 @@ class ObjectPlacement(RoomPanelExtension):
             match = placement_for_object('device', obj.pk, rack_pk=obj.rack_id, facility=facility)
         if not match:
             return ''
-        floor_key, room_id = match
+        # `focus` is the placed object's own normalized marker centre (the rack's, when a racked
+        # device resolves via its cabinet) — passed to `_panel` so the embed frames on the device
+        # itself, cropped tight, rather than the whole room the room-page embed shows (SHOW-3).
+        floor_key, room_id, focus = match
 
         # Resolve the placement's room back to a viewable Room — a miss (deleted room, or one the
         # user may not view) shows nothing rather than leaking a room the caller can't otherwise see.
@@ -260,12 +323,51 @@ class ObjectPlacement(RoomPanelExtension):
                 .filter(floor_key=floor_key, room_id=room_id).select_related('location').first())
         if not room:
             return ''
+        # The floor's other rooms (permission-scoped) let `_panel` subtract a contained smaller
+        # room from this room's highlight/spotlight; the embed itself draws only `[room]`.
+        floor_rooms = list(Room.objects.restrict(request.user, 'view').filter(floor_key=floor_key))
         return self._panel(floor_key, [room], crop_to=room, user=request.user, title='Facility Map',
-                           facility=facility)
+                           facility=facility, all_rooms=floor_rooms, focus=focus)
+
+
+def _floor_picker_cards(buildings, floor_locs, facility, built, user):
+    """The floor-picker cards shared by `SiteFloors` (dcim.site, Site-anchored) and `BuildingFloors`
+    (dcim.location, Location-anchored): one card per rendered floor — thumbnail, label, a room-count
+    badge and a sheet-count badge — each linking to that floor's own NetBox Location page.
+
+    `buildings` are the manifest building entries for the anchor; `floor_locs` maps a floor id
+    (== the floor Location's `slug`) to that `dcim.Location` for the card link. Room counts come from
+    ONE grouped, `.restrict(user,'view')`-scoped query rather than a COUNT per card, keyed off
+    `building['dir']` — which is `<siteSlug>` for a Site-anchored building and
+    `<siteSlug>/<buildingSlug>` for a Location-anchored one, so the count is correct for both the
+    2-segment and 3-segment `floor_key` shapes (MODEL-3). Floors with no rooms simply don't appear
+    in the grouped result and fall back to 0."""
+    floor_keys = [f"{building['dir']}/{floor['id']}"
+                  for building in buildings
+                  for floor in building.get('floors', [])]
+    room_counts = {r['floor_key']: r['n'] for r in
+                   Room.objects.restrict(user, 'view')
+                   .filter(floor_key__in=floor_keys)
+                   .values('floor_key').annotate(n=Count('id'))}
+
+    cards = []
+    for building in buildings:
+        for floor in building.get('floors', []):
+            loc = floor_locs.get(floor['id'])
+            cards.append({
+                # Card-sized `thumb` when the manifest has one (builds since 1.44.0);
+                # fall back to the full-res plan for older manifests.
+                'image': media_url(floor.get('thumb') or floor.get('image'), facility, built),
+                'label': floor.get('label') or floor['id'],
+                'url': loc.get_absolute_url() if loc else '',
+                'rooms': room_counts.get(f"{building['dir']}/{floor['id']}", 0),
+                'sheets': len(floor.get('pages') or []),
+            })
+    return cards
 
 
 class SiteFloors(PluginTemplateExtension):
-    """Embed a building's floor picker on its NetBox `dcim.Site` page.
+    """Embed a building's floor picker on its NetBox `dcim.Site` page (the Site-anchored surface).
 
     Here a Site *is* one building, so this mirrors the SPA's building view
     (`App.renderBuilding`): a grid of floor cards — thumbnail, label, a room-count badge and a
@@ -274,6 +376,10 @@ class SiteFloors(PluginTemplateExtension):
     whose `slug` is the floor id), keeping the user in NetBox where `FloorRooms` then draws the
     plan. The manifest is a runtime render artifact, so a missing/unreadable manifest (or a
     Site with no matching rendered building) yields no panel rather than an empty grid.
+
+    The Location-anchored counterpart (Site = campus, building is a `dcim.Location`) is
+    `BuildingFloors`, which sits on the `dcim.location` page; both build their cards through the
+    shared `_floor_picker_cards`.
     """
 
     models = ['dcim.site']
@@ -303,36 +409,69 @@ class SiteFloors(PluginTemplateExtension):
             return ''
 
         # Floor Locations under this Site, keyed by slug (== floor id), for the card links.
-        locs = {l.slug: l for l in
-                Location.objects.restrict(request.user, 'view').filter(site=site)}
+        floor_locs = {l.slug: l for l in
+                      Location.objects.restrict(request.user, 'view').filter(site=site)}
+        cards = _floor_picker_cards(buildings, floor_locs, facility,
+                                    manifest.get('built'), request.user)
+        if not cards:
+            return ''
 
-        # Room counts for every floor card in ONE grouped query rather than a COUNT per card
-        # (F floors → F queries on every Site page load). `.restrict(user,'view')` keeps the
-        # counts object-permission scoped, exactly as the old per-card count did; floors with
-        # no rooms simply don't appear in the result and fall back to 0 below.
-        floor_keys = [f"{site.slug}/{floor['id']}"
-                      for building in buildings
-                      for floor in building.get('floors', [])]
-        room_counts = {r['floor_key']: r['n'] for r in
-                       Room.objects.restrict(request.user, 'view')
-                       .filter(floor_key__in=floor_keys)
-                       .values('floor_key').annotate(n=Count('id'))}
+        return self.render('netbox_facilitymap/site_floors.html',
+                           extra_context={'cards': cards})
 
-        built = manifest.get('built')
-        cards = []
-        for building in buildings:
-            for floor in building.get('floors', []):
-                loc = locs.get(floor['id'])
-                rooms = room_counts.get(f"{site.slug}/{floor['id']}", 0)
-                cards.append({
-                    # Card-sized `thumb` when the manifest has one (builds since 1.44.0);
-                    # fall back to the full-res plan for older manifests.
-                    'image': media_url(floor.get('thumb') or floor.get('image'), facility, built),
-                    'label': floor.get('label') or floor['id'],
-                    'url': loc.get_absolute_url() if loc else '',
-                    'rooms': rooms,
-                    'sheets': len(floor.get('pages') or []),
-                })
+
+class BuildingFloors(PluginTemplateExtension):
+    """Embed a building's floor picker on its NetBox `dcim.Location` page (the Location-anchored
+    surface — MODEL-3 / BUILDING-ANCHOR-DESIGN §4.5).
+
+    Under Site = campus a building is a `dcim.Location`, not a Site, so its home page is the
+    Location page and its floors are that Location's **child** Locations. This mirrors `SiteFloors`
+    — the same card grid, via the shared `_floor_picker_cards` — but matches the manifest building
+    whose `(siteSlug, buildingSlug)` anchor is this Location, keys off the 3-segment `floor_key`,
+    and links each card to the floor Location beneath the building. A Site-anchored building never
+    carries a `buildingSlug`, so it never matches here and stays on `SiteFloors`. A missing/
+    unreadable manifest, or a Location that is not a building anchor, yields no panel.
+    """
+
+    models = ['dcim.location']
+
+    def full_width_page(self):
+        loc = self.context['object']
+        request = self.context['request']
+
+        # Same gate as FloorRooms, NOT SiteFloors' plain `may_view_map`: the page object here is the
+        # building Location, so its Site is not implicitly `.restrict()`-ed by reaching this page,
+        # and the floor thumbnails stream through the SEC-1 per-Site media gate
+        # (`images/<siteSlug>/<buildingSlug>/…`). A user who may see this Location but not its Site
+        # gets no grid rather than broken tiles.
+        site = getattr(loc, 'site', None)
+        if not may_view_map_for_site(request.user, site):
+            return ''
+        if site is None:
+            return ''
+
+        # This building's facility (its Site's SiteGroup/Region) scopes the manifest + media.
+        facility = facility_for_site(site)
+        manifest = read_manifest(facility)
+        if manifest is None:
+            return ''
+
+        # A manifest building is anchored to THIS Location iff its (optional) `buildingSlug` is this
+        # Location's slug AND its pure `siteSlug` is this Location's Site — `buildingSlug` is
+        # namespaced under the Site, so both must agree. Site-anchored buildings have no
+        # `buildingSlug` and so never match, keeping this surface Location-anchored only.
+        buildings = [b for b in manifest.get('buildings', [])
+                     if b.get('buildingSlug') == loc.slug and b.get('siteSlug') == site.slug]
+        if not buildings:
+            return ''
+
+        # Floors are this building Location's child Locations, keyed by slug (== floor id). Two
+        # buildings under one campus can share a floor slug, so scoping to `parent=loc` (not
+        # `site=site`) is what picks *this* building's floors for the card links.
+        floor_locs = {l.slug: l for l in
+                      Location.objects.restrict(request.user, 'view').filter(parent=loc)}
+        cards = _floor_picker_cards(buildings, floor_locs, facility,
+                                    manifest.get('built'), request.user)
         if not cards:
             return ''
 
@@ -344,4 +483,5 @@ class SiteFloors(PluginTemplateExtension):
 # framework, ADDON-2): a capability that overlays its own panel on a NetBox page adds its
 # `PluginTemplateExtension`s via `template_extensions()` rather than editing this list. Empty until
 # a feature capability ships one.
-template_extensions = [FloorRooms, SiteFloors, ObjectPlacement] + capabilities.all_template_extensions()
+template_extensions = ([FloorRooms, SiteFloors, BuildingFloors, ObjectPlacement]
+                       + capabilities.all_template_extensions())
