@@ -22,7 +22,8 @@
         <circle cx="{{ g.cx }}" cy="{{ g.cy }}" r="{{ g.r }}"
                 vector-effect="non-scaling-stroke" style="{{ g.style }}"/>
       {% elif g.tag == 'path' %}
-        <path d="{{ g.d }}" vector-effect="non-scaling-stroke" style="{{ g.style }}"/>
+        <path d="{{ g.d }}"{% if g.transform %} transform="{{ g.transform }}"{% endif %}
+              vector-effect="non-scaling-stroke" style="{{ g.style }}"/>
       {% endif %}
     {% endfor %}
     {% if m.label %}

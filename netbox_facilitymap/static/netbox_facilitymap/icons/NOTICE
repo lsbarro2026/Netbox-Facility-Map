@@ -1,15 +1,20 @@
 Vendored UI icons — Lucide (https://lucide.dev, https://github.com/lucide-icons/lucide)
 
 These SVGs are copied unmodified from the Lucide icon set and bundled here so the
-plugin ships fully offline (no CDN, no npm/build step — see CLAUDE.md coding
-standard #3). Lucide is ISC-licensed; some glyphs derive from Feather (MIT). The
-full upstream license text is vendored alongside as ./LICENSE.
+plugin ships fully offline (no CDN, no npm/build step — the plugin has no runtime
+dependency on anything outside NetBox itself). Lucide is ISC-licensed; some glyphs
+derive from Feather (MIT). The full upstream license text is vendored alongside as
+./LICENSE.
 
 The frontend does NOT load these files at runtime. Their path bodies are inlined
-verbatim into the `Icons` static class (static/netbox_facilitymap/lib.js), which
-returns each glyph as an SVG string on Lucide's native 24×24 viewBox. These files
-are the auditable source of truth for those inlined paths — regenerate the getter
-after replacing an icon here. Keep this map in sync with `Icons`:
+verbatim — into the `Icons` static class (static/netbox_facilitymap/lib.js), for UI
+chrome, AND into `DeviceShapes` (static/netbox_facilitymap/device-shapes.js + its
+server-side mirror device_shapes.py), for the schematic device markers whose role
+maps cleanly to a Lucide glyph. Each returns the glyph on Lucide's native 24×24
+viewBox. These files are the auditable source of truth for those inlined paths —
+regenerate the consumer after replacing an icon here.
+
+Keep this map in sync with `Icons`:
 
   Icons getter   Lucide source file
   ------------   ------------------
@@ -35,7 +40,21 @@ after replacing an icon here. Keep this map in sync with `Icons`:
   download       download.svg
   print          printer.svg
   info           info.svg
+  help           circle-help.svg     (the editors' keyboard/mouse shortcuts panel toggle)
   sliders        sliders-horizontal.svg
   chevron        chevron-right.svg   (used generically as a caret, not just "next")
   todo           list-todo.svg
   wifi           wifi.svg
+  more           ellipsis-vertical.svg   (the toolbar's "…" overflow-menu trigger)
+  building       building-2.svg          (the topbar facility picker)
+
+Keep this map in sync with `DeviceShapes._lucide` / `DeviceShapes._LUCIDE` (device
+marker glyphs; other device types are bespoke schematics, not vendored icons):
+
+  DeviceShapes type   Lucide source file
+  -----------------   ------------------
+  server              server.svg
+  router              router.svg
+  firewall            brick-wall-shield.svg
+  storage             hard-drive.svg
+  ups                 battery-charging.svg

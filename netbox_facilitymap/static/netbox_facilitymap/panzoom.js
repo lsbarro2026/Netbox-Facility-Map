@@ -16,14 +16,17 @@
    from live bounding rects, so no layout/margin bookkeeping is needed. */
 
 class PanZoom {
+  static ZOOM_FLOOR_FACTOR = 0.85;   // zoom floor, as a fraction of the whole-wrap fit scale
+  static ZOOM_CEILING = 8;           // zoom ceiling (absolute, or ×fit if that's larger)
+
   constructor() {
     this.wrap = null;        // the transformed .map-wrap
     this.container = null;    // the .map-viewport clip box (the viewport)
     this.tx = 0;              // translation x, screen px
     this.ty = 0;              // translation y, screen px
     this.k = 1;               // scale factor
-    this.minScale = 0.05;     // zoom floor: 0.85× the whole-wrap fit (set by _setRange)
-    this.maxScale = 8;        // zoom ceiling (set with minScale by _setRange)
+    this.minScale = 0.05;     // zoom floor: ZOOM_FLOOR_FACTOR× the whole-wrap fit (set by _setRange)
+    this.maxScale = PanZoom.ZOOM_CEILING;   // zoom ceiling (set with minScale by _setRange)
     this.onScale = null;      // optional hook(k) fired when the scale changes (not on pure pans)
     this._lastK = null;       // last scale onScale saw, so a pan (k unchanged) doesn't re-fire it
   }
@@ -50,12 +53,12 @@ class PanZoom {
     if (this.onScale && this.k !== this._lastK) { this._lastK = this.k; this.onScale(this.k); }
   }
 
-  /** Set the zoom range. Floor = 0.85× the whole-wrap fit: a full zoom-out shows the
-   *  entire map plus a small margin and stops there, rather than shrinking the fixed-
-   *  resolution raster below the fit into minification blur. Ceiling 8×. */
+  /** Set the zoom range. Floor = ZOOM_FLOOR_FACTOR× the whole-wrap fit: a full zoom-out shows
+   *  the entire map plus a small margin and stops there, rather than shrinking the fixed-
+   *  resolution raster below the fit into minification blur. Ceiling ZOOM_CEILING×. */
   _setRange(fit) {
-    this.minScale = fit * 0.85;
-    this.maxScale = Math.max(fit * 8, 8);
+    this.minScale = fit * PanZoom.ZOOM_FLOOR_FACTOR;
+    this.maxScale = Math.max(fit * PanZoom.ZOOM_CEILING, PanZoom.ZOOM_CEILING);
   }
 
   /** Scale the whole map to fit the viewport and centre it. Sets the zoom range.
@@ -77,8 +80,8 @@ class PanZoom {
   }
 
   /** Fit a normalized sub-rectangle [nx0,ny0 … nx1,ny1] of the wrap into the
-   *  viewport and centre it. The zoom *floor* is 0.85× the whole-wrap fit (independent
-   *  of this framed opening scale), so zooming out reveals everything plus a small margin
+   *  viewport and centre it. The zoom *floor* is ZOOM_FLOOR_FACTOR× the whole-wrap fit
+   *  (independent of this framed opening scale), so zooming out reveals everything plus a small margin
    *  and `fit()` stays the full reset. Used to open a multi-sheet floor centred on its
    *  primary sheet, zoomed out to reveal the others (see FloorEditor._peekRegion).
    *  Returns true/false like fit() so the initial framing can be retried before layout. */
@@ -89,7 +92,7 @@ class PanZoom {
     const c = this.container.getBoundingClientRect();
     if (!w.width || !w.height || !c.width || !c.height) return false;
     const kFull = Math.min(c.width / w.width, c.height / w.height);
-    const maxScale = Math.max(kFull * 8, 8);
+    const maxScale = Math.max(kFull * PanZoom.ZOOM_CEILING, PanZoom.ZOOM_CEILING);
     const rw = (nx1 - nx0) * w.width, rh = (ny1 - ny0) * w.height;
     this.k = Math.max(kFull, Math.min(maxScale, Math.min(c.width / rw, c.height / rh)));
     this._setRange(kFull);

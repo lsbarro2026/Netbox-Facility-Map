@@ -169,6 +169,44 @@ def test_enabled_keys_are_a_subset_of_known_keys():
     assert set(cap.enabled_keys()) <= known
 
 
+# ---- The OCR feature capability (IMPORT-31) ----------------------------------------------------
+#
+# `ocr` is the first capability gating a *tool* rather than a filetype, and the first whose modules
+# ship in the BASE install — so on a normal deployment it is simply on. It is still a capability
+# because the two ways it can be absent (no onnxruntime wheel for the platform; a wheel built
+# without its model package-data) must hide the button rather than surface a failing one.
+
+def _ocr_cap():
+    return {c.key: c for c in cap.CAPABILITIES}["ocr"]
+
+
+def test_ocr_capability_needs_both_runtime_modules(monkeypatch):
+    c = _ocr_cap()
+    monkeypatch.setattr(cap, "_module_installed", lambda name: name != "onnxruntime")
+    assert c.available() is False, "must gate off where there is no onnxruntime wheel"
+    monkeypatch.setattr(cap, "_module_installed", lambda name: name != "numpy")
+    assert c.available() is False
+
+
+def test_ocr_capability_needs_the_vendored_model(monkeypatch):
+    """The model is part of the gate, not just the modules. A wheel built without its
+    `models/*.onnx` package-data would import cleanly and then fail at read time — exactly the
+    late, opaque failure a capability probe exists to turn into "the tool isn't offered"."""
+    c = _ocr_cap()
+    monkeypatch.setattr(cap, "_module_installed", lambda _name: True)
+    assert c.available() is True                       # model ships in this tree
+    monkeypatch.setattr("os.path.isfile", lambda _p: False)
+    assert c.available() is False
+
+
+def test_ocr_model_ships_in_the_package():
+    """Offline recognition depends on the model being IN the wheel — if this file goes missing the
+    feature silently stops being offered on every install."""
+    model = pathlib.Path(cap.__file__).parent / "models" / "rec.onnx"
+    assert model.is_file(), "the vendored PP-OCRv4 model must ship with the package"
+    assert model.stat().st_size > 1_000_000
+
+
 # ---- Isolation contract: no Django / decoder import at module scope ----------------------------
 
 def test_module_top_level_is_import_safe():

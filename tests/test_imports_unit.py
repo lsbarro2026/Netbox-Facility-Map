@@ -6,7 +6,8 @@ import resource
 
 import pytest
 
-from netbox_facilitymap.imports import RenderRunner, _sniff, _upload_ok, _zip_targets
+from netbox_facilitymap.render_runner import RenderRunner
+from netbox_facilitymap.uploads import _sniff, _upload_ok, _zip_targets
 
 
 # ---- _zip_targets: how a zip's members map onto uploads/<folder>/<file> ----

@@ -4,7 +4,10 @@
   rendered floor of the building(s) whose `siteSlug` matches this Site's slug. Each card
   links to that floor's NetBox Location page.
   Self-contained: presentation is inline so it needs none of the plugin stylesheet, which
-  isn't loaded on dcim pages.
+  isn't loaded on dcim pages. Because it renders INSIDE a NetBox page it does inherit NetBox's
+  Tabler palette, so every surface/text colour below is a theme-aware `--tblr-*` var (hex
+  fallback kept in case the var is ever absent) and the panel follows NetBox's light/dark mode
+  for free. The one exception is the thumbnail's `#fff` backing — see its note below.
 {% endcomment %}
 <div class="card">
   <h5 class="card-header">Facility Map: Floors</h5>
@@ -19,21 +22,29 @@
       {% for c in cards %}
         {% if c.url %}<a href="{{ c.url }}" style="text-decoration:none;color:inherit">{% endif %}
         <div style="display:grid;grid-template-columns:clamp(96px,32%,150px) 1fr;min-height:92px;
-                    border:1px solid #ccc;border-radius:6px;overflow:hidden;background:#f4f5f7;height:100%">
+                    border:1px solid var(--tblr-border-color,#ccc);border-radius:6px;overflow:hidden;
+                    background:var(--tblr-secondary-bg,#f4f5f7);height:100%">
+          {% comment %}
+            The backing stays white in dark mode on purpose: floor renders are light-background
+            rasters that never darken, so a white matte blends into the drawing while the card
+            around it goes dark (same rule as the SPA's --image-matte).
+          {% endcomment %}
           {% if c.image %}
             <img src="{{ c.image }}" loading="lazy"
-                 style="display:block;width:100%;height:100%;object-fit:cover;background:#fff;border-right:1px solid #ddd">
+                 style="display:block;width:100%;height:100%;object-fit:cover;background:#fff;
+                        border-right:1px solid var(--tblr-border-color,#ddd)">
           {% endif %}
           <div style="padding:8px 10px;display:flex;flex-direction:column;justify-content:center;gap:6px;min-width:0">
             <div style="font-weight:600">{{ c.label }}</div>
             <div style="display:flex;flex-wrap:wrap;gap:6px">
               <span style="display:inline-block;padding:1px 6px;border-radius:8px;font-size:11px;
-                           {% if c.rooms %}background:#2fa84f22;color:#1f7a37{% else %}background:#e0e0e0;color:#666{% endif %}">
+                           {% if c.rooms %}background:var(--tblr-green-lt,#2fa84f22);color:var(--tblr-success-text-emphasis,#1f7a37)
+                           {% else %}background:var(--tblr-secondary-bg,#e0e0e0);color:var(--tblr-secondary-color,#666){% endif %}">
                 {% if c.rooms %}{{ c.rooms }} room{{ c.rooms|pluralize }}{% else %}unmapped{% endif %}
               </span>
               {% if c.sheets > 1 %}
                 <span style="display:inline-block;padding:1px 6px;border-radius:8px;font-size:11px;
-                             background:#e6effa;color:#2c5f9e">{{ c.sheets }} sheets</span>
+                             background:var(--tblr-blue-lt,#e6effa);color:var(--tblr-info-text-emphasis,#2c5f9e)">{{ c.sheets }} sheets</span>
               {% endif %}
             </div>
           </div>

@@ -6,7 +6,8 @@ finder can surface items that exist in NetBox but were never drawn/placed on the
 under test: it matches by name and returns each item's floor hierarchy + display names; it is
 facility-scoped like `NbSitesView` (FACIL-1) so one facility never lists another's inventory; it is
 object-permission scoped (`.restrict(user,'view')`); and it returns only rooms *under a floor*
-(never a floor/site-root Location) and only *unracked* devices.
+(never a floor/site-root Location) and only *unracked* devices under `devices` — rack-mounted ones
+are searchable in their own `racked_devices` key, keyed to the rack the finder navigates to (NAV-19).
 """
 
 import json
@@ -129,7 +130,7 @@ def test_inventory_short_or_empty_query_returns_empty(client, superuser):
 
     for q in ('', 'A'):   # below the MIN_Q=2 floor
         body = _get(client, facility='ga', q=q).json()
-        assert body == {'rooms': [], 'racks': [], 'devices': []}
+        assert body == {'rooms': [], 'racks': [], 'devices': [], 'racked_devices': []}
 
 
 def test_inventory_scoped_to_active_facility(client, superuser):
@@ -154,29 +155,95 @@ def test_inventory_excludes_floor_and_site_root_locations(client, superuser):
     assert body['rooms'] == []
 
 
-def test_inventory_excludes_racked_device(client, superuser):
-    # A device mounted in a rack shows under its rack on the map, not as its own marker — mirror
-    # NbDevicesView and leave it out of the inventory search.
+def test_inventory_racked_device_is_searchable_under_its_rack(client, superuser):
+    # A device mounted in a rack shows under its rack on the map, not as its own marker — so it stays
+    # out of the placeable `devices` list (mirroring NbDevicesView) but IS searchable by its own name
+    # in `racked_devices` (NAV-19), carrying the rack the finder should navigate to.
     site, floor, room = _tree('ga', 'bldg-a', room_name='Alpha Room')
     rack = _rack(site, room, 'Host Rack')
-    _device(site, room, 'Racked Node', rack=rack)
+    device = _device(site, room, 'Racked Node', rack=rack)
     client.force_login(superuser)
 
-    assert _get(client, facility='ga', q='Racked').json()['devices'] == []
+    body = _get(client, facility='ga', q='Racked').json()
+    assert body['devices'] == []
+    (d,) = body['racked_devices']
+    assert d['kind'] == 'device' and d['id'] == device.pk and d['name'] == 'Racked Node'
+    assert (d['rack_id'], d['rack_name']) == (rack.pk, 'Host Rack')
+    # The floor hierarchy is resolved through the *rack's* location — that's the placed object.
+    assert (d['site_slug'], d['floor_slug'], d['room_id']) == ('bldg-a', 'bldg-a-floor', room.pk)
+    assert d['site_name'] == 'bldg-a' and d['floor_name'] == 'bldg-a Floor'
+    # The URL stays the device's own page: in NetBox-target mode the searcher wanted the device.
+    assert d['url'].endswith(device.get_absolute_url()) and d['url'].startswith('http')
+
+
+def test_inventory_racked_device_excluded_when_rack_has_no_room(client, superuser):
+    # A rack parked at site level (or directly on a floor) resolves to no map floor, so its devices
+    # have nowhere to navigate — filtered out, same as an unracked device outside a room.
+    from dcim.models import Rack
+    site, floor, room = _tree('ga', 'bldg-a', room_name='Alpha Room')
+    site_rack = Rack.objects.create(name='Loose Rack', site=site, status='active')
+    floor_rack = Rack.objects.create(name='Floor Rack', site=site, location=floor, status='active')
+    _device(site, room, 'Racked Loose', rack=site_rack)
+    _device(site, room, 'Racked OnFloor', rack=floor_rack)
+    client.force_login(superuser)
+
+    assert _get(client, facility='ga', q='Racked').json()['racked_devices'] == []
+
+
+def test_inventory_racked_device_scoped_to_facility_and_permissions(client, superuser,
+                                                                    login_only_user):
+    # The racked-device query carries the same two guards as its siblings: facility scoping through
+    # the rack's site (FACIL-1) and object-permission scoping.
+    site_a, _, room_a = _tree('ga', 'bldg-a', room_name='Alpha Room')
+    site_b, _, room_b = _tree('gb', 'bldg-b', room_name='Beta Room')
+    _device(site_b, room_b, 'Racked Node', rack=_rack(site_b, room_b, 'B Rack'))
+
+    client.force_login(superuser)
+    assert _get(client, facility='ga', q='Racked').json()['racked_devices'] == []
+    assert len(_get(client, facility='gb', q='Racked').json()['racked_devices']) == 1
+
+    client.force_login(login_only_user)
+    assert _get(client, facility='gb', q='Racked').json()['racked_devices'] == []
 
 
 def test_inventory_is_object_permission_scoped(client, login_only_user):
     # A bare authenticated user with no dcim view permission sees nothing, even where a query would
     # otherwise match — the finder never leaks inventory the user can't view.
     site, floor, room = _tree('ga', 'bldg-a', room_name='Alpha Room')
-    _rack(site, room, 'Alpha Rack')
+    rack = _rack(site, room, 'Alpha Rack')
     _device(site, room, 'Alpha Server')
+    _device(site, room, 'Alpha Racked Node', rack=rack)
     client.force_login(login_only_user)
 
     body = _get(client, facility='ga', q='Alpha').json()
-    assert body == {'rooms': [], 'racks': [], 'devices': []}
+    assert body == {'rooms': [], 'racks': [], 'devices': [], 'racked_devices': []}
 
 
 def test_inventory_rejects_bad_facility(client, superuser):
     client.force_login(superuser)
     assert _get(client, facility='bad.slug', q='Alpha').status_code == 400
+
+
+def test_inventory_scoped_to_the_location_facility_subtree(client, superuser):
+    # MODEL-8: under the location grouping two facilities share the campus Site, so the Site bound
+    # alone would list the whole campus — the finder must narrow to the requested facility's own
+    # subtree.
+    from dcim.models import Location, Site
+    from netbox_facilitymap.models import FacilityMapBlob
+
+    FacilityMapBlob.objects.update_or_create(
+        kind='settings', facility='', key='', defaults={'data': {'facility_grouping': 'location'}})
+    site = Site.objects.create(name='Campus', slug='campus')
+    a = Location.objects.create(name='Building A', slug='bldg-a', site=site)
+    b = Location.objects.create(name='Building B', slug='bldg-b', site=site)
+    fa = Location.objects.create(name='A Floor', slug='a-floor', site=site, parent=a)
+    fb = Location.objects.create(name='B Floor', slug='b-floor', site=site, parent=b)
+    room_a = Location.objects.create(name='IDF room A', slug='idf-a', site=site, parent=fa)
+    room_b = Location.objects.create(name='IDF room B', slug='idf-b', site=site, parent=fb)
+    _rack(site, room_a, 'IDF-rack-a')
+    _rack(site, room_b, 'IDF-rack-b')
+
+    client.force_login(superuser)
+    body = _get(client, facility='bldg-a', q='IDF').json()
+    assert {r['name'] for r in body['rooms']} == {'IDF room A'}
+    assert {r['name'] for r in body['racks']} == {'IDF-rack-a'}

@@ -5,8 +5,10 @@
      - previewUrl(pdfRel, page, angle)      → the on-demand hi-res render URL for a drawing
      - attachZoomPan(box, img, frame, opts) → cursor-anchored wheel-zoom + drag-pan on an image
      - rotateControls(holder, onChange)     → ⟲/⟳ 90° straightening toolbar bound to a {deg} holder
+     - zoomBar(canvas, zoom) / applyZoom(canvas, zoom)
+                                            → −/Fit/+ widen-the-canvas zoom for the box editors
      - lightbox(p)                          → full-window preview popup for a drawing
-   Shared by the mapping cards and the preview popup. */
+   Shared by the mapping cards, the preview popup, and the box editors (ImportRegions/ImportAlign). */
 
 class ImportPreview {
   /** On-demand high-res render URL for an uploaded drawing (`p.pdf`). The server renders it at
@@ -24,6 +26,35 @@ class ImportPreview {
     return Api.withFacility(url);   // serve from the active facility's working dir (MULTI-2)
   }
 
+  /** A close-up of just the normalized 0..1 `region` of the image at `src`, as a CSS crop: the
+   *  <img> is widened to `1/region.w` of its box and translated by `-region.x`/`-region.y` of its
+   *  own size, so the region exactly fills an overflow-clipped box. Those are percentages, so the
+   *  crop rescales for free with the box; only the aspect ratio needs the render's intrinsic size,
+   *  set once on load.
+   *
+   *  Shared (IMPORT-63) by the map card's code-crop thumbnail (`ImportCards._codeCropThumb`) and by
+   *  the region picker's live preview, which exist precisely to show the same thing: "the region I
+   *  marked" and "the region OCR reads" diverging invisibly is the bug this closes, and two
+   *  independent crop implementations would be a standing invitation for them to diverge again.
+   *  A degenerate box is floored rather than dividing by zero — the drag gesture already refuses
+   *  one, so this is a guard against a corrupt draft, not a real case. */
+  static cropBox(src, region, opts = {}) {
+    const w = Math.max(region.w, 1e-6), h = Math.max(region.h, 1e-6);
+    const img = Dom.el('img', { class: 'imp-crop-img', src, loading: 'lazy' });
+    img.style.width = (100 / w) + '%';
+    img.style.transform = 'translate(' + (-region.x * 100) + '%,' + (-region.y * 100) + '%)';
+    const attrs = { class: 'imp-thumb imp-codecrop' };
+    if (opts.title) attrs.title = opts.title;
+    if (opts.onClick) attrs.onclick = opts.onClick;
+    const box = Dom.el('div', attrs, [img]);
+    const fit = () => {
+      const iw = img.naturalWidth, ih = img.naturalHeight;
+      if (iw && ih) box.style.aspectRatio = (w * iw) + ' / ' + (h * ih);
+    };
+    if (img.complete) fit(); else img.addEventListener('load', fit);
+    return box;
+  }
+
   /** A small ⟲/⟳ toolbar that straightens a rotated scan in 90° steps. State lives on the passed
    *  `holder` ({deg}) — the wizard model, mutated in place like `attachZoomPan`'s `frame` — so the
    *  angle survives step switches and is emitted at build. `onChange()` fires after each turn (to
@@ -36,10 +67,39 @@ class ImportPreview {
       { class: 'imp-rotate-btn', title, onclick: (e) => { e.stopPropagation(); turn(delta); } }, glyph);
     // Swallow pointerdown so a button press never starts the thumb's drag-pan (which would
     // otherwise fire its click-to-lightbox on release).
+    // The word "Straighten" rides the toolbar rather than living only in the buttons' tooltips
+    // (IMPORT-63): two bare glyphs on a thumbnail are exactly the sort of control a first-time
+    // operator has to click to find out about.
     return Dom.el('div', { class: 'imp-rotate', onpointerdown: (e) => e.stopPropagation() }, [
+      Dom.el('span', { class: 'imp-rotate-label' }, 'Straighten'),
       btn('⟲', 'Rotate 90° counter-clockwise', -90),
       btn('⟳', 'Rotate 90° clockwise', 90),
     ]);
+  }
+
+  /** −/Fit/+ zoom controls for the box editors (the code-region picker, the region split, the
+   *  overlay align), so a small floor code or a dense drawing can be marked accurately. Zoom
+   *  widens the canvas inside its scrollable viewport rather than transforming it, so the boxes —
+   *  positioned by % of the canvas — track the drawing at any zoom and panning is plain scrolling.
+   *  "Fit" resets to fill the viewport width; ± steps the zoom (1×–6×). State lives on the passed
+   *  `zoom` ({z}) holder, mutated in place like `rotateControls`' `{deg}` — the wizard keeps it so
+   *  the factor survives a step switch (a view aid only, never persisted in the draft). */
+  static zoomBar(canvas, zoom) {
+    const step = (f) => () => {
+      zoom.z = Math.max(1, Math.min(6, Math.round((zoom.z + f) * 10) / 10));
+      ImportPreview.applyZoom(canvas, zoom);
+    };
+    return Dom.el('div', { class: 'imp-region-zoom' }, [
+      Dom.el('button', { title: 'Zoom out', onclick: step(-0.5) }, '−'),
+      Dom.el('button', { title: 'Fit to width',
+        onclick: () => { zoom.z = 1; ImportPreview.applyZoom(canvas, zoom); } }, 'Fit'),
+      Dom.el('button', { title: 'Zoom in', onclick: step(0.5) }, '+'),
+    ]);
+  }
+
+  /** Apply the current zoom by widening the canvas; the scrollable viewport handles panning. */
+  static applyZoom(canvas, zoom) {
+    canvas.style.width = (zoom.z * 100) + '%';
   }
 
   /** Cursor-anchored scroll-to-zoom + drag-to-pan on an image inside a clipped box —

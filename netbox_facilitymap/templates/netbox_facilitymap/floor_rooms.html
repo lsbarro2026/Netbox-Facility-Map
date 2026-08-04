@@ -2,6 +2,11 @@
   Facility-map room overlay injected on a floor's Location page (Phase 4).
   Self-contained: presentation is inline so it needs none of the plugin stylesheet,
   which isn't loaded on dcim pages.
+  Theming: the card renders inside a NetBox page, so its frame colours use NetBox's Tabler vars
+  and follow light/dark for free. Everything drawn INSIDE the <svg> deliberately does not — the
+  floor render underneath is a light-background raster that never darkens, so the SVG's backing
+  matte, spotlight mask, room highlight and arrows keep their light-mode values in both themes
+  (the same rule as the SPA's --image-matte / map-overlay palette; §10 Theming).
 {% endcomment %}
 <div class="card">
   {% comment %}
@@ -31,7 +36,7 @@
     {% if embed_aspect %}<div style="max-width:{{ embed_size }}%;margin-inline:auto;aspect-ratio:{{ embed_aspect|floatformat:4 }}">{% endif %}
     <svg viewBox="{% if viewbox %}{{ viewbox }}{% else %}0 0 {{ vw }} {{ vh }}{% endif %}"
          preserveAspectRatio="xMidYMid meet"
-         style="{% if embed_aspect %}display:block;width:100%;height:100%{% else %}width:100%;height:auto{% endif %};border:1px solid #ccc;background:#f4f5f7">
+         style="{% if embed_aspect %}display:block;width:100%;height:100%{% else %}width:100%;height:auto{% endif %};border:1px solid var(--tblr-border-color,#ccc);background:#f4f5f7">
       {% include 'netbox_facilitymap/inc/floor_sheets.html' %}
       {% comment %}
         Spotlight: on the cropped single-room embed, dim the floor outside the room's own

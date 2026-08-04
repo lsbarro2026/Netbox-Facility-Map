@@ -1,13 +1,29 @@
 'use strict';
 /* import-flow.js — ImportFlow: the shared base for the in-app "import a facility from PDFs"
-   flows. It owns everything both flows share — the step-rendering machinery (upload, bind,
-   code-region + region-split editors, floor mapping), draft persistence, the pre-build
-   room-safety diff, floor resolution, and the build — and defers only the handful of genuine
-   divergence points to subclass hooks (`_resume`, `_onScanError`, `_buildingsActions`).
+   flows. It owns everything both flows share — the step-rendering machinery (upload, bind, floor
+   mapping), the building model, draft persistence, floor resolution, and the build — and defers
+   only the handful of genuine divergence points to subclass hooks (`_resume`, `_onScanError`,
+   `_buildingsActions`).
+
+   The self-contained concerns live in collaborators, each constructed here with a back-ref
+   (the ImportUploader pattern) and reachable as a field:
+     • uploader  ImportUploader — file ingestion + upload
+     • regions   ImportRegions  — the code-crop pick (a section of the Site plan step, plus its
+                                  per-building detour) + the region-split editor
+     • align     ImportAlign    — the GIS-overlay align editor + its control-point solver
+     • bulk      ImportBulk     — bulk floor triage (the building header's cluster)
+     • diff      ImportDiff     — the pre-build room-safety diff + its post-build repairs
+     • organize  ImportOrganize — the fresh flow's merged Buildings step: organize drawings into
+                                  buildings + anchor them to NetBox (IMPORT-3/IMPORT-34)
+     • topology  ImportTopology — the facility-layout step (TOPO-3) + the campus step (MODEL-7)
+     • binder    ImportBind     — the edit hub's bind screen; the shared anchor picker + facility
+                                  assignment surface both flows render (MULTI-6)
+     • cards     ImportCards    — the map step's per-building card grid (floor pickers, Replace)
+   Image zoom/pan, the box-editor zoom bar, and the lightbox live on the static ImportPreview.
 
    Two subclasses specialize it (like Editor → FloorEditor/SiteplanEditor):
-     • FreshImportFlow  — the linear first-time import: grouping → upload → bind → code-region →
-                          siteplan → map floors → build.
+     • FreshImportFlow  — the linear first-time import: grouping → upload → sites → site plan →
+                          map floors → build.
      • EditImportFlow   — the non-linear edit hub for revising an already-built facility
                           (Settings → "Edit buildings & floors").
    App.showImport() picks the subclass by store.hasContent() (a built facility → edit hub).
@@ -19,11 +35,64 @@
 
 class ImportFlow {
   static HIRES_AT = 260;   // card width (px) at/above which the size slider upgrades to hi-res
+  // How a scan waits out a **busy** server (IMPORT-47). `import/scan` doubles as its own status
+  // probe: while another import holds the working-dir lock the POST 409s immediately, without
+  // spawning a render — so re-sending it is a cheap poll that returns the inventory the moment the
+  // lock frees, which no separate status read could. The budget covers a full-length build
+  // (`render_timeout_s`, 300s by default) so an honest wait never gives up early, and is bounded so
+  // a lock stranded by a crashed render — reclaimed only after 2 × that — still surfaces as an
+  // error rather than spinning forever.
+  static SCAN_BUSY_POLL_MS = 2000;
+  static SCAN_BUSY_BUDGET_MS = 300000;
+  // Upload folders reserved by the pipeline, which `PreprocessBase.building_folders` skips by
+  // name — so a drawing in either is invisible to `scan`/`build` and never becomes a building.
+  // `EXCLUDED_FOLDER` is where the organize step parks a drawing the operator dropped from the
+  // import (IMPORT-24). `THUMBS_FOLDER` is the render cache, named here only so the "Add building"
+  // field can refuse it: typing it used to move drawings into the cache, where they vanished.
+  // Both mirror the Python constants (`preprocess.PreprocessBase`, `render_runner.RenderRunner`).
+  static EXCLUDED_FOLDER = '_excluded';
+  static THUMBS_FOLDER = '.thumbs';
   // Location fields the floor-label picker may choose between (value -> option text). Matches
   // the fixed set `frontend_api._trim` exposes for a Location, so a floor's label is always one
   // of these three known JSON keys, never an arbitrary attribute.
   static LABEL_FIELDS = [
     ['name', 'Location name'], ['slug', 'Location slug'], ['description', 'Location description'],
+  ];
+  // Below this OCR confidence a floor code the sweep resolved is routed back to the operator
+  // (IMPORT-53): it passes the build gate like any other suggestion, so the only thing between a
+  // faint misread and a built map is somebody noticing it. Set where the reader's own scores put
+  // a hesitant read — a clean title block reads far above it, a smudged or rotated one below.
+  static LOW_OCR_CONF = 0.6;
+  // At or above this confidence a floor code that matched a floor **literally** is taken as the
+  // answer rather than offered as a suggestion (IMPORT-63) — the one place in the wizard where a
+  // read commits on its own. Four guard rails, not the threshold alone, are what make that safe:
+  // only the literal rung of `ImportBulk._suggestFrom` may auto-accept (its ordinal and alignment
+  // rungs are inferences and stay suggestions), only an `isUnanswered` drawing is ever filled, the
+  // card says so in words (`ImportCards._autoAcceptBadge`), and `_undoAutoAccepted` turns the whole
+  // set back into suggestions in one action. Well clear of `LOW_OCR_CONF`, which routes a *faint*
+  // read to the operator — the two thresholds answer different questions and neither implies the
+  // other.
+  static AUTO_ACCEPT_OCR_CONF = 0.8;
+  // The install-wide facility grouping (MULTI-3/MODEL-8), `[value, title, what it does]`. Mirrors
+  // the server's `facilities.GROUPING_CHOICES`; the count beneath each option is live.
+  static GROUPING_OPTIONS = [
+    ['sitegroup', 'Site Group',
+      'Sites grouped organizationally or functionally (dcim.SiteGroup). The default.'],
+    ['region', 'Region',
+      'Sites grouped geographically by country, campus, or building cluster (dcim.Region).'],
+    ['location', 'Building / Location',
+      'Splits the install into one facility PER top-level Location (a building or wing) — not a '
+      + 'way to say “our buildings are Locations under one Site.” If your whole campus is a '
+      + 'single NetBox Site with buildings modelled as Locations beneath it, keep Site Group or '
+      + 'Region here and choose “Site = campus” below instead.'],
+  ];
+  // The per-facility organization mode (MODEL-6), `[value, title, what it means]`. Lockstep with
+  // the server's `facilities.ORG_MODE_CHOICES` and the Settings row's own allowlist.
+  static ORG_MODE_OPTIONS = [
+    ['site-as-building', 'Site = building',
+      'Each building is its own NetBox site; its floors are the site’s top-level Locations.'],
+    ['site-as-campus', 'Site = campus (buildings are Locations)',
+      'One campus site holds every building as a Location; floors are those buildings’ children.'],
   ];
 
   constructor(app) {
@@ -34,19 +103,31 @@ class ImportFlow {
     this.thumbWidth = 480;  // map-step card width (px); the size slider drives it (its centred default)
     this._bIdx = 0;         // index of the building currently visible in the map step
     this._autoMapDone = false;  // the building→NetBox auto-match pass runs once per scan
+    // The facility's **campus Site** under the declared `site-as-campus` organization mode
+    // (MODEL-6/MODEL-7): `{id, slug, name}`, or null when unchosen. One facility-level fact, not a
+    // per-building one — every drawing folder then binds to a building **Location** beneath it, so
+    // this scopes the bind search and the auto-match. Persisted in the draft; ignored entirely in
+    // `site-as-building` mode. `_campusPromptDone` gates the once-per-session detour into
+    // `_stepCampus`, so skipping it doesn't loop back on the next bind-step render.
+    this.campus = null;
+    this._campusPromptDone = false;
     // Floor assignment shows a cropped close-up of each drawing's identifying code so floors
     // are recognizable at a glance. `_codeRegion` is the normalized 0..1 box the user drags
     // over that code on a sample drawing, applied as a crop to every drawing (a building can
     // override it with its own `codeRegion` when its title block sits elsewhere). A null region
-    // falls back to full-drawing thumbnails. `_codeRegionDone` gates the pick step (the user
-    // either marks a region or skips it). Both persist in the draft.
+    // falls back to full-drawing thumbnails. Persisted in the draft.
     this._codeRegion = null;
-    this._codeRegionDone = false;
-    // The site plan is chosen in its own step before floor assignment (it has no floor code).
-    // `_siteplanDone` gates that step (persisted) so it's shown once; `_regionZoom` is the
-    // transient zoom factor for the code region picker (a view aid, not persisted).
-    this._siteplanDone = false;
-    this._regionZoom = 1;
+    // Whether the **Site plan** step — which picks the site plan (it carries no floor code, so it
+    // is chosen apart from floor assignment) and marks that global code region, one step since
+    // IMPORT-37 — has been answered. Persisted, and read by `FreshImportFlow._resume` alone, to
+    // decide where a restored in-progress import lands: it is NOT a gate on the map step, which
+    // always renders the map. `_regionZoom` is the
+    // transient zoom factor shared by the box editors (a view aid, not persisted). It is an
+    // object, not a number, because `ImportPreview.zoomBar` mutates the holder in place — the
+    // same `{deg}` convention `ImportPreview.rotateControls` uses — so the factor survives a step
+    // switch without the editors reaching back through the flow to write it.
+    this._siteplanStepDone = false;
+    this._regionZoom = { z: 1 };
     // Which Location field a Location-mode floor's label is drawn from (see LABEL_FIELDS).
     // Defaults to the server's `floor_label_field` PLUGINS_CONFIG setting; re-validated against
     // the known field set (never trust window.MAP blindly) and persisted in the draft.
@@ -56,20 +137,118 @@ class ImportFlow {
     // Add-drawings flow: when true the upload step merges new PDFs into the current model
     // (re-applying the saved draft so existing assignments survive) instead of starting fresh.
     this._mergeMode = false;
+    // Upload-step controls the in-flight upload guard drives (IMPORT-30): written by `_stepUpload`,
+    // read by `_setUploadPhase` as `ImportUploader` changes phase. Null until that step renders.
+    this._dropZone = null;
+    this._dropLabel = '';
+    this._zipLink = null;
+    this._uploadBack = null;
+    // The upload step's Continue button and the fact it is gated on (IMPORT-32): whether any
+    // drawing exists on the server yet. `_setUploadPhase` combines that with the in-flight phase.
+    this._continueBtn = null;
+    this._continueLabel = '';
+    this._uploadHasContent = false;
+    // The single-flight scan (IMPORT-47): the promise of the `import/scan` currently in flight, or
+    // null when none is. Every scan in the wizard goes through `scan()`, so a second caller joins
+    // this one instead of firing a POST the server's render lock would 409. `_scanWaiting` is the
+    // narrower state where the scan *did* 409 and is being waited out, which the upload step's
+    // Continue button says out loud.
+    this._scanFlight = null;
+    this._scanWaiting = false;
     // `folder/stem` of every drawing whose bytes were replaced in place this session (REPL-1). A
-    // Replace keeps the floor id (so `_orphanedFloors` won't flag it) and usually the same
-    // pixel size + aspect ratio (so `_desyncedFloors`' angle/aspect checks won't either), yet a
+    // Replace keeps the floor id (so `ImportDiff.orphanedFloors` won't flag it) and usually the same
+    // pixel size + aspect ratio (so `ImportDiff.desyncedFloors`' angle/aspect checks won't either), yet a
     // revision with shifted margins/title-block silently misaligns rooms placed against the old
     // drawing — undetectable from manifest metadata (only `w`/`h` + angle are recorded). So a
     // replaced drawing with placed features drives an unconditional desync warning at build time.
     // Cleared after a successful build (the manifest is then rebuilt from the new drawing).
     this._replaced = new Set();
-    // File ingestion + upload live in ImportUploader (needs a back-ref for progress + the
-    // post-upload routing); image zoom/pan + lightbox live in the static ImportPreview.
+    // Site slug -> that Site's full flat Location list, as last fetched by `_loadFloors`. A
+    // session cache for the tree questions the anchor controls ask (which Locations sit under the
+    // anchor, what a Location's parent is called) — deliberately on the flow, NOT on a building:
+    // `_saveDraft` serializes `this.buildings` whole, so a per-building copy would bloat every
+    // draft with the site's Location list. Rewritten on each fetch, so it is as fresh as that
+    // building's last floor load; consumers are read-only and degrade to "no tree info". Left alone
+    // by `_reset()`, like `organize._assignCands` — it caches NetBox state, not upload state.
+    this._siteLocs = new Map();
+    // The self-contained concerns, each holding a back-ref to this flow (see the file header).
+    // Image zoom/pan + lightbox live in the static ImportPreview, which needs no instance.
     this.uploader = new ImportUploader(this);
+    this.regions = new ImportRegions(this);
+    this.align = new ImportAlign(this);
+    this.bulk = new ImportBulk(this);
+    this.diff = new ImportDiff(this);
+    this.organize = new ImportOrganize(this);
+    this.topology = new ImportTopology(this);
+    this.binder = new ImportBind(this);
+    this.cards = new ImportCards(this);
+    // Constructed after `bulk`: the sweep resolves its reads through it (IMPORT-53).
+    this.ocr = new ImportOcrSweep(this);
+    // ...and after `ocr`: the overview reports the sweep's coverage per building (IMPORT-63).
+    this.overview = new ImportOverview(this);
   }
 
   // ---- helpers ----
+  /** True when `loc` sits anywhere beneath the Location `ancestorId` in `byId` (the site's flat
+   *  `id -> Location` map). Walks the plain `parent` edge — NetBox's MPTT `depth`/`level` fields are
+   *  unreliable on 4.2+, so the tree is always read through `parent` here. Bounded by the map size,
+   *  so a cyclic or truncated list can't loop forever. */
+  static _isUnder(loc, ancestorId, byId) {
+    let cur = loc, steps = byId.size;
+    while (cur && cur.parent != null && steps-- > 0) {
+      if (cur.parent === ancestorId) return true;
+      cur = byId.get(cur.parent);
+    }
+    return false;
+  }
+
+  /** Which tier of the site's Location tree this building's floors sit in — the number the server's
+   *  `truncated_depth` is compared against to decide whether a clipped answer clipped anything that
+   *  matters (IMPORT-49). Tier 0 is a root Location, so the answer is the anchor's own tier + 1.
+   *
+   *  A **Site anchor** (no `buildingSlug`) always answers 1: `_floorsFromLocations` reads the roots
+   *  (tier 0) and the building root's children (tier 1), and nothing deeper.
+   *
+   *  A **Location anchor** is located in the list and its tier counted up the `parent` chain (the
+   *  same plain-FK walk `_isUnder` uses, and bounded the same way). `null` when the anchor itself
+   *  isn't in the answer — either the Location is gone, or the read was clipped *above* the floors,
+   *  and the caller must treat the floor list as incomplete either way. */
+  static _floorTier(locs, buildingSlug) {
+    if (!buildingSlug) return 1;
+    const anchor = locs.find(l => l.slug === buildingSlug);
+    if (!anchor) return null;
+    const byId = new Map(locs.map(l => [l.id, l]));
+    let tier = 0, cur = anchor, steps = byId.size;
+    while (cur && cur.parent != null && steps-- > 0) { tier++; cur = byId.get(cur.parent); }
+    return tier + 1;
+  }
+
+  /** Did the server's row cap clip anything this building's **floor list** depends on?
+   *
+   *  `truncated` alone used to answer that, and answered it wrong in the common direction: the read
+   *  arrives shallowest-first (IMPORT-49), so what a cap clips is the deepest tier — the site's
+   *  *rooms*, which the floor list doesn't read. Treating that as a partial floor list is what put
+   *  a warning on every building of any real facility and, worse, made `_loadFloors` skip the stale
+   *  -token sweep it exists to run.
+   *
+   *  So compare where the clip landed (`truncated_depth`) against where the floors live
+   *  (`_floorTier`): a clip strictly below them leaves the floor list complete. Anything the server
+   *  can't answer for — a floor tier that can't be established, or a server too old to send
+   *  `truncated_depth` — counts as clipped, so the guard fails safe. */
+  static _clippedTheFloors(res, locs, buildingSlug) {
+    const floorTier = ImportFlow._floorTier(locs, buildingSlug);
+    if (floorTier === null || typeof res.truncated_depth !== 'number') return true;
+    return res.truncated_depth <= floorTier;
+  }
+
+  /** The display name of an install-wide facility grouping (MULTI-3/MODEL-8). One place, so the
+   *  wizard's options, the edit hub's row and any future reader can't drift — and so the third
+   *  choice can't be quietly rendered as the first, which is what a two-branch ternary did. */
+  static groupingLabel(grouping) {
+    const opt = ImportFlow.GROUPING_OPTIONS.find(([value]) => value === grouping);
+    return opt ? opt[1] : grouping;
+  }
+
   static slugify(s) {
     return s.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   }
@@ -89,19 +268,73 @@ class ImportFlow {
     return Api.withFacility((window.MAP ? window.MAP.media : '/') + encodeURI(rel));
   }
 
+  /** One non-siteplan drawing's starting floor assignment: the floor its own filename names when it
+   *  names one (`ImportBulk.floorFromStem`, marked `suggested` so `_floorButtons` shows it as a
+   *  pre-fill awaiting confirmation), else the positional Level 1..N default this always used.
+   *  `i` is the drawing's index within its building.
+   *
+   *  The positional default carries `autoDefault` (IMPORT-63): it is a *placeholder*, not an answer
+   *  — nobody looked at the drawing to produce it — and before this flag nothing could tell it apart
+   *  from a Level N the operator picked by hand. That indistinguishability is what made the
+   *  floor-code sweep read nothing at all in floor-type fallback mode: `_defaultAssign` leaves no
+   *  drawing `unassigned`, so the sweep's "only blanks" rule matched none of them. See
+   *  `isUnanswered`. */
+  static _defaultAssign(p, i) {
+    const g = ImportBulk.floorFromStem(p.stem);
+    return g
+      ? { type: g.type, num: g.num, token: null, label: '', suggested: true }
+      : { type: 'level', num: i + 1, token: null, label: '', autoDefault: true };
+  }
+
+  /** Whether an assignment is still **nobody's answer** — the predicate the floor-code sweep reads
+   *  and writes through, and the one auto-accept is allowed to fill (IMPORT-63). Three states
+   *  qualify, and each is a placeholder the wizard produced rather than a decision the operator
+   *  made:
+   *    - `type === 'unassigned'` — Location mode's explicit blank (`_normalizeToLocations`);
+   *    - `suggested` — a filename or floor-code pre-fill awaiting confirmation (IMPORT-28);
+   *    - `autoDefault` — the blind positional Level 1..N of `_defaultAssign`.
+   *
+   *  Everything else is somebody's answer and is never touched. That boundary is the whole safety
+   *  property: an operator pick clears all three markers in one place (`clearUnanswered`), so
+   *  widening what OCR may write can never reach a floor a human chose. `type: 'none'` is likewise
+   *  a real decision and is deliberately absent from the list. */
+  static isUnanswered(a) {
+    return !!a && (a.type === 'unassigned' || !!a.suggested || !!a.autoDefault);
+  }
+
+  /** Retire every "not yet answered" marker on `a` — what the operator answering looks like in the
+   *  model. Called from each place a human commits a floor (`ImportCards._floorButtons`,
+   *  `_addFloor`, the re-anchor pick, `ImportBulk._apply`) so the four can't drift apart, which is
+   *  exactly how a stale `suggested` badge used to survive a hand-picked floor. */
+  static clearUnanswered(a) {
+    if (!a) return;
+    a.suggested = false;
+    delete a.autoDefault;
+    delete a.autoAccepted;
+  }
+
   /** A persisted floor `assign` is trustworthy only if it's an object carrying a string `type`
    *  (what `_resolveFloors`/`_cardUnassigned` read). Used to drop a malformed entry on draft
-   *  resume so it degrades to the model default instead of throwing mid-render. */
+   *  resume so it degrades to the model default instead of throwing mid-render. The optional
+   *  `suggested` flag rides along untouched — an older draft simply has none, which reads as
+   *  "the operator's own answer", exactly the safe default. */
   static _validAssign(a) {
     return !!a && typeof a === 'object' && typeof a.type === 'string';
   }
 
   /** A persisted region-split entry is `{ box:{x,y,w,h}, assign }`; validate the box numerics and
-   *  the nested assign so a corrupt draft can't strand `_stepSplitRegions`/`_resolveFloors`. */
+   *  the nested assign so a corrupt draft can't strand `ImportRegions.openSplit`/`_resolveFloors`. */
   static _validRegion(r) {
     const box = r && r.box;
     return !!box && ['x', 'y', 'w', 'h'].every(k => typeof box[k] === 'number')
       && ImportFlow._validAssign(r.assign);
+  }
+
+  /** A persisted campus pick (MODEL-7) is `{id, slug, name}` with a string `slug` (what
+   *  `_campusSlug`/`buildingLocations` key off) — anything else is dropped on resume so a corrupt
+   *  draft degrades to "no campus chosen" rather than scoping the search to a bogus slug. */
+  static _validCampus(c) {
+    return !!c && typeof c === 'object' && typeof c.slug === 'string' && !!c.slug;
   }
 
   /** A persisted overlay control point (FMT-6) is `{src:[x,y], dst:[nx,ny]}` of finite numbers —
@@ -114,12 +347,31 @@ class ImportFlow {
     return !!p && typeof p === 'object' && pt(p.src) && pt(p.dst);
   }
 
+  /** Whether a saved draft says the **Site plan** step has been answered (`_siteplanStepDone`).
+   *  A draft written before IMPORT-37 knows nothing of that step — it carries the two flags of the
+   *  two steps the merge replaced, so it counts as answered only when **both** were: a draft that
+   *  picked a site plan and stopped has genuinely not answered the code-region half, and must be
+   *  asked it rather than resumed straight onto the map. */
+  static _draftStepDone(draft) {
+    if (!draft || typeof draft !== 'object') return false;
+    if (draft.siteplanStepDone !== undefined) return !!draft.siteplanStepDone;
+    return !!(draft.siteplanDone && draft.codeRegionDone);
+  }
+
   /** Render a fresh `#stage` view with the step title. `stepKey` (one of a flow's linear step
    *  ids, or undefined for a detour/transient screen) is handed to the `_chrome` hook so a flow
-   *  can prepend step chrome — a progress stepper (fresh) or a header (edit) — above the title. */
+   *  can prepend step chrome — a progress stepper (fresh) or a header (edit) — above the title.
+   *
+   *  The home crumb below is a live link out of the wizard on every screen of both flows. It
+   *  carries no guard of its own: it navigates like any other in-app link, so `App._navigate`
+   *  refuses it through `navRefusal` while a run is in flight (IMPORT-61), along with the other
+   *  ways out the wizard never drew. Its label routes through `homeCrumbLabel()` like every other
+   *  home-crumb head, since a fresh import (where this label is seen most) has no siteplan yet
+   *  (IMPORT-62). */
   _stage(title, stepKey) {
+    this._clearUploadRefs();
     this.app.current = null;
-    this.app.crumbs([{ label: 'Siteplan', hash: '/' }, { label: 'Import' }]);
+    this.app.crumbs([{ label: this.app.homeCrumbLabel(), hash: '/' }, { label: 'Import' }]);
     this.app.setToolbar([]);
     const stage = Dom.$('#stage'); stage.innerHTML = '';
     const children = [Dom.el('h2', {}, title)];
@@ -128,6 +380,58 @@ class ImportFlow {
     const view = Dom.el('div', { class: 'import-view' }, children);
     stage.append(view);
     return view;
+  }
+
+  /** Forget the upload step's control refs, because `_stage` is about to wipe `#stage` out from
+   *  under them. Every node `_stepUpload` kept is detached from that moment on, so clearing them
+   *  here is what makes `_setUploadPhase`'s "is this step on screen" test honest: a scan completing
+   *  from somewhere else in the wizard (`_refreshUploadPhase` runs from `scan()`, anywhere) would
+   *  otherwise write phase state into a dead step — and, since IMPORT-55, dim the chrome of whatever
+   *  step actually is on screen. `_stepUpload` re-seats every one of these as it renders. */
+  _clearUploadRefs() {
+    this._dropZone = null;
+    this._progress = null;
+    this._uploadNote = null;
+    this._continueBtn = null;
+    this._uploadBack = null;
+    this._zipLink = null;
+  }
+
+  /** Prepend the discoverable top-of-page `.imp-back-top` control every full-stage detour needs
+   *  (a screen staged with no `stepKey`, so `_chrome` renders no stepper/header) — named for the
+   *  destination it returns to, landing above the title. Bottom action rows (Cancel/Done) are
+   *  unchanged; this exists because a tall canvas + list means scrolling all the way down is the
+   *  only other way out. */
+  _detourBack(view, label, onclick) {
+    view.insertBefore(Dom.el('button', { class: 'imp-back-top', onclick }, label), view.firstChild);
+  }
+
+  /** Hoist a copy of a step's action row to the **top** of the view, directly under the title
+   *  (IMPORT-66) — the row-level sibling of `_detourBack`, and the counterpart to the bottom row's
+   *  sticky rule (IMPORT-64). A step whose content runs for pages — the Buildings step's
+   *  facility-scale grid, the edit hub's bind list — is one an operator arrives at from the top and
+   *  often has nothing left to do on, so the forward action belongs where they already are.
+   *
+   *  **Under the title, not above the content.** What sits between the two is unbounded: the grouped
+   *  Buildings step's preamble alone can carry the campus row, the hoisted facility control and
+   *  "Confirm all N". Anchoring to the title is the only placement that is scroll-free on every
+   *  presentation.
+   *
+   *  The caller owns the row and must build it **in the same paint as the bottom one, from the same
+   *  gate** — see `ImportOrganize.paintActions`, which fills both from one `continueGate()`. That is
+   *  what answers IMPORT-64's objection to a mirrored row: the risk was never the second row, it was
+   *  a second *paint path* that could miss a repaint and offer a Continue the real gate has disabled.
+   *  Two rows off one call cannot disagree.
+   *
+   *  Inserting rather than appending is also what keeps the bottom row sticky: the CSS match is
+   *  `.import-view > .imp-actions:last-child`, which this copy never is. */
+  _actionsTop(view, row) {
+    row.classList.add('imp-actions-top');
+    // `_stage` builds the only `h2` a step view ever holds, so the title is unambiguous — and
+    // anchoring to it rather than to a child index survives the optional `_chrome` above it.
+    const title = view.querySelector('h2');
+    view.insertBefore(row, title.nextSibling);
+    return row;
   }
 
   // ---- step-chrome hooks (fresh-vs-edit divergence; see FreshImportFlow/EditImportFlow) ----
@@ -143,14 +447,117 @@ class ImportFlow {
    *  non-linear edit hub leaves it null (each shared step drops the null child via `Dom.el`). */
   _backButton(_stepKey) { return null; }
 
+  /** Reflect "a run is in flight" onto whatever nav-away the chrome itself offers, so the chrome and
+   *  the step's own back button are disabled in step rather than drifting apart (IMPORT-55). Called
+   *  by `_setUploadPhase` — the single writer of that state — and only while the upload step is on
+   *  screen. The base renders no chrome, so it has none to disable; `FreshImportFlow` overrides for
+   *  its stepper, whose done entries jump back to an earlier step, while the edit flow's static
+   *  header has nothing to click. */
+  _setChromeBusy(_busy) {}
+
+  // ---- the scan (single-flight, busy-tolerant) ----
+
+  /** Whether an `import/scan` is in flight — read by `_setUploadPhase` as the third conjunct of
+   *  the Continue gate. */
+  get scanBusy() { return !!this._scanFlight; }
+
+  // ---- leaving the wizard (App's stage-page nav guard) ----
+
+  /** Refuse to be navigated **out of the wizard** while an upload run or a scan is in flight
+   *  (IMPORT-61) — `App._navRefusal` asks this from the navigation chokepoint, so it answers for
+   *  every door the wizard itself didn't draw: the crumb trail's `Siteplan` link (stamped on every
+   *  screen by `_stage`, in both flows), browser Back/Forward, the settings gear, the facility
+   *  picker. `_goToStep` guards the ways off a *step*; this guards the ways off the *wizard*, and
+   *  the hazard is the same one — leaving mid-run detaches the live `_progress` node the runner
+   *  narrates into, and leaving mid-scan lets that scan re-stage the wizard on top of wherever the
+   *  operator went.
+   *
+   *  Same `busyGate` decision as every other refusal, so the wording can't say something different
+   *  from what the upload step is showing. The refusal is bounded by construction: a run always
+   *  ends back at `idle`, and `scan()` clears `_scanFlight` in a `finally` within
+   *  `SCAN_BUSY_BUDGET_MS` — an unbounded one would trap the operator in the wizard. Returns the
+   *  message to show, or null to allow the navigation. */
+  navRefusal() {
+    const gate = ImportFlow.busyGate({ phase: this.uploader.phase, scanBusy: this.scanBusy });
+    return gate.busy ? gate.message : null;
+  }
+
+  /** **Every** `import/scan` in the wizard goes through here (IMPORT-47). Two guarantees:
+   *
+   *  - **Single-flight.** A scan already in flight is *joined*, not raced. §10 makes the client
+   *    responsible for never sending a second scan — the server's render lock is a backstop, and
+   *    its 409 is an error the user can do nothing with. A scan fired straight off the Continue
+   *    button (`_scanAndMap`) used to sit outside any such coordination, so stepping back to the
+   *    upload step and clicking Continue twice put two scans on the wire: the loser toasted `an
+   *    import is already running`, then the winner navigated on its own a minute later. That button
+   *    is now the wizard's *only* scan trigger (IMPORT-65), which makes this the guarantee the whole
+   *    step rests on rather than a second one beside the uploader's.
+   *  - **A busy server is waited out, never surfaced raw.** Something else can still hold the lock
+   *    (a build in another tab, a `reset`), which no client-side flag can know about. That 409 is
+   *    polled through (see `SCAN_BUSY_*`) rather than thrown at a user who was invited to press
+   *    the button; only a genuinely stuck lock ends as an error, and it says what it means.
+   *
+   *  Resolves to the scan's inventory JSON; throws like `Api.post` on a real failure, so every
+   *  existing `catch` keeps working unchanged. */
+  scan() {
+    if (!this._scanFlight) {
+      this._scanFlight = this._runScan().finally(() => {
+        this._scanFlight = null;
+        this._scanWaiting = false;
+        this._refreshUploadPhase();
+      });
+      this._refreshUploadPhase();
+    }
+    return this._scanFlight;
+  }
+
+  /** POST the scan, polling through a busy server. Kept apart from `scan()` so the single-flight
+   *  bookkeeping has one exit (`finally`) regardless of how this returns. */
+  async _runScan() {
+    const deadline = Date.now() + ImportFlow.SCAN_BUSY_BUDGET_MS;
+    for (;;) {
+      try {
+        return await Api.post('/api/import/scan', {});
+      } catch (e) {
+        // Only the working-dir lock's 409 is worth waiting on; every other failure is the caller's
+        // to report (`Api._fail` attaches the status so this needn't re-parse the message).
+        if (e.status !== 409 || Date.now() >= deadline) {
+          if (e.status === 409) {
+            throw new Error('another import has been running for too long — reload the page, and '
+              + 'if it persists ask an administrator to check the server');
+          }
+          throw e;
+        }
+        if (!this._scanWaiting) { this._scanWaiting = true; this._refreshUploadPhase(); }
+        await ImportFlow._sleep(ImportFlow.SCAN_BUSY_POLL_MS);
+      }
+    }
+  }
+
+  /** The busy-poll's delay. Private to the scan loop — the wizard has no other timed wait, so this
+   *  stays here rather than becoming a shared `Util` helper on nothing's behalf. */
+  static _sleep(ms) { return new Promise(done => setTimeout(done, ms)); }
+
+  /** Re-run the upload step's control gate against the current scan state. A no-op unless that
+   *  step is on screen (`_setUploadPhase` is null-guarded throughout), so `scan()` can call it
+   *  from anywhere in the wizard. */
+  _refreshUploadPhase() {
+    this._setUploadPhase(this.uploader.phase);
+  }
+
   async show() {
     // Probe for an in-progress import (existing uploads). The scan also regenerates
     // thumbnails so the map step's cards are ready when we jump straight to it.
     const loadView = this._stage('Import a facility');
     loadView.append(Dom.el('p', { class: 'imp-progress' }, 'Checking for existing uploads…'));
+    // The bind step steers off the facility's declared organization mode (MODEL-7), which lives on
+    // the facility list. `init()` loads that list fire-and-forget, so await it here rather than
+    // letting a slow boot fetch make a `site-as-campus` facility read as the default and get
+    // Site-anchored suggestions — the exact by-luck binding this step exists to end.
+    await this.app.ensureFacilities();
     let inv;
     try {
-      inv = await Api.post('/api/import/scan', {});
+      inv = await this.scan();
     } catch (e) {
       // A scan *failure* is NOT the same as "no uploads": swallowing it and falling to a fresh
       // upload would make a built facility look like it vanished. Each flow decides how to
@@ -168,12 +575,12 @@ class ImportFlow {
     return this._freshStart();
   }
 
-  /** A brand-new import opens with the install-wide grouping question (Site Group vs Region,
-   *  MULTI-3) before the first upload. Shared by both flows: a fresh open with no existing
-   *  uploads starts here regardless of which flow is driving (the edit hub reaches grouping from
-   *  its own row instead). */
+  /** A brand-new import opens with the topology question — what a facility is, and what a building
+   *  is (MULTI-3 + MODEL-6, TOPO-3) — before the first upload. Shared by both flows: a fresh open
+   *  with no existing uploads starts here regardless of which flow is driving (the edit hub reaches
+   *  the same step from its own row instead). */
   _freshStart() {
-    this._stepGrouping(() => this._stepUpload());
+    this._stepTopology(() => this._stepUpload());
   }
 
   // ---- subclass hooks (the only fresh-vs-edit divergence; see FreshImportFlow/EditImportFlow) ----
@@ -182,79 +589,100 @@ class ImportFlow {
   _resume() { throw new Error('ImportFlow._resume is abstract'); }
   /** Where `show()` routes when the scan itself throws (degrade without faking a fresh install). */
   _onScanError(_e) { throw new Error('ImportFlow._onScanError is abstract'); }
-  /** The bind step's (`_stepBuildings`) action row — fresh keeps the linear "Continue to floor
-   *  mapping"; edit offers "Save & back to hub". */
+  /** The bind screen's (`ImportBind.step`) action row. Only the edit hub reaches that screen since
+   *  IMPORT-34 (fresh overrides `_stepBuildings` to the merged Buildings step, which builds its own
+   *  actions), so `EditImportFlow` is the one live override — kept a hook so the screen itself
+   *  stays flow-agnostic. */
   _buildingsActions(_focusBuilding) { throw new Error('ImportFlow._buildingsActions is abstract'); }
 
-  /** Ask which NetBox grouping identifies a *facility* (MULTI-3) — an install-wide choice the
-   *  facility picker resolves against: a `dcim.SiteGroup` (the default) or a `dcim.Region`. Shown
-   *  as the first step of a fresh import and re-editable from the hub; `next` is where Continue
-   *  routes (the upload step, or back to the hub). Persists via the import-gated facilities POST
-   *  and updates the live `app.grouping` so the picker reflects it without a reload. */
-  _stepGrouping(next) {
-    const view = this._stage('How is your facility organized?', 'grouping');
-    view.append(Dom.el('p', { class: 'hint' },
-      'A “facility” is one campus or site you map on its own. Pick which NetBox grouping names a '
-      + 'facility. The choice applies to the whole install and drives the facility picker. Most '
-      + 'installs use Site Group.'));
+  /** Where the Buildings step goes when it is done with the buildings question. The edit hub has no
+   *  walk, so the base lands straight on the map; `FreshImportFlow` overrides it with the next step
+   *  of its linear walk (IMPORT-37). A hook rather than a `hasContent()` branch inside the shared
+   *  step — and the reason the map step needs no gates: forward routing lives with the flow that
+   *  owns the step order, not with the step being routed to. */
+  _afterBuildings() { return this._stepMap(); }
 
-    let chosen = this.app.grouping;
-    const cards = [];
-    const opts = [
-      ['sitegroup', 'Site Group',
-        'Sites grouped organizationally or functionally (dcim.SiteGroup). The default.'],
-      ['region', 'Region',
-        'Sites grouped geographically by country, campus, or building cluster (dcim.Region).'],
-    ];
-    for (const [value, title, desc] of opts) {
-      const radio = Dom.el('input', { type: 'radio', name: 'imp-grouping', value });
-      if (value === chosen) radio.checked = true;
-      const card = Dom.el('label',
-        { class: 'imp-bind imp-grouping-opt' + (value === chosen ? ' selected' : '') }, [
-          Dom.el('div', { class: 'imp-bind-head' }, [
-            radio, Dom.el('span', { class: 'imp-bind-folder' }, title),
-          ]),
-          Dom.el('div', { class: 'imp-hub-meta' }, desc),
-        ]);
-      radio.addEventListener('change', () => {
-        chosen = value;
-        cards.forEach(c => c.classList.toggle('selected', c === card));
-      });
-      cards.push(card);
-      view.append(card);
-    }
+  // ---- step 1: how is this facility organized? (both settings axes, TOPO-3) ----
 
-    const cont = Dom.el('button', { class: 'primary', onclick: async () => {
-      // Changing the grouping on a populated install re-scopes which facility each Site resolves to,
-      // so existing map data can end up orphaned under the old key (HEALTH-1). Warn + confirm before
-      // the change (the server enforces the same gate via a 409 unless `confirm` is passed), and
-      // point at the Settings reassignment that recovers anything that does get stranded.
-      const changing = chosen !== this.app.grouping;
-      if (changing && this.app.store.hasContent() && !window.confirm(
-        'Changing the facility grouping re-scopes your existing map data. Floors, rooms, and '
-        + 'placements may become unassigned and disappear from the map until you reassign them '
-        + 'from the Settings page. Change the grouping anyway?')) {
-        return;
-      }
-      cont.disabled = true;
-      try {
-        await this.app.netbox.setGrouping(chosen, changing);
-        this.app.grouping = chosen;
-      } catch (e) {
-        cont.disabled = false;
-        return Toast.show('Could not save grouping: ' + e.message, true);
-      }
-      next();
-    } }, 'Continue');
-    view.append(Dom.el('div', { class: 'imp-actions' }, [cont]));
+  /** Which route the topology step opens on: `'detect'` | `'guided'` | `'manual'`. A subclass hook
+   *  rather than a `store.hasContent()` branch inside the shared step (§10 in-app-import): a first
+   *  import wants to be *told* what it is looking at, while an already-configured facility should
+   *  open on what is currently set rather than be nudged off a working configuration. */
+  _topologyDefaultRoute() { return 'detect'; }
+
+  /** Ask how this facility is organized (TOPO-3) — `ImportTopology` owns the step; a thin
+   *  delegator, kept on the base because both flows drive it directly (the fresh walk opens on it,
+   *  the edit hub's "Facility layout" row re-enters it). `next` is where a committed answer
+   *  routes. */
+  _stepTopology(next) {
+    this.topology.open(next);
+  }
+
+  /** The setup in force right now, as one short line for the "keep it" control: the install-wide
+   *  grouping and this facility's effective organization mode. */
+  _currentTopologyLabel() {
+    return ImportFlow.groupingLabel(this.app.grouping) + ' · '
+      + (this._isCampusMode() ? 'Site = campus' : 'Site = building');
+  }
+
+  // ---- step 1.4: the campus Site (site-as-campus organization mode only) ----
+
+  /** The facility's declared NetBox organization mode (MODEL-6) — `'site-as-building'` (a Site *is*
+   *  a building) or `'site-as-campus'` (a Site is a campus whose buildings are Locations). Read
+   *  through `App.orgMode()`, the single reader; `show()` awaits the facility list first so this is
+   *  never a premature default. */
+  _orgMode() {
+    return this.app.orgMode();
+  }
+
+  /** True when this facility is declared Site = campus, so the wizard should bind drawing folders to
+   *  building **Locations** beneath one campus Site rather than to Sites. */
+  _isCampusMode() {
+    return this._orgMode() === 'site-as-campus';
+  }
+
+  /** The Site slug the building search scopes to, or `''` for an unscoped facility-wide search:
+   *  the chosen campus in `site-as-campus` mode, nothing otherwise (a `site-as-building` facility
+   *  has no campus concept, and a stale `campus` from a mode flip must not narrow its search). */
+  _campusSlug() {
+    return (this._isCampusMode() && this.campus && this.campus.slug) || '';
+  }
+
+  /** The buildings that already carry a NetBox anchor. The population every "changing this setting
+   *  is safe" note below is *about* — and the reason those notes test bound buildings rather than
+   *  `store.hasContent()`: what an operator stands to lose is an anchor they already confirmed, not
+   *  a built manifest, and testing the thing itself keeps the copy honest on a first import that
+   *  stepped back to the layout step after binding (§10 in-app-import — no flow-mode fork). */
+  _boundBuildings() {
+    return this.buildings.filter(b => b.nbSite);
+  }
+
+  /** Ask for the facility's campus Site (MODEL-7) — `ImportTopology` owns the step; a thin
+   *  delegator, kept on the base because both flows drive it directly (the linear walk visits it
+   *  between upload and bind, the edit hub's "Campus site" row re-enters it). `next` is where
+   *  Continue/Skip route. */
+  _stepCampus(next) {
+    this.topology.openCampus(next);
   }
 
   // ---- step 1: upload ----
   _stepUpload() {
+    // A fresh visit: the uploader's "uploaded N drawings so far" total and its overwrite bookkeeping
+    // span the successive runs of one visit (IMPORT-65), not the wizard's whole lifetime.
+    this.uploader.beginVisit();
     // In merge mode the upload step is a detour off the map (add drawings), not the linear step —
     // no stepper and no linear back-nav (a plain Cancel returns to the map instead).
     const view = this._stage(this._mergeMode ? 'Add drawings' : 'Import a facility',
       this._mergeMode ? undefined : 'upload');
+
+    // Stepping back into this step (or simply revisiting it) after drawings are already uploaded
+    // must not look empty — the files are server-side the whole time (`this.inv`, the last scan),
+    // so there is nothing to re-upload. Merge mode is exempt: there the existing drawings are
+    // *expected* to be there already and the ask is purely additive, so it keeps its plain drop
+    // zone rather than a "continue with what's here" summary (IMPORT-16).
+    const hasFolders = this.inv && this.inv.folders && this.inv.folders.length > 0;
+    const uploaded = !this._mergeMode && hasFolders;
+    if (uploaded) view.append(this._uploadSummary(this.inv.folders));
 
     const folderInput = Dom.el('input', {
       type: 'file', class: 'imp-file', multiple: 'multiple', accept: ImportUploader.EXTS.join(','),
@@ -271,9 +699,18 @@ class ImportFlow {
       onchange: (e) => { const f = e.target.files[0]; if (f) this.uploader.uploadZip(f); },
     });
 
-    const drop = Dom.el('div', { class: 'imp-drop', onclick: () => folderInput.click() }, [
-      Dom.el('div', { class: 'imp-drop-big' }, 'Drop or click to choose a facility folder'),
+    // Demoted (smaller, quieter) once the summary above already says what's there — the drop zone
+    // is then "add / replace", not the primary action for the step.
+    const dropLabel = uploaded
+      ? 'Drop or click to add or replace drawings'
+      : 'Drop or click to choose a facility folder';
+    const drop = Dom.el('div', { class: 'imp-drop' + (uploaded ? ' imp-drop-secondary' : ''),
+      onclick: () => folderInput.click() }, [
+      Dom.el('div', { class: 'imp-drop-big' }, dropLabel),
     ]);
+    // Kept for `_setUploadPhase`, which swaps the label while a scan is running and restores it.
+    this._dropZone = drop;
+    this._dropLabel = dropLabel;
     drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
     drop.addEventListener('dragleave', () => drop.classList.remove('over'));
     drop.addEventListener('drop', async (e) => {
@@ -287,9 +724,11 @@ class ImportFlow {
     view.append(zipInput);
     // Separate affordance for the zip-via-click path (see zipInput) — kept outside the drop zone's
     // onclick, which fires the folder picker.
+    this._zipLink = Dom.el('button', { class: 'imp-link', onclick: () => zipInput.click() },
+      'Choose a .zip file');
     view.append(Dom.el('div', { class: 'imp-drop-alt' }, [
       Dom.el('span', { class: 'hint' }, 'Have a .zip of your drawings? '),
-      Dom.el('button', { class: 'imp-link', onclick: () => zipInput.click() }, 'Choose a .zip file'),
+      this._zipLink,
     ]));
     this._progress = Dom.el('div', { class: 'imp-progress hidden' });
     view.append(this._progress);
@@ -299,13 +738,144 @@ class ImportFlow {
     view.append(this._uploadNote);
     const cont = this._mergeMode
       ? Dom.el('button', { class: 'primary', onclick: () => this._mergeUploads() }, 'Done adding')
-      : Dom.el('button', { class: 'primary', onclick: () => this._scanAndMap() }, 'Continue to mapping');
+      : Dom.el('button', { class: 'primary', onclick: () => this._scanAndMap() },
+        uploaded ? 'Continue with these drawings →' : 'Continue to mapping');
+    // Whether anything exists on the server to continue with (IMPORT-32). Keyed off `hasFolders`,
+    // NOT `uploaded`: merge mode and a step-back-after-upload must both count as "has content" even
+    // though `uploaded` is false in the former and true in the latter — the two flags answer
+    // different questions (what to render vs. whether anything exists to continue with). An upload
+    // landing its first file flips this mid-step (`ImportUploader._markContent`).
+    this._continueBtn = cont;
+    // Kept for `continueGate`, which swaps the label while a scan runs and restores it after —
+    // the same `_dropLabel` convention the drop zone uses.
+    this._continueLabel = cont.textContent;
+    this._uploadHasContent = hasFolders;
     const back = this._mergeMode
       ? Dom.el('button', { onclick: () => { this._mergeMode = false; this._stepMap(); } }, 'Cancel')
       : this._startOver();
     // Linear back to the grouping step (fresh, non-merge only — null in merge mode / edit).
     const linBack = this._mergeMode ? null : this._backButton('upload');
+    // The step's nav-away (Cancel in merge mode, the linear back otherwise): leaving mid-run strands
+    // a runner still streaming files into a progress line the navigation has detached. "Start over"
+    // is guarded in `_reset` instead, since the same button is built by every step.
+    this._uploadBack = this._mergeMode ? back : linBack;
     view.append(Dom.el('div', { class: 'imp-actions' }, [linBack, cont, back]));
+    // A re-render can land while something is still running (`_scanAndMap` returns here when a scan
+    // finds no drawings), so reflect the uploader's current phase on these fresh controls rather
+    // than showing it idle.
+    this._setUploadPhase(this.uploader.phase);
+  }
+
+  /** Reflect `ImportUploader`'s phase on the upload step's controls (IMPORT-30). While a run is in
+   *  flight the controls that would race it are disabled (see `_stepUpload`); while a **scan** is in
+   *  flight the queue is sealed too, so the drop zone stops accepting selections and says so
+   *  (IMPORT-47 — and since IMPORT-65 a scan is the only thing that seals it, an upload run having
+   *  no scan of its own any more). `ImportUploader._submit` refuses a sealed selection regardless,
+   *  so this is the visible half of that guard, not the enforcement. It returns early once the step
+   *  is off screen (`_stage` clears the refs it writes), so it can be called from anywhere in the
+   *  wizard without reaching into a step that has been replaced.
+   *
+   *  Continue answers to **three** gates and is recomputed here as their conjunction (see
+   *  `continueGate`, which holds the decision itself): there must be something on the server to
+   *  continue with (IMPORT-32), no upload run in flight to race, and no scan in flight to fire a
+   *  second of (IMPORT-47). This is the single place that state is written, so the rules can't
+   *  fight over the button. */
+  _setUploadPhase(phase) {
+    // Not on screen — `_stage` cleared every ref below, so there is nothing to reflect onto.
+    const drop = this._dropZone;
+    if (!drop) return;
+    // A scan in flight is what **seals** the step (IMPORT-47) — `ImportUploader.sealed` reads the
+    // same condition. Both halves matter: a selection accepted now starts a run the scan would
+    // navigate away from mid-upload, and a nav-away strands a scan that later yanks the operator
+    // forward out of whatever step they left for — the unexplained auto-advance that guard is about.
+    // An upload *run* seals nothing on its own: it scans nothing and ends back on this step
+    // (IMPORT-65), so it only disables the controls that would race it.
+    const scanning = this.scanBusy;
+    const busy = ImportFlow.busyGate({ phase, scanBusy: scanning }).busy;
+    const gate = ImportFlow.continueGate({
+      phase, hasContent: this._uploadHasContent, scanBusy: scanning,
+      scanWaiting: this._scanWaiting, label: this._continueLabel,
+    });
+    this._continueBtn.disabled = gate.disabled;
+    this._continueBtn.textContent = gate.label;
+    // Both nav-aways off this step, disabled together: the step's own back/cancel (null in the edit
+    // flow, which offers none) and whatever the chrome above the title offers — the fresh flow's
+    // stepper, which used to walk the operator off a live run (IMPORT-55).
+    if (this._uploadBack) this._uploadBack.disabled = busy;
+    this._setChromeBusy(busy);
+    this._zipLink.disabled = scanning;
+    drop.classList.toggle('imp-drop-busy', scanning);
+    const label = drop.querySelector('.imp-drop-big');
+    // The sealed drop zone names what it is waiting on; otherwise it goes back to inviting a
+    // selection — including right after a run, which now ends here rather than navigating away.
+    if (label) label.textContent = scanning ? 'Scanning your drawings…' : this._dropLabel;
+  }
+
+  /** The upload step's Continue gate as a pure decision: `{disabled, label}` from the three rules
+   *  that own the button. Extracted from `_setUploadPhase` (still the only *writer*) so the
+   *  conjunction the §10 invariant is about can be exercised directly rather than inferred from a
+   *  rendered step:
+   *
+   *  - `hasContent` (IMPORT-32) — nothing on the server means nothing to continue with. This is
+   *    the only rule that reads as a plain "not yet", so it keeps the button's own label.
+   *  - `phase` (IMPORT-30) — an upload run in flight; Continue would fire a scan racing it. The
+   *    step's progress line already narrates the upload, so the label is left alone here too. The
+   *    moment the run ends this rule clears and the button goes live *on the step* — since
+   *    IMPORT-65 that is the only way onward, so this gate is what the operator is waiting on.
+   *  - `scanBusy`/`scanWaiting` (IMPORT-47) — a scan in flight. This one *is* relabelled: the
+   *    click that started it navigates nowhere for as long as the scan takes, and a dead button
+   *    with no explanation is what made the old double-click look broken. `scanWaiting` narrows
+   *    it further, to the case where the server is busy with someone else's import entirely. */
+  static continueGate({ phase, hasContent, scanBusy, scanWaiting, label }) {
+    if (scanBusy) {
+      return { disabled: true,
+        label: scanWaiting ? 'Waiting for the running import…' : 'Scanning your drawings…' };
+    }
+    return { disabled: phase !== 'idle' || !hasContent, label };
+  }
+
+  /** Whether an upload run or a scan is in flight, and how to say so — the one decision behind every
+   *  "not while this is running" refusal the upload step makes, and the reason its controls can't
+   *  drift apart from each other. Pure, beside `continueGate`, so it can be exercised directly
+   *  rather than inferred from a rendered step.
+   *
+   *  It returns the wording rather than a bare boolean because the run and the scan are different
+   *  things to be waiting on, and a refusal that names the wrong one reads as a bug. The phase is
+   *  checked first so a run narrates as an upload everywhere; since IMPORT-65 the two can no longer
+   *  overlap in practice (a run scans nothing, and a scan seals the step against starting one), so
+   *  that precedence is defence against an unreachable pairing rather than, as it once was, the
+   *  everyday description of a run finishing in its own scan.
+   *
+   *  Four callers, one rule: `_setUploadPhase` disables the step's nav-aways (its back/cancel and
+   *  the chrome's stepper), `FreshImportFlow._goToStep` refuses the jump those controls would make
+   *  anyway (the enforcement behind them, IMPORT-55), `navRefusal` refuses to leave the wizard at
+   *  all (the crumb trail, browser Back, the gear, the picker — IMPORT-61), and `_reset` refuses to
+   *  wipe the working dir out from under the run. */
+  static busyGate({ phase, scanBusy }) {
+    if (phase !== 'idle') return { busy: true, message: 'An upload is still in progress' };
+    if (scanBusy) return { busy: true, message: 'Your drawings are still being scanned' };
+    return { busy: false, message: '' };
+  }
+
+  /** The "already uploaded" card shown above the drop zone when the working dir already holds
+   *  drawings from a prior visit to this step (IMPORT-16): folder names + per-folder drawing
+   *  counts, so stepping back from a later step reads as "here's what you have", not "start over".
+   *  Reads straight from the last scan (`folders`, i.e. `this.inv.folders`) rather than the
+   *  editable `this.buildings` model — it only needs to say what's on disk, not how it's assigned. */
+  _uploadSummary(folders) {
+    const total = folders.reduce((n, f) => n + f.pdfs.length, 0);
+    const rows = folders.map(f => Dom.el('li', { class: 'imp-upload-summary-row' }, [
+      Dom.el('span', {}, ImportFlow.prettyName(f.folder)),
+      Dom.el('span', { class: 'hint' },
+        f.pdfs.length + ' drawing' + (f.pdfs.length === 1 ? '' : 's')),
+    ]));
+    return Dom.el('section', { class: 'imp-bind imp-upload-summary' }, [
+      Dom.el('div', { class: 'imp-bind-head' }, [
+        Dom.el('div', { class: 'imp-bind-folder' },
+          total + ' drawing' + (total === 1 ? '' : 's') + ' already uploaded'),
+      ]),
+      Dom.el('ul', { class: 'imp-upload-summary-list' }, rows),
+    ]);
   }
 
   /** Route an ingested `{ items, bim }` selection: upload the importable drawings, or — when there
@@ -335,7 +905,7 @@ class ImportFlow {
   // ---- step 2: map ----
   async _scanAndMap() {
     try {
-      const inv = await Api.post('/api/import/scan', {});
+      const inv = await this.scan();
       if (!inv.ok) throw new Error(inv.error || 'scan failed');
       this.inv = inv;
     } catch (e) { Toast.show('Scan failed: ' + e.message, true); return; }
@@ -356,6 +926,10 @@ class ImportFlow {
    *  normal upload step in "merge" mode so the re-scan re-applies that draft — existing drawings
    *  keep their floors and only the newly added ones arrive unassigned. */
   async _addDrawings() {
+    // A merge re-scans and rebuilds `this.buildings`, so a sweep still applying reads to the
+    // current model would be writing into objects about to be replaced — and racing the draft the
+    // merge re-applies (IMPORT-53). Stopped, not suppressed: the new drawings want reading too.
+    this.ocr.cancel({ suppress: false });
     await this._saveDraft();
     this._mergeMode = true;
     this._stepUpload();
@@ -366,7 +940,7 @@ class ImportFlow {
    *  unbound in the binding step, which auto-skips back to the map once everything is bound. */
   async _mergeUploads() {
     try {
-      const inv = await Api.post('/api/import/scan', {});
+      const inv = await this.scan();
       if (!inv.ok) throw new Error(inv.error || 'scan failed');
       this.inv = inv;
     } catch (e) { Toast.show('Scan failed: ' + e.message, true); return; }
@@ -390,8 +964,12 @@ class ImportFlow {
   static _explodePages(p) {
     const n = p.pages || 1;
     if (n <= 1) return [p];
+    // `sizes`/`unit` ride along whole (the row's own `page` indexes them, see
+    // `ImportRegions.pageGeom`), so a page row reports its own sheet geometry — pages of one PDF
+    // are not required to be the same size.
     return Array.from({ length: n }, (_, i) => ({
       file: p.file, pdf: p.pdf, stem: p.stem + '#p' + (i + 1), page: i + 1, thumb: null,
+      sizes: p.sizes, unit: p.unit,
     }));
   }
 
@@ -427,13 +1005,25 @@ class ImportFlow {
         // NetBox floor Locations for the building's bound site, lazily fetched in the map
         // step so floors can be picked as buttons. undefined = not fetched, 'loading' = in
         // flight, array = done (empty array = fall back to the floor-type buttons).
+        // Never persisted: `_saveDraft` strips it (it is re-fetched every load, and a site's whole
+        // Location list would bloat every draft write).
         nbFloors: undefined,
+        // Why `nbFloors` is what it is (see `_loadFloors`): null = a clean, complete read;
+        // 'fetch' | 'site-missing' | 'truncated' otherwise. Read by `ImportCards._floorButtons` so a
+        // broken binding or a clipped list can't masquerade as "this site has no floors". Transient
+        // like `nbFloors`, and stripped from the draft with it.
+        nbFloorsError: null,
         // Per-PDF floor assignment. `token` (a NetBox Location slug) takes precedence over
         // `type`/`num`; when set, the build emits the slug verbatim as the floor id (see
         // `_resolveFloors`/`_build`).
+        // A drawing whose filename spells its floor takes that (flagged `suggested`, so the card
+        // presents it as a pre-fill to confirm — IMPORT-28); the rest keep the blind Level 1..N
+        // default. In Location mode `_normalizeToLocations` clears both back to `unassigned` and
+        // `ImportBulk.suggestFloors` re-derives against the real Locations, so the guess is made
+        // once here for the floor-type fallback and once there for Location mode.
         assign: Object.fromEntries(pdfs.map((p, i) =>
           [p.stem, isSite ? { type: 'none', num: 1, token: null, label: '' }
-            : { type: 'level', num: i + 1, token: null, label: '' }])),
+            : ImportFlow._defaultAssign(p, i)])),
         // Per-card thumbnail framing (zoom/pan) — a viewing aid only, never sent to build.
         frame: Object.fromEntries(pdfs.map(p => [p.stem, { scale: 1, x: 0, y: 0 }])),
         // Per-card straightening rotation ({deg} clockwise, 0 = as-is). Unlike `frame`, this IS
@@ -453,7 +1043,7 @@ class ImportFlow {
         regions: Object.fromEntries(pdfs.map(p => [p.stem, []])),
         // Per-drawing overlay control points (FMT-6): `[{src:[sx,sy], dst:[nx,ny]}, …]` pairs
         // tying a GIS overlay's raw source coordinates to spots on its floor's 0..1 canvas,
-        // captured in the align editor (`_stepAlignOverlay`). Only OVERLAY-role drawings use
+        // captured in the align editor (`ImportAlign.open`). Only OVERLAY-role drawings use
         // theirs; `_build` emits ≥2 pairs as the import-map `overlayAlign`, which georeferences
         // the layer at the next build. Empty (the default) = fit-to-bounds, as before.
         align: Object.fromEntries(pdfs.map(p => [p.stem, []])),
@@ -480,17 +1070,86 @@ class ImportFlow {
     return this.buildings.filter(b => b.pdfs.some(p => b.assign[p.stem].type !== 'none'));
   }
 
-  /** True once every floor-contributing building is bound to a NetBox site. */
+  /** True once every floor-contributing building is bound to a NetBox site — **bound**, which counts
+   *  an unconfirmed auto-match (`nbSite.auto`) as bound. Deliberately unchanged by IMPORT-57: three
+   *  of its four callers need exactly this looser question. `FreshImportFlow._resume` uses it to
+   *  decide whether a restored draft still owes the Buildings step an *anchor*, and both edit-flow
+   *  **Auto-match buildings** buttons (`EditImportFlow._buildingsActions`/`_stepHub`) are offered
+   *  while anything is *unbound* — auto-match only ever fills unbound rows, so tightening this would
+   *  offer a button that could do nothing. The fourth caller, the fresh Buildings step's Continue,
+   *  asks `_allBuildingsConfirmed()` **as well**. */
   _allBuildingsBound() {
     return this._floorBuildings().every(b => b.nbSite);
   }
 
-  /** True when every uploaded drawing sits in a single building folder — the shape a flat,
-   *  unsorted pile of drawings lands in (one `uploads/<folder>/` bucket, since `ImportUploader.split`
-   *  routes an unsubfoldered selection into one building). The signal for offering the in-wizard
-   *  building split (`_stepAssignBuildings`) on the bind step. */
-  _isSingleBuildingImport() {
-    return this.buildings.length === 1;
+  /** True once every floor-contributing building carries a **confirmed** anchor — bound, and not
+   *  still flagged as the wizard's own guess (IMPORT-57). A second predicate rather than a
+   *  tightening of `_allBuildingsBound()`, whose other callers ask a genuinely different question.
+   *
+   *  This is the bar the fresh Buildings step's Continue now shares with
+   *  `ImportOrganize.groupedNeedsAttention`, and the two used to disagree: the grouped screen
+   *  refused to auto-skip while any anchor was an unconfirmed guess, then — once it did render —
+   *  waved those same guesses through Continue, because the gate only asked `_allBuildingsBound()`.
+   *  Re-anchoring changes every `Room.floor_key` beneath a building (§10 foundations), so the review
+   *  the row's "Confirm or change" asks for is the last one before those keys are committed.
+   *
+   *  The two predicates agree on the **binding axis only**. `groupedNeedsAttention` stays
+   *  deliberately broader — it also stops on a pending/foreign facility verdict and on `_bindRow`'s
+   *  campus-mode Site-anchor advisory. Neither belongs in this gate: the facility lock is optional,
+   *  and nothing new is gated on the organization mode (MODEL-7). "Worth rendering the screen" is a
+   *  lower bar than "must not proceed"; only the binding axis was ever inconsistent between them. */
+  _allBuildingsConfirmed() {
+    return ImportFlow.allAnchorsConfirmed(this._floorBuildings());
+  }
+
+  /** Whether every building in `buildings` carries a confirmed anchor — the bar `_allBuildingsConfirmed`
+   *  applies to `_floorBuildings()`, lifted out pure and static (like `anchorFromRow`,
+   *  `ImportBind.facilityRowState`, `ImportOrganize.groupedNeedsAttention`) so the unit tier can pin
+   *  it against the auto-skip predicate it is supposed to agree with. */
+  static allAnchorsConfirmed(buildings) {
+    return buildings.every(b => b.nbSite && !b.nbSite.auto);
+  }
+
+  /** The NetBox anchor one candidate row stands for, in the shape `_bindSite`/`_bindBuilding` take —
+   *  or null when the row is not a NetBox object at all (a hand-typed building name, an upload
+   *  folder). The bridge from a picker row to a binding, used to carry an organize-step pick into
+   *  the bind step (IMPORT-25).
+   *
+   *  **The row's own shape decides the anchor kind, never the ambient organization mode**: a
+   *  building Location carries its campus `site_slug`/`site_name` (`serializers._trim_building_
+   *  location`) and a Site does not (`_trim_site`). Keying off the row means a pick binds as the
+   *  kind it was *made* as even if the mode is flipped between the two steps — the mode steers what
+   *  a step offers, never what an answer already given meant (MODEL-7). */
+  static anchorFromRow(row) {
+    if (!row || !row.slug) return null;
+    const id = row.id == null ? null : row.id;
+    const name = row.name || row.slug;
+    // A Location anchor's `site` is the campus, whose own id is not in this row (only its
+    // slug/name) — the same null-id campus record `_bindRow`'s Location branch builds.
+    if (row.site_slug)
+      return {
+        kind: 'building',
+        site: { id: null, slug: row.site_slug, name: row.site_name || row.site_slug },
+        building: { id, slug: row.slug, name },
+      };
+    return { kind: 'site', site: { id, slug: row.slug, name } };
+  }
+
+  /** The NetBox anchor a building resolves to, as one comparable string: the site slug for a Site
+   *  anchor, `siteSlug/buildingSlug` for a Location anchor (MODEL-4). `''` for a building with no
+   *  slug yet — the callers' own empty-slug guards own that case.
+   *
+   *  **This, not the site slug, is the identity that must be unique** across floor-contributing
+   *  buildings. Under `site-as-campus` (which the `location` grouping forces server-side) every
+   *  building binds beneath one campus Site, so `_bindBuilding` gives them all the *same* `b.slug`
+   *  and they are told apart by their building Location alone. A slug-level uniqueness test
+   *  therefore rejects a perfectly good campus import wholesale (IMPORT-28) — it is the anchor that
+   *  collides or doesn't. Both the boundary guard (`_buildMap`) and the inline warning
+   *  (`ImportCards._buildingFieldError`) key off this one helper so the two can never drift. */
+  static anchorKey(b) {
+    const s = (b.slug || '').trim();
+    if (!s) return '';
+    return b.nbBuilding ? s + '/' + b.nbBuilding.slug : s;
   }
 
   /** Bind a building to a NetBox **Site** anchor (the Site *is* the building): store its identity
@@ -502,6 +1161,7 @@ class ImportFlow {
     b.nbSite = { id: site.id, slug: site.slug, name: site.name, auto: !!auto };
     b.nbBuilding = null;
     b.nbFloors = undefined;   // re-fetch floors for the new anchor
+    b.nbFloorsError = null;   // a new anchor's load answers for itself; drop the old verdict
     b.slug = site.slug;
     b.name = site.name;
     b.abbr = ImportFlow.initials(site.name);
@@ -517,9 +1177,77 @@ class ImportFlow {
     b.nbSite = { id: site.id, slug: site.slug, name: site.name, auto: !!auto };
     b.nbBuilding = { id: building.id, slug: building.slug, name: building.name };
     b.nbFloors = undefined;   // re-fetch floors (this anchor's are the building Location's children)
+    b.nbFloorsError = null;   // a new anchor's load answers for itself; drop the old verdict
     b.slug = site.slug;
     b.name = building.name;
     b.abbr = ImportFlow.initials(building.name);
+  }
+
+  /** Accept the anchor a building already has, clearing the unconfirmed-guess flag (IMPORT-57) — the
+   *  **Confirm** half of the "Confirm or change" the auto-matched row has always claimed to offer,
+   *  where *change* was the row's search box and *confirm* was nothing at all.
+   *
+   *  Its own method rather than a re-run of `_bindSite`/`_bindBuilding` with `auto = false`, because
+   *  **confirming does not move the anchor** and must not run the code path whose job is moving one.
+   *  Both binders re-derive `name`/`abbr` from the anchor and clear `nbFloors`; re-binding an
+   *  *identical* anchor would therefore revert a building the operator renamed on the map step and,
+   *  from the bulk confirm, fire one needless Location-tree refetch per building. The anchor itself
+   *  still only ever moves through those two (and `_reanchorBuilding`), so the §10 rule that
+   *  re-anchoring — which re-keys every `Room.floor_key` beneath the building — stays an explicit
+   *  operator action is untouched: this writes only the review flag, and only on the flow, never
+   *  from the screen that renders the button. */
+  _confirmAnchor(b) {
+    if (!b.nbSite) return;
+    b.nbSite.auto = false;
+  }
+
+  /** Move a building's **Location anchor** down the Location tree to one of its own children
+   *  (MULTI-5) — the fix for a facility modelled campus → building → **wing** → floor, where the
+   *  floors are the wing's children, not the anchored building's.
+   *
+   *  The floor key's middle segment must be the floor's *direct parent* (see
+   *  `_floorsFromLocations`), so the supported answer for a deeper tree is to anchor on the wing:
+   *  that produces the ordinary 3-segment `site/wing/floor` key every backend resolver already
+   *  handles, with no format change. Post-conditions mirror `_bindBuilding` — same anchor identity,
+   *  same name/abbr prefill from the anchored Location, and `b.slug` (the campus Site slug, the
+   *  manifest `siteSlug`) deliberately untouched. Clearing `nbFloors` re-runs `_loadFloors`, whose
+   *  `_dropUnanchoredTokens` pass then resets any assignment the new anchor can't hold. */
+  async _reanchorBuilding(b, loc) {
+    if (!b.nbSite) return;
+    b.nbBuilding = { id: loc.id, slug: loc.slug, name: loc.name };
+    b.nbFloors = undefined;
+    b.nbFloorsError = null;
+    b.name = loc.name;
+    b.abbr = ImportFlow.initials(loc.name);
+    await this._saveDraft();
+    this._rerenderBuildingSection(b);   // re-render in place, preserving scroll (IMPORT-2)
+    this._ensureFloors(b);
+  }
+
+  /** The anchor's direct child Locations — the candidates `_anchorDrillControl` offers to re-anchor
+   *  onto. Read from the `_siteLocs` tree cache, so it is empty until this building's floors have
+   *  loaded once (the control simply doesn't render then). */
+  _anchorChildren(b) {
+    const locs = (b.nbBuilding && this._siteLocs.get((b.slug || '').trim())) || [];
+    return locs.filter(l => l.parent === b.nbBuilding.id)
+      .sort((x, y) => (x.name || '').localeCompare(y.name || '', undefined, { numeric: true }));
+  }
+
+  /** Structural "the anchored Location's children look like wings/zones, not floors" signal: some
+   *  **grandchild** of the anchor has children of its own.
+   *
+   *  A normal building → floor → room tree is two levels deep below the anchor and can never trip
+   *  this; a building → wing → floor → room tree is three and always does. It is used **only** to
+   *  decide whether to shout — the drill control is offered either way, because a wing whose floors
+   *  have no room Locations yet is two levels deep and structurally indistinguishable from a
+   *  building. Never used to change *what* is offered: which descendants are floors stays an
+   *  explicit operator pick (MULTI-5). */
+  _isWingLikeAnchor(b) {
+    const locs = (b.nbBuilding && this._siteLocs.get((b.slug || '').trim())) || [];
+    if (!locs.length) return false;
+    const parents = new Set(locs.map(l => l.parent));
+    const childIds = new Set(locs.filter(l => l.parent === b.nbBuilding.id).map(l => l.id));
+    return locs.some(l => childIds.has(l.parent) && parents.has(l.id));
   }
 
   /** One-line summary of a building's current anchor, for the bind-state UI (shared by the bind
@@ -531,831 +1259,35 @@ class ImportFlow {
     return b.nbSite ? b.nbSite.name + ' (' + b.nbSite.slug + ')' : '';
   }
 
-  /** Try to auto-match each still-unbound building to a NetBox **anchor** — a Site or, failing that,
-   *  a building Location (Site = campus, MODEL-4) — by name/slug. Runs once per scan (guarded by
-   *  `_autoMapDone`). A confident **Site** match wins first, exactly as before (a site whose slug
-   *  equals the folder-derived slug, whose name matches, or a lone result), so the Site-anchored
-   *  auto-map is unchanged. Only when no Site is confident does it search building Locations and
-   *  apply the same confidence test — so Location suggestions are purely additive. Every match is
-   *  flagged `auto` for the operator to confirm; ambiguous folders stay unbound for manual binding. */
-  async _autoMapBuildings() {
-    if (this._autoMapDone) return;
-    this._autoMapDone = true;
-    for (const b of this._floorBuildings()) {
-      if (b.nbSite) continue;
-      const nameLc = b.name.toLowerCase();
-      let sites = [];
-      try { sites = (await this.app.netbox.sites(b.name)).sites || []; } catch (_) { /* try Locations */ }
-      const site = sites.find(s => s.slug === b.slug)
-        || sites.find(s => s.name.toLowerCase() === nameLc)
-        || (sites.length === 1 ? sites[0] : null);
-      if (site) { this._bindSite(b, site, true); continue; }
-      // No confident Site — look for a building Location (Site = campus). The endpoint already
-      // returns only building-like Locations (those with floor children), each carrying its campus
-      // site, so a confident hit binds a Location anchor.
-      let locs = [];
-      try { locs = (await this.app.netbox.buildingLocations(b.name)).locations || []; } catch (_) { continue; }
-      const loc = locs.find(l => l.slug === b.slug)
-        || locs.find(l => l.name.toLowerCase() === nameLc)
-        || (locs.length === 1 ? locs[0] : null);
-      if (loc) this._bindBuilding(b, { id: null, slug: loc.site_slug, name: loc.site_name }, loc, true);
-    }
+  /** Bind every floor-contributing building to a NetBox anchor (MULTI-6) — a thin delegator, kept
+   *  on the base because shared code drives it directly (`_scanAndMap`, `_mergeUploads`, both
+   *  `_resume()`s, the campus step's return, the edit hub's per-building "Edit binding"/"Bind to
+   *  NetBox" rows, and every re-render inside the hosted controls). The base routes to the edit hub's
+   *  per-building bind screen (`ImportBind.step`); `FreshImportFlow` overrides it to the merged
+   *  Buildings step (`ImportOrganize.step`, IMPORT-34) — the flows' one step-level divergence, kept a
+   *  subclass hook per §10. `focusBuilding` scrolls that building's row/group into view. */
+  _stepBuildings(focusBuilding) {
+    return this.binder.step(focusBuilding);
   }
 
-  /** Bind every floor-contributing building to a NetBox site. When the edit hub jumps here to fix
-   *  one building, `focusBuilding` scrolls that bind row into view and highlights it, so the user
-   *  lands on the row they came to change instead of the top of the list. The action row itself is
-   *  the `_buildingsActions(focusBuilding)` hook — fresh keeps the linear **Continue to floor
-   *  mapping →** (gated on every building being bound) + **Start over**; edit offers **Save & back
-   *  to hub** / **← Back to hub** so a one-off re-bind returns where it came from. */
-  async _stepBuildings(focusBuilding) {
-    const buildings = this._floorBuildings();
-    if (!buildings.length) return this._stepMap();   // siteplan-only import — nothing to bind
+  // ---- the box editors (ImportRegions) + overlay align (ImportAlign) ----
 
-    const view = this._stage('Map buildings to NetBox', 'bind');
-    view.append(Dom.el('p', { class: 'hint' }, 'Bind each building to its NetBox site.'));
-
-    if (!this._autoMapDone) {
-      view.append(Dom.el('p', { class: 'imp-progress' }, 'Matching buildings to NetBox…'));
-      await this._autoMapBuildings();
-      return this._stepBuildings(focusBuilding);   // re-render with the auto-match results
-    }
-
-    // A flat, unsorted pile of drawings all lands in one building folder. Offer to split it into
-    // several buildings — the user assigns each drawing and the files are physically regrouped
-    // (IMPORT-3), the in-app path for an import that wasn't organized one-subfolder-per-building.
-    // Placed before binding, since regrouping re-identifies the buildings (and discards bindings).
-    if (this._isSingleBuildingImport())
-      view.append(Dom.el('section', { class: 'imp-split-note' }, [
-        Dom.el('span', { class: 'hint' },
-          'All your drawings are in one building. If they belong to different buildings, split '
-          + 'them so each maps to its own NetBox site.'),
-        Dom.el('button', { onclick: () => this._stepAssignBuildings() }, 'Split into buildings'),
-      ]));
-
-    let focusRow = null;
-    for (const b of buildings) {
-      const row = this._bindRow(b);
-      if (b === focusBuilding) { row.classList.add('focus'); focusRow = row; }
-      view.append(row);
-    }
-    if (focusRow) focusRow.scrollIntoView({ block: 'center' });
-
-    view.append(this._buildingsActions(focusBuilding));
-  }
-
-  /** One building's bind control: its current state plus an anchor-search autocomplete. The search
-   *  returns both **Sites** (Site = building) and building **Locations** (Site = campus, MODEL-4),
-   *  so the operator can confirm or override to either anchor kind in the same row. */
-  _bindRow(b) {
-    const state = Dom.el('div', { class: 'imp-bind-state' });
-    if (b.nbSite && b.nbSite.auto)
-      state.append(Dom.el('span', { class: 'imp-bind-auto' },
-        '✓ auto-matched → ' + this._anchorSummary(b) + '. Confirm or change.'));
-    else if (b.nbSite)
-      state.append(Dom.el('span', { class: 'imp-bind-ok' }, '✓ ' + this._anchorSummary(b)));
-    else
-      state.append(Dom.el('span', { class: 'imp-bind-warn' },
-        '⚠ not bound: pick a NetBox site or building'));
-
-    const search = Dom.el('input', { placeholder: 'Search NetBox sites or buildings…' });
-    const list = Dom.el('div', { class: 'imp-bind-list' });
-    let token = 0;
-    const run = async (q) => {
-      const mine = ++token;
-      // Fetch Sites and building Locations together; either may error independently (fall back to
-      // whatever came back), and a stale keystroke's results are dropped.
-      const [sr, lr] = await Promise.all([
-        this.app.netbox.sites(q).catch(() => ({ sites: [] })),
-        this.app.netbox.buildingLocations(q).catch(() => ({ locations: [] })),
-      ]);
-      if (mine !== token) return;   // a newer keystroke superseded this fetch
-      list.innerHTML = '';
-      const sites = sr.sites || [], locs = lr.locations || [];
-      if (!sites.length && !locs.length) {
-        list.append(Dom.el('div', { class: 'hint' }, 'No sites or buildings found.'));
-        return;
-      }
-      // Sites first (the common Site = building case), then building Locations, each labelled so the
-      // two anchor kinds are distinguishable. A row is marked bound when it matches the current
-      // anchor — for a Location that means both its site slug and its own slug.
-      for (const s of sites) {
-        const isThis = !b.nbBuilding && b.nbSite && b.nbSite.slug === s.slug;
-        const item = Dom.el('div', { class: 'room-item' + (isThis ? ' bound' : '') }, [
-          Dom.el('div', { class: 'nm' }, s.name + (isThis ? '  ✓' : '')),
-          Dom.el('div', { class: 'sl' }, 'Site · ' + s.slug),
-        ]);
-        item.onclick = () => { this._bindSite(b, s, false); this._stepBuildings(); };
-        list.append(item);
-      }
-      for (const l of locs) {
-        const isThis = b.nbBuilding && b.nbBuilding.slug === l.slug && b.nbSite.slug === l.site_slug;
-        const item = Dom.el('div', { class: 'room-item' + (isThis ? ' bound' : '') }, [
-          Dom.el('div', { class: 'nm' }, l.name + (isThis ? '  ✓' : '')),
-          Dom.el('div', { class: 'sl' }, 'Building in ' + l.site_name + ' · ' + l.slug),
-        ]);
-        item.onclick = () => {
-          this._bindBuilding(b, { id: null, slug: l.site_slug, name: l.site_name }, l, false);
-          this._stepBuildings();
-        };
-        list.append(item);
-      }
-    };
-    search.addEventListener('input', () => run(search.value));
-
-    return Dom.el('section', { class: 'imp-bind' }, [
-      Dom.el('div', { class: 'imp-bind-head' }, [
-        Dom.el('div', { class: 'imp-bind-folder' }, b.folder), state,
-      ]),
-      search, list,
-    ]);
-  }
-
-  // ---- step 1.4: split a flat pile of drawings into buildings ----
-
-  /** Assign each drawing of a single, unsorted building folder to a building of its own, then
-   *  physically regroup the files server-side (IMPORT-3). Reached from `_stepBuildings` when the
-   *  whole import landed in one folder (a flat pile). The user names buildings and picks one per
-   *  drawing; **Continue** moves the files into per-building folders (`_regroup`) and returns to the
-   *  bind step, where each new building binds to its own NetBox site. Assignment is per **physical
-   *  file** — a multi-page PDF is several page rows in `pdfs` but one file on disk, so it moves as a
-   *  unit. Assignments are ephemeral (nothing is written until Continue; the folder-keyed model is
-   *  rebuilt from the re-scan afterwards). */
-  _stepAssignBuildings() {
-    const source = this.buildings[0];
-    if (!source) return this._stepBuildings();
-    // One assignable entry per physical file (dedupe the exploded per-page rows), keeping the
-    // first row of each for a representative thumbnail.
-    const files = [], rowFor = {};
-    for (const p of source.pdfs)
-      if (!(p.file in rowFor)) { rowFor[p.file] = p; files.push(p.file); }
-    // Buildings default to the current folder verbatim, so "keep them all in one building" is a
-    // no-op move (source folder == destination). `assign` maps each file to a building index.
-    const groups = [source.folder];
-    const assign = Object.fromEntries(files.map(f => [f, 0]));
-
-    const view = this._stage('Organize drawings into buildings');
-    view.append(Dom.el('p', { class: 'hint' },
-      'These drawings are all in one building. Add a building for each one you want to split out, '
-      + 'then assign every drawing to a building. Leave them together if they belong to one.'));
-
-    const grid = Dom.el('div', { class: 'imp-assign-grid' });
-    const render = () => { grid.innerHTML = ''; files.forEach(f => grid.append(row(f))); };
-
-    // Building-name manager: a text field + Add. Each name is a destination folder, so reject the
-    // path separators `safe_path` would otherwise have to (the server re-checks).
-    const nameInput = Dom.el('input', { placeholder: 'New building name' });
-    const add = () => {
-      const name = nameInput.value.trim();
-      if (!name) return;
-      if (/[\/\\]/.test(name)) return Toast.show('A building name can’t contain / or \\', true);
-      if (groups.includes(name)) return Toast.show('That building already exists', true);
-      groups.push(name); nameInput.value = ''; nameInput.focus(); render();
-    };
-    nameInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); add(); } });
-    view.append(Dom.el('div', { class: 'imp-assign-add' }, [
-      nameInput, Dom.el('button', { onclick: add }, 'Add building'),
-    ]));
-
-    const row = (file) => {
-      const p = rowFor[file];
-      // A single-page drawing has a scan thumbnail; an exploded page row doesn't, so fall back to
-      // its on-demand per-page preview (same choice `_pdfCard` makes).
-      const src = p.thumb ? ImportFlow._media(p.thumb) : ImportPreview.previewUrl(p.pdf, p.page);
-      const thumb = Dom.el('div', { class: 'imp-thumb imp-assign-thumb' },
-        [Dom.el('img', { src, loading: 'lazy' })]);
-      const sel = Dom.el('select', { onchange: (e) => { assign[file] = parseInt(e.target.value, 10); } },
-        groups.map((g, i) => {
-          const o = Dom.el('option', { value: String(i) }, g);
-          if (assign[file] === i) o.selected = true;
-          return o;
-        }));
-      return Dom.el('div', { class: 'imp-assign-row' }, [
-        thumb, Dom.el('span', { class: 'imp-assign-name' }, file), sel,
-      ]);
-    };
-    render();
-    view.append(grid);
-
-    const cont = Dom.el('button', { class: 'primary', onclick: () => {
-      // Group each building's assigned files into `{ destFolder: [uploads-relative src, ...] }`,
-      // dropping empty buildings. Files whose destination equals the source folder don't move.
-      const payload = {};
-      groups.forEach((name, i) => {
-        const picked = files.filter(f => assign[f] === i);
-        if (picked.length) payload[name] = picked.map(f => source.folder + '/' + f);
-      });
-      const dests = Object.keys(payload);
-      if (dests.length <= 1 && dests[0] === source.folder) return this._stepBuildings();  // unchanged
-      this._regroup(payload);
-    } }, 'Continue');
-    view.append(Dom.el('div', { class: 'imp-actions' }, [
-      cont,
-      Dom.el('button', { onclick: () => this._stepBuildings() }, 'Cancel'),
-      this._startOver(),
-    ]));
-  }
-
-  /** Move the assigned drawings into their per-building folders on the server, then re-scan and
-   *  rebuild the folder-keyed model. `groups` is `{ destFolder: [uploads-relative src, ...] }`. The
-   *  endpoint validates every move before touching a file, so a rejected regroup leaves the pile
-   *  intact; on any failure the assignment step is re-shown with the cause toasted. */
-  async _regroup(groups) {
-    const view = this._stage('Organizing drawings…');
-    view.append(Dom.el('p', { class: 'imp-progress' }, 'Moving drawings into buildings…'));
-    try {
-      await Api.post('/api/import/regroup', { groups });
-      const inv = await Api.post('/api/import/scan', {});
-      if (!inv.ok) throw new Error(inv.error || 'scan failed');
-      this.inv = inv;
-    } catch (e) {
-      Toast.show('Could not organize drawings: ' + e.message, true);
-      return this._stepAssignBuildings();
-    }
-    this._modelFromInventory();
-    this._bIdx = 0;
-    this._autoMapDone = false;
-    this._stepBuildings();
-  }
-
-  // ---- step 2a: mark where each drawing's identifying code sits ----
-
-  /** Before the mapping grid, the user marks the spot on a sample drawing where the
-   *  floor-identifying code/caption sits, dragging one box stored normalized 0..1 so it maps
-   *  onto every drawing's render. Each floor card then shows a close-up crop of just that spot
-   *  (see `_codeCropThumb`), so floors are recognizable at a glance without opening each drawing.
-   *  Passing a `building` re-marks just that one — its own `codeRegion` override for an outlier
-   *  whose title block sits elsewhere than the global sample. The step is skippable (fall back to
-   *  full-drawing thumbnails). */
+  /** Enter the per-building code-region re-mark, a detour off the map step. A thin delegator, kept
+   *  on the base because both flows drive it directly — the map step's per-building button and the
+   *  edit hub's per-building row — so it stays part of the flow's vocabulary even though
+   *  `ImportRegions` owns the editor itself. The **global** pick is a section of the Site plan step
+   *  (`ImportRegions.codeSection`), not a screen of its own (IMPORT-37). */
   _stepRegionPick(building) {
-    const scoped = !!building;
-    // Sample on a real floor drawing, never the site plan (it's `type:'none'` and has no code).
-    const real = (x, pp) => x.assign[pp.stem] && x.assign[pp.stem].type !== 'none';
-    const b = building || this.buildings.find(x => x.pdfs && x.pdfs.some(pp => real(x, pp)));
-    const p = b && b.pdfs.find(pp => real(b, pp));
-    if (!p) {   // no floor drawing to sample
-      if (scoped) { Toast.show('No drawing to re-mark in ' + (b.name || b.folder), true); return this._stepMap(); }
-      this._codeRegionDone = true; return this._stepMap();   // siteplan-only import: nothing to crop
-    }
-
-    const view = this._stage(scoped ? 'Mark ' + (b.name || b.folder) + '’s code' : 'Mark the drawing code',
-      scoped ? undefined : 'coderegion');
-    view.append(Dom.el('p', { class: 'hint' },
-      'Drag a box around the code or caption that identifies each drawing, the part that names '
-      + 'the floor (e.g. “SECOND BASEMENT LEVEL (B2)”). Each floor card then shows a close-up of '
-      + 'just that spot, so you can tell the floors apart at a glance. Zoom in if it’s small; '
-      + 'scroll to pan.'));
-
-    // Zoom widens the canvas inside a scrollable viewport (scroll to pan); the image fills the
-    // canvas and the overlay is positioned by % of it, so the box tracks the image at any zoom.
-    const img = Dom.el('img', { class: 'imp-region-img', src: ImportPreview.previewUrl(p.pdf, p.page) });
-    const sel = Dom.el('div', { class: 'imp-region-sel hidden' });
-    const canvas = Dom.el('div', { class: 'imp-region-canvas' }, [img, sel]);
-    const viewport = Dom.el('div', { class: 'imp-region-view' }, [canvas]);
-    this._attachRegionDrag(img, sel, building);
-    view.append(this._regionZoomBar(canvas));
-    view.append(viewport);
-    this._applyRegionZoom(canvas);
-
-    const use = async () => {
-      if (scoped) this._bIdx = Math.max(0, this._mappableBuildings().indexOf(b));   // land back on it
-      else this._codeRegionDone = true;
-      await this._saveDraft();
-      this._stepMap();
-    };
-    const go = Dom.el('button', { class: 'primary', onclick: use }, 'Use this region');
-    go.disabled = !(scoped ? building.codeRegion : this._codeRegion);
-    this._regionGo = go;
-    // Linear back to the siteplan step (fresh, unscoped only); a scoped re-mark is a detour with
-    // its own Cancel, so it gets no linear back.
-    const actions = scoped ? [go] : [this._backButton('coderegion'), go];
-    if (scoped) {
-      // A scoped re-mark refines one building; offer to drop the override — back to the global
-      // region when one exists, else to full-drawing thumbnails — and a plain Cancel back to the map.
-      if (building.codeRegion)
-        actions.push(Dom.el('button', { onclick: async () => {
-          building.codeRegion = null; await this._saveDraft(); this._stepMap(); } },
-          this._codeRegion ? 'Use the global region' : 'Clear (show full drawing)'));
-      actions.push(Dom.el('button', { onclick: () => this._stepMap() }, 'Cancel'));
-    } else {
-      actions.push(Dom.el('button', { onclick: async () => {
-        this._codeRegion = null; this._codeRegionDone = true; await this._saveDraft(); this._stepMap();
-      } }, 'Skip (show full drawings)'));
-      actions.push(this._startOver());
-    }
-    view.append(Dom.el('div', { class: 'imp-actions' }, actions));
+    this.regions.openPick(building);
   }
 
-  /** Drag a selection box over the sample image, storing it normalized 0..1 — on the building's
-   *  own `codeRegion` when `building` is given (the per-building override), else the global
-   *  `_codeRegion`. The overlay shares the <img>'s box (the image fills it, no letterboxing), so
-   *  pointer positions map straight to image space via `getBoundingClientRect()`. */
-  _attachRegionDrag(img, sel, building) {
-    const get = () => (building ? building.codeRegion : this._codeRegion);
-    const set = (r) => { if (building) building.codeRegion = r; else this._codeRegion = r; };
-    const draw = (r) => {
-      sel.classList.remove('hidden');
-      sel.style.left = (r.x * 100) + '%'; sel.style.top = (r.y * 100) + '%';
-      sel.style.width = (r.w * 100) + '%'; sel.style.height = (r.h * 100) + '%';
-    };
-    const cur = get();
-    if (cur) draw(cur);
-    img.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      const rect = img.getBoundingClientRect();
-      const nx = (c) => Math.max(0, Math.min(1, (c - rect.left) / rect.width));
-      const ny = (c) => Math.max(0, Math.min(1, (c - rect.top) / rect.height));
-      const x0 = nx(e.clientX), y0 = ny(e.clientY);
-      let pending = null;
-      try { img.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
-      const move = (ev) => {
-        const x1 = nx(ev.clientX), y1 = ny(ev.clientY);
-        pending = { x: Math.min(x0, x1), y: Math.min(y0, y1), w: Math.abs(x1 - x0), h: Math.abs(y1 - y0) };
-        draw(pending);
-      };
-      const up = () => {
-        img.removeEventListener('pointermove', move);
-        img.removeEventListener('pointerup', up);
-        if (pending && pending.w > 0.005 && pending.h > 0.005) {
-          set(pending);
-          if (this._regionGo) this._regionGo.disabled = false;
-        }
-      };
-      img.addEventListener('pointermove', move);
-      img.addEventListener('pointerup', up);
-    });
-  }
-
-  /** −/Fit/+ zoom controls for the region picker, so a small floor code can be boxed
-   *  accurately. "Fit" resets to fill the viewport width; ± steps the zoom (1×–6×). */
-  _regionZoomBar(canvas) {
-    const step = (f) => () => {
-      this._regionZoom = Math.max(1, Math.min(6, Math.round((this._regionZoom + f) * 10) / 10));
-      this._applyRegionZoom(canvas);
-    };
-    return Dom.el('div', { class: 'imp-region-zoom' }, [
-      Dom.el('button', { title: 'Zoom out', onclick: step(-0.5) }, '−'),
-      Dom.el('button', { title: 'Fit to width',
-        onclick: () => { this._regionZoom = 1; this._applyRegionZoom(canvas); } }, 'Fit'),
-      Dom.el('button', { title: 'Zoom in', onclick: step(0.5) }, '+'),
-    ]);
-  }
-
-  /** Apply the current zoom by widening the canvas; the scrollable viewport handles panning. */
-  _applyRegionZoom(canvas) {
-    canvas.style.width = (this._regionZoom * 100) + '%';
-  }
-
-  // ---- step 2b: split one plan into several floors by region (FLOOR-4) ----
-
-  /** Region-split editor: draw one or more boxes over a single drawing and give each its own
-   *  floor, so the page fans into several floors at build (`_resolveFloors` emits the
-   *  `[{token, region}]` shape `preprocess._page_entries` consumes). Follows the `_stepRegionPick`
-   *  precedent — the drawing sits in a scrollable, zoomable viewport — but supports *several* boxes,
-   *  each a floor. The image renders at the card's straightening `angle`, so a box is marked in the
-   *  same straightened space the backend crops (crop-after-rotate). Boxes + per-region assignments
-   *  live on `b.regions[p.stem]` and persist in the draft. Reached from a card's "Split into
-   *  floors…" button; empty the list (Clear all / removing every region) to fall back to one
-   *  whole-page floor. */
-  _stepSplitRegions(b, p) {
-    const view = this._stage('Split ' + p.file + ' into floors');
-    view.append(Dom.el('p', { class: 'hint' },
-      'Drag a box around each part of this drawing that is its own floor, then assign a floor to '
-      + 'each box below. One plan can map to several floors this way (e.g. a split-level sheet). '
-      + 'Zoom in if the drawing is dense; scroll to pan.'));
-
-    const deg = (b.angle[p.stem] && b.angle[p.stem].deg) || 0;
-    const img = Dom.el('img', { class: 'imp-region-img', src: ImportPreview.previewUrl(p.pdf, p.page, deg) });
-    const overlay = Dom.el('div', { class: 'imp-region-overlay' });
-    const canvas = Dom.el('div', { class: 'imp-region-canvas' }, [img, overlay]);
-    const viewport = Dom.el('div', { class: 'imp-region-view' }, [canvas]);
-    const list = Dom.el('div', { class: 'imp-region-list' });
-
-    // Repaint the numbered box overlay + the per-region floor-assignment list from the current
-    // model, without rebuilding the image — so an add / remove / floor pick never disturbs the
-    // zoom or scroll position.
-    const redraw = () => {
-      const regions = b.regions[p.stem];
-      overlay.innerHTML = '';
-      regions.forEach((r, i) => {
-        const boxEl = Dom.el('div', { class: 'imp-region-box' }, String(i + 1));
-        boxEl.style.left = (r.box.x * 100) + '%'; boxEl.style.top = (r.box.y * 100) + '%';
-        boxEl.style.width = (r.box.w * 100) + '%'; boxEl.style.height = (r.box.h * 100) + '%';
-        overlay.append(boxEl);
-      });
-      list.innerHTML = '';
-      if (!regions.length) {
-        list.append(Dom.el('p', { class: 'hint' }, 'No regions yet — drag a box on the drawing above.'));
-        return;
-      }
-      regions.forEach((r, i) => {
-        list.append(Dom.el('div', { class: 'imp-region-row' }, [
-          Dom.el('span', { class: 'imp-region-rownum' }, 'Region ' + (i + 1)),
-          this._floorButtons(b, r.assign, () => { this._saveDraft(); redraw(); }),
-          Dom.el('button', { class: 'imp-floor', onclick: () => {
-            regions.splice(i, 1); this._saveDraft(); redraw();
-          } }, 'Remove'),
-        ]));
-      });
-    };
-
-    this._attachRegionAdd(img, b, p, redraw);
-    view.append(this._regionZoomBar(canvas));
-    view.append(viewport);
-    view.append(list);
-    this._applyRegionZoom(canvas);
-    redraw();
-
-    view.append(Dom.el('div', { class: 'imp-actions' }, [
-      Dom.el('button', { class: 'primary',
-        onclick: async () => { await this._saveDraft(); this._stepMap(); } }, 'Done'),
-      Dom.el('button', { onclick: async () => {
-        if (b.regions[p.stem].length && !confirm('Remove all regions from this drawing?')) return;
-        b.regions[p.stem] = []; await this._saveDraft(); this._stepMap();
-      } }, 'Clear all'),
-      Dom.el('button', { onclick: () => this._stepMap() }, 'Cancel'),
-    ]));
-  }
-
-  /** Drag on the split editor's canvas to add a region box (FLOOR-4): a press-drag-release marks a
-   *  new normalized 0..1 box, appended to `b.regions[p.stem]` as a fresh `unassigned` floor. Mirrors
-   *  `_attachRegionDrag` (the code-crop picker) — a live preview box tracks the drag, and the overlay
-   *  shares the <img>'s box so pointer coords map straight to image space via
-   *  `getBoundingClientRect()` at any zoom. Too-small drags are ignored so a stray click adds
-   *  nothing. `onAdd` repaints the overlay + region list. */
-  _attachRegionAdd(img, b, p, onAdd) {
-    const preview = Dom.el('div', { class: 'imp-region-sel hidden' });
-    img.parentElement.append(preview);
-    const draw = (r) => {
-      preview.classList.remove('hidden');
-      preview.style.left = (r.x * 100) + '%'; preview.style.top = (r.y * 100) + '%';
-      preview.style.width = (r.w * 100) + '%'; preview.style.height = (r.h * 100) + '%';
-    };
-    img.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      const rect = img.getBoundingClientRect();
-      const nx = (c) => Math.max(0, Math.min(1, (c - rect.left) / rect.width));
-      const ny = (c) => Math.max(0, Math.min(1, (c - rect.top) / rect.height));
-      const x0 = nx(e.clientX), y0 = ny(e.clientY);
-      let pending = null;
-      try { img.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
-      const move = (ev) => {
-        const x1 = nx(ev.clientX), y1 = ny(ev.clientY);
-        pending = { x: Math.min(x0, x1), y: Math.min(y0, y1), w: Math.abs(x1 - x0), h: Math.abs(y1 - y0) };
-        draw(pending);
-      };
-      const up = () => {
-        img.removeEventListener('pointermove', move);
-        img.removeEventListener('pointerup', up);
-        preview.classList.add('hidden');
-        if (pending && pending.w > 0.005 && pending.h > 0.005) {
-          b.regions[p.stem].push(
-            { box: pending, assign: { type: 'unassigned', num: 1, token: null, label: '' } });
-          this._saveDraft();
-          onAdd();
-        }
-      };
-      img.addEventListener('pointermove', move);
-      img.addEventListener('pointerup', up);
-    });
-  }
-
-  // ---- step 2c: align a GIS overlay onto its floor plan (FMT-6) ----
-
-  /** The overlay card's alignment row: the layer's placement state (approximate fit vs aligned
-   *  with N control points) and the jump into the align editor. Overlay cards only. */
-  _alignRow(b, p) {
-    const pairs = ((b.align && b.align[p.stem]) || []).filter(ImportFlow._validAlignPair);
-    const aligned = pairs.length >= 2;
-    const state = Dom.el('span', { class: 'imp-align-state' + (aligned ? ' ok' : '') },
-      aligned ? '⌖ aligned (' + pairs.length + ' points)' : 'placed by approximate fit');
-    return Dom.el('div', { class: 'imp-align-row' }, [
-      state,
-      Dom.el('button', { class: 'imp-floor',
-        title: 'Pin points on this data layer to their true spots on the floor plan (georeference)',
-        onclick: () => this._stepAlignOverlay(b, p) }, '⌖ Align on plan…'),
-    ]);
-  }
-
-  /** The built manifest's overlay entry for drawing stem `stem` of building model `b` — with its
-   *  floor + manifest building — or null when the facility hasn't been built with this overlay
-   *  mapped yet. Matched by the manifest `folder` (the same key the edit hub's binding recovery
-   *  uses) and the overlay `name` (the drawing stem `preprocess` writes). */
-  _manifestOverlay(b, stem) {
-    const manifest = this.app.store.manifest;
-    for (const mb of (manifest && manifest.buildings) || []) {
-      if (mb.folder !== b.folder) continue;
-      for (const floor of mb.floors || [])
-        for (const ov of floor.overlays || [])
-          if (ov.name === stem) return { building: mb, floor, overlay: ov };
-    }
-    return null;
-  }
-
-  /** Align-overlay editor (FMT-6): the floor's combined canvas with the overlay drawn on top;
-   *  clicking a feature vertex drops a control-point pin whose head is then dragged to the same
-   *  physical spot on the plan. Each pin is a `{src, dst}` pair — `src` the vertex's RAW source
-   *  coordinate (recovered by inverting the manifest's `srcTransform`), `dst` a 0..1 point on the
-   *  floor canvas — stored on `b.align[p.stem]` (draft-persisted) and emitted at build as the
-   *  import-map `overlayAlign`, which georeferences the layer server-side. With ≥2 pins the
-   *  editor re-solves the transform locally (`_alignSolve`, the JS mirror of the backend's
-   *  OverlayProjector) so the preview tracks live; the authoritative solve still happens at
-   *  rebuild. Needs a built manifest carrying this overlay — the deliberate flow is build once
-   *  (approximate fit), then align, then rebuild. Follows the `_stepSplitRegions` viewport/zoom
-   *  precedent. */
-  _stepAlignOverlay(b, p) {
-    const view = this._stage('Align ' + p.file + ' on the plan');
-    const found = this._manifestOverlay(b, p.stem);
-    const unproject = found && Array.isArray(found.overlay.srcTransform)
-      ? ImportFlow._invertAffine(found.overlay.srcTransform) : null;
-    if (!unproject) {
-      view.append(Dom.el('p', { class: 'hint' },
-        'This overlay isn’t part of the built facility yet (or was built by an older version). '
-        + 'Assign it a floor and run Review & build once — it imports with an approximate fit — '
-        + 'then come back here to pin it to the plan.'));
-      view.append(Dom.el('div', { class: 'imp-actions' },
-        [Dom.el('button', { class: 'primary', onclick: () => this._stepMap() }, '← Back')]));
-      return;
-    }
-    const { building, floor, overlay } = found;
-
-    // Every feature vertex back in RAW source coordinates, so the live preview can re-place the
-    // whole layer through a freshly solved transform (and a clicked vertex knows its `src`).
-    const rawFeats = (overlay.features || []).map((feat) => ({
-      type: feat.type,
-      raw: feat.type === 'point'
-        ? [unproject(feat.coords[0], feat.coords[1])]
-        : feat.coords.map((c) => unproject(c[0], c[1])),
-    }));
-    const rawPoints = [];
-    for (const f of rawFeats) for (const pt of f.raw) rawPoints.push(pt);
-
-    view.append(Dom.el('p', { class: 'hint' },
-      'Click a recognizable point on the data layer (a corner, a junction), then drag the pin to '
-      + 'the same physical spot on the floor plan. Two pins align the layer (scale + rotation); '
-      + 'a third refines it with a best fit. The preview updates live — the alignment is applied '
-      + 'to the facility when you rebuild (Review & build).'));
-
-    // One SVG in layout-px units: sheet images tiled per the floor's combined canvas (honoring a
-    // saved arrangement — the same `floorLayout` geometry the map renders), the overlay features,
-    // and the control-point pins. Normalized 0..1 coords scale by the layout size, exactly the
-    // floor editor's convention, and the <svg> keeps the viewBox aspect so pointer→0..1 mapping
-    // is a plain getBoundingClientRect division (the `_attachRegionAdd` technique).
-    const g = this.app.store.floorLayout(building.dir, floor.id);
-    const svg = Dom.svg('svg', { viewBox: '0 0 ' + g.W + ' ' + g.H, class: 'imp-align-svg' });
-    for (const cell of g.cells)
-      svg.append(Dom.svg('image', { href: this.app.store.mediaUrl(cell.image),
-        x: cell.col * g.cellW, y: cell.row * g.cellH, width: cell.w, height: cell.h }));
-    const featLayer = Dom.svg('g');
-    const pinLayer = Dom.svg('g');
-    svg.append(featLayer);
-    svg.append(pinLayer);
-    const canvas = Dom.el('div', { class: 'imp-region-canvas imp-align-canvas' }, [svg]);
-    const viewport = Dom.el('div', { class: 'imp-region-view' }, [canvas]);
-    const status = Dom.el('p', { class: 'imp-align-status' });
-    const list = Dom.el('div', { class: 'imp-region-list' });
-    // Marker geometry in layout units (the canvas can be thousands of px wide, so fixed pixel
-    // radii would vanish); ~0.5% of a sheet reads well at fit-to-width and while zoomed.
-    const unit = Math.max(g.cellW, g.cellH) / 200;
-
-    const snapshot = JSON.stringify(b.align[p.stem] || []);
-    const pairs = () => b.align[p.stem];
-    const validPairs = () => pairs().filter(ImportFlow._validAlignPair);
-    // The transform the preview draws with: a live local solve once ≥2 pins exist, else the
-    // manifest's as-built placement.
-    const displayTransform = () => {
-      const clean = validPairs();
-      if (clean.length >= 2) {
-        const t = ImportFlow._alignSolve(clean, overlay.crs, rawPoints);
-        if (t) return t;
-      }
-      return overlay.srcTransform;
-    };
-
-    const redraw = () => {
-      const t = displayTransform();
-      featLayer.innerHTML = '';
-      pinLayer.innerHTML = '';
-      for (const f of rawFeats) {
-        const pts = f.raw.map((pt) => ImportFlow._applyAffine(t, pt[0], pt[1]));
-        if (f.type === 'point') {
-          featLayer.append(Dom.svg('circle', { cx: pts[0][0] * g.W, cy: pts[0][1] * g.H,
-            r: unit, class: 'imp-align-feat' }));
-        } else {
-          featLayer.append(Dom.svg(f.type === 'polygon' ? 'polygon' : 'polyline', {
-            points: pts.map((pt) => (pt[0] * g.W) + ',' + (pt[1] * g.H)).join(' '),
-            'stroke-width': unit / 2, class: 'imp-align-feat' }));
-        }
-      }
-      pairs().forEach((pr, i) => {
-        const s = ImportFlow._applyAffine(t, pr.src[0], pr.src[1]);
-        const d = pr.dst;
-        // Tail (where the source point currently sits) → head (its true spot). With ≥2 pins the
-        // solve interpolates the anchors exactly, so an anchored pin's tail collapses onto its
-        // head — visually confirming the fit.
-        pinLayer.append(Dom.svg('line', { x1: s[0] * g.W, y1: s[1] * g.H,
-          x2: d[0] * g.W, y2: d[1] * g.H, 'stroke-width': unit / 3, class: 'imp-align-link' }));
-        pinLayer.append(Dom.svg('circle', { cx: s[0] * g.W, cy: s[1] * g.H, r: unit * 0.8,
-          class: 'imp-align-tail' }));
-        const head = Dom.svg('circle', { cx: d[0] * g.W, cy: d[1] * g.H, r: unit * 1.4,
-          class: 'imp-align-head', 'data-pin': String(i) });
-        pinLayer.append(head);
-        const label = Dom.svg('text', { x: d[0] * g.W, y: d[1] * g.H - unit * 1.8,
-          'font-size': unit * 2.2, 'text-anchor': 'middle', class: 'imp-align-num' });
-        label.textContent = String(i + 1);
-        pinLayer.append(label);
-      });
-      const n = validPairs().length;
-      status.textContent =
-        n >= 3 ? n + ' pins — aligned (best-fit). Rebuild to apply.'
-          : n === 2 ? '2 pins — aligned (scaled + rotated to fit). Rebuild to apply.'
-            : n === 1 ? '1 pin — add at least one more to align the layer.'
-              : 'No pins yet.';
-      status.className = 'imp-align-status' + (n >= 2 ? ' ok' : '');
-      list.innerHTML = '';
-      pairs().forEach((pr, i) => {
-        list.append(Dom.el('div', { class: 'imp-region-row' }, [
-          Dom.el('span', { class: 'imp-region-rownum' }, 'Pin ' + (i + 1)),
-          Dom.el('button', { class: 'imp-floor', onclick: () => {
-            pairs().splice(i, 1); this._saveDraft(); redraw();
-          } }, 'Remove'),
-        ]));
-      });
-    };
-
-    this._attachAlignDrag(svg, { pairs, validPairs, displayTransform, rawFeats, redraw });
-
-    view.append(this._regionZoomBar(canvas));
-    view.append(viewport);
-    view.append(status);
-    view.append(list);
-    this._applyRegionZoom(canvas);
-    redraw();
-
-    view.append(Dom.el('div', { class: 'imp-actions' }, [
-      Dom.el('button', { class: 'primary',
-        onclick: async () => { await this._saveDraft(); this._stepMap(); } }, 'Done'),
-      Dom.el('button', { onclick: async () => {
-        if (pairs().length && !confirm('Remove all alignment pins from this overlay?')) return;
-        b.align[p.stem] = []; await this._saveDraft(); redraw();
-      } }, 'Clear alignment'),
-      Dom.el('button', { onclick: () => {
-        b.align[p.stem] = JSON.parse(snapshot); this._stepMap();
-      } }, 'Cancel'),
-    ]));
-  }
-
-  /** Pointer wiring for the align editor: press on a pin head drags it; press near a displayed
-   *  feature vertex drops a NEW pin there (src = that vertex's raw coordinate) and immediately
-   *  drags its head, so pinning is one gesture — press the layer point, drag to its true spot.
-   *  A press on empty plan does nothing (no accidental pins). Coordinates map pointer→0..1 via
-   *  the svg's live `getBoundingClientRect` (the `_attachRegionAdd` technique — the svg keeps the
-   *  viewBox aspect, so there is no letterboxing to correct for). */
-  _attachAlignDrag(svg, ed) {
-    svg.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      const rect = svg.getBoundingClientRect();
-      const norm = (ev) => [
-        Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width)),
-        Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height)),
-      ];
-      const [nx, ny] = norm(e);
-      // Screen-space hit radius (12px) converted to normalized units so snapping feels the same
-      // at any zoom. The canvas keeps the viewBox aspect, so one axis conversion suffices.
-      const hit = 12 / rect.width;
-      let pair = null;
-      const headEl = e.target.closest ? e.target.closest('.imp-align-head') : null;
-      if (headEl) {
-        pair = ed.pairs()[Number(headEl.getAttribute('data-pin'))] || null;
-      } else {
-        // Snap to the nearest displayed feature vertex within the hit radius.
-        const t = ed.displayTransform();
-        let best = null, bestD = hit * hit;
-        for (const f of ed.rawFeats) {
-          for (const pt of f.raw) {
-            const dpt = ImportFlow._applyAffine(t, pt[0], pt[1]);
-            const dx = dpt[0] - nx, dy = (dpt[1] - ny) * (rect.height / rect.width);
-            const d2 = dx * dx + dy * dy;
-            if (d2 < bestD) { bestD = d2; best = pt; }
-          }
-        }
-        if (best) {
-          const start = ImportFlow._applyAffine(t, best[0], best[1]);
-          pair = { src: [best[0], best[1]], dst: [start[0], start[1]] };
-          ed.pairs().push(pair);
-        }
-      }
-      if (!pair) return;
-      try { svg.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
-      const move = (ev) => { pair.dst = norm(ev); ed.redraw(); };
-      const up = () => {
-        svg.removeEventListener('pointermove', move);
-        svg.removeEventListener('pointerup', up);
-        this._saveDraft();
-        ed.redraw();
-      };
-      svg.addEventListener('pointermove', move);
-      svg.addEventListener('pointerup', up);
-      ed.redraw();
-    });
-  }
-
-  /** Apply a 6-coefficient affine `[a,b,c,d,e,f]`: `(x, y) → [a·x + b·y + c, d·x + e·y + f]`. */
-  static _applyAffine(t, x, y) {
-    return [t[0] * x + t[1] * y + t[2], t[3] * x + t[4] * y + t[5]];
-  }
-
-  /** Invert a 6-coefficient affine, or null when (near-)singular. The align editor uses it to
-   *  recover the raw source coordinate behind a manifest overlay vertex from `srcTransform`. */
-  static _invertAffine(t) {
-    const a = t[0], bb = t[1], c = t[2], d = t[3], e = t[4], f = t[5];
-    const det = a * e - bb * d;
-    if (!isFinite(det) || Math.abs(det) < 1e-12) return null;
-    return (nx, ny) => [
-      (e * (nx - c) - bb * (ny - f)) / det,
-      (a * (ny - f) - d * (nx - c)) / det,
-    ];
-  }
-
-  /** Solve the control-point transform from ≥2 clean pairs — the JS mirror of the backend's
-   *  `OverlayProjector._solve_pairs` (keep the two in LOCKSTEP, architecture §10): two pairs →
-   *  exact similarity, three+ → least-squares affine, both solved in a Y-down pre-projected
-   *  working plane (`u = k·x, v = −y`; `k` = cos of the layer's clamped mid-latitude for a
-   *  geographic CRS, else 1 — `rawPoints` supplies the latitudes exactly as the backend derives
-   *  them from the layer's own points). Returns the raw-source→unit `[a,b,c,d,e,f]`, or null
-   *  when degenerate (the preview then keeps the as-built placement). */
-  static _alignSolve(pairs, crs, rawPoints) {
-    let k = 1;
-    if (crs === 'geographic' && rawPoints.length) {
-      let lo = Infinity, hi = -Infinity;
-      for (const pt of rawPoints) { if (pt[1] < lo) lo = pt[1]; if (pt[1] > hi) hi = pt[1]; }
-      const lat0 = Math.max(-89, Math.min(89, (lo + hi) / 2));
-      k = Math.cos(lat0 * Math.PI / 180);
-    }
-    const uv = pairs.map((pr) => [pr.src[0] * k, -pr.src[1]]);
-    const dst = pairs.map((pr) => pr.dst);
-    const plane = pairs.length === 2
-      ? ImportFlow._similarity(uv, dst) : ImportFlow._lsqAffine(uv, dst);
-    if (!plane || !plane.every(isFinite)) return null;
-    return [plane[0] * k, -plane[1], plane[2], plane[3] * k, -plane[4], plane[5]];
-  }
-
-  /** Exact 2-point similarity in the working plane (complex `dst = A·src + B` via real
-   *  arithmetic), or null when the source points coincide. Mirrors `OverlayProjector._similarity`. */
-  static _similarity(uv, dst) {
-    const su = uv[1][0] - uv[0][0], sv = uv[1][1] - uv[0][1];
-    const den = su * su + sv * sv;
-    if (den < 1e-24) return null;
-    const dx = dst[1][0] - dst[0][0], dy = dst[1][1] - dst[0][1];
-    const ar = (dx * su + dy * sv) / den;    // A = (d1 − d0) / (s1 − s0)
-    const ai = (dy * su - dx * sv) / den;
-    const br = dst[0][0] - (ar * uv[0][0] - ai * uv[0][1]);   // B = d0 − A·s0
-    const bi = dst[0][1] - (ai * uv[0][0] + ar * uv[0][1]);
-    return [ar, -ai, br, ai, ar, bi];
-  }
-
-  /** Least-squares affine in the working plane: two 3-unknown normal-equation systems over rows
-   *  `[u, v, 1]`, or null when singular (collinear sources). Mirrors `OverlayProjector._lsq_affine`. */
-  static _lsqAffine(uv, dst) {
-    const m = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-    const rx = [0, 0, 0], ry = [0, 0, 0];
-    for (let n = 0; n < uv.length; n++) {
-      const row = [uv[n][0], uv[n][1], 1];
-      for (let i = 0; i < 3; i++) {
-        for (let j = 0; j < 3; j++) m[i][j] += row[i] * row[j];
-        rx[i] += row[i] * dst[n][0];
-        ry[i] += row[i] * dst[n][1];
-      }
-    }
-    const top = ImportFlow._solve3(m, rx), bot = ImportFlow._solve3(m, ry);
-    return top && bot ? [top[0], top[1], top[2], bot[0], bot[1], bot[2]] : null;
-  }
-
-  /** 3×3 Gaussian elimination with partial pivoting, or null when singular. Left side `m` and
-   *  `rhs` are not modified (worked on copies — `_lsqAffine` reuses `m` for both axes). */
-  static _solve3(m, rhs) {
-    const a = m.map((row, i) => [row[0], row[1], row[2], rhs[i]]);
-    for (let col = 0; col < 3; col++) {
-      let piv = col;
-      for (let r = col + 1; r < 3; r++) if (Math.abs(a[r][col]) > Math.abs(a[piv][col])) piv = r;
-      if (Math.abs(a[piv][col]) < 1e-12) return null;
-      const tmp = a[col]; a[col] = a[piv]; a[piv] = tmp;
-      for (let r = 0; r < 3; r++) {
-        if (r === col) continue;
-        const factor = a[r][col] / a[col][col];
-        for (let c = col; c < 4; c++) a[r][c] -= factor * a[col][c];
-      }
-    }
-    return [a[0][3] / a[0][0], a[1][3] / a[1][1], a[2][3] / a[2][2]];
-  }
-
+  /** The map step **always renders the map** (IMPORT-37). It used to open with two hidden gates —
+   *  unset `_siteplanDone`/`_codeRegionDone` bounced the caller into the preparatory steps — which
+   *  meant any jump here (the stepper's own *Map & build*, the edit hub's "Review & build →", a
+   *  per-building "Edit floors →") could silently land somewhere else. Where those steps sit in the
+   *  walk is the walk's business: `FreshImportFlow` sequences them through `STEPS`/`_goToStep`, and
+   *  routes into them from `_afterBuildings`/`_resume`. */
   _stepMap() {
-    // Order of the assign phase: pick the site plan first (it has no floor code), then mark the
-    // code region (skippable) so the cards can show a close-up crop of each drawing's code.
-    if (!this._siteplanDone) return this._stepSiteplan();
-    if (!this._codeRegionDone) return this._stepRegionPick();
-
     const view = this._stage('Map drawings to floors', 'map');
     this._mapView = view;
     this._cards = [];   // {upgrade()} per card — lets the size slider swap in hi-res renders
@@ -1363,12 +1295,26 @@ class ImportFlow {
     // `_stepMap()` (which wipes `#stage` and resets the page scroll — IMPORT-2). Cleared here so a
     // siteplan-only render, or one before the section is appended, leaves no stale reference.
     this._buildingSectionEl = null;
+    // The carousel nav bars, so the background OCR sweep can refresh their per-building counts in
+    // place as reads land (`_refreshBuildingNavs`) — the `_buildActionsRow` idiom (IMPORT-53).
+    this._navRows = [];
     view.append(Dom.el('p', { class: 'hint' }, 'Assign every drawing to a floor.'));
 
-    view.append(this._sizer());
+    // Step-wide context + the one view preference share a single compact row (IMPORT-50). The
+    // floor-label pick — a build-time setting, not a mapping action — rides the build row instead
+    // (`_buildActions`).
+    view.append(Dom.el('div', { class: 'imp-maptools' },
+      [this._siteplanSummary(), this._sizer()]));
+    // The background floor-code sweep's own strip, directly under the step's context row: it
+    // reports on the whole facility, not on the building in view, and it is the only place a
+    // running sweep can be stopped (IMPORT-53). Hidden while idle.
+    view.append(this.ocr.statusEl());
+    // Why nothing is being read, when the install could read but nothing is marked (IMPORT-63).
+    // `ImportOcrSweep.autoStart` declines silently by design, so without this the operator's only
+    // evidence of the feature is its absence.
+    const idle = this._ocrIdleNotice();
+    if (idle) view.append(idle);
     this._applyThumbSize();
-    view.append(this._floorLabelFieldControl());
-    view.append(this._siteplanSummary());
 
     // The carousel pages over floor-mapping buildings only (`_mappableBuildings`), so the
     // chosen site plan / a `Site Plan` folder is never shown as a card asking for a floor.
@@ -1376,20 +1322,52 @@ class ImportFlow {
     const buildings = this._mappableBuildings();
     if (buildings.length) {
       this._bIdx = Math.max(0, Math.min(this._bIdx, buildings.length - 1));
-      if (buildings.length > 1) view.append(this._buildingNav(buildings));
+      // The whole-facility view (IMPORT-63), above the carousel it is the alternative to: progress,
+      // a name search, a status filter, and the sweep's coverage across every building. Null for a
+      // handful of buildings, where the nav bar already answers everything it would.
+      const overview = this.overview.section();
+      if (overview) view.append(overview);
+      if (buildings.length > 1) view.append(this._addBuildingNav(buildings));
       const b = buildings[this._bIdx];
       this._ensureFloors(b);   // kick off the NetBox Location fetch for this building (cached)
-      this._buildingSectionEl = this._buildingSection(b);
+      this._buildingSectionEl = this.cards.section(b);
       view.append(this._buildingSectionEl);
       this._applyThumbSize();   // re-apply now cards exist, so a large size upgrades them to hi-res
 
       // A second nav at the bottom so the user isn't forced back to the top after assigning a
       // building's drawings. Re-rendering rebuilds both bars each switch, keeping them in sync.
-      if (buildings.length > 1) view.append(this._buildingNav(buildings));
+      if (buildings.length > 1) view.append(this._addBuildingNav(buildings));
     }
 
     this._buildActionsRow = this._buildActions();
     view.append(this._buildActionsRow);
+
+    // Read the facility's floor codes in the background, if there is a region to read them
+    // through and anything left to read (IMPORT-53). Declines silently otherwise — this is the
+    // automatic path, and it must never be the reason arriving at this step says something.
+    this.ocr.autoStart();
+  }
+
+  /** One `_buildingNav` bar, remembered so `_refreshBuildingNavs` can swap it in place. */
+  _addBuildingNav(buildings) {
+    const nav = this._buildingNav(buildings);
+    this._navRows.push(nav);
+    return nav;
+  }
+
+  /** Rebuild the carousel nav bars in place, for a change that alters what their per-building
+   *  labels say without touching the visible building's cards — a background OCR batch landing on
+   *  some other building (IMPORT-53). Skips a bar that has left the DOM (an earlier render's), and
+   *  is a no-op before the map step has drawn any. */
+  _refreshBuildingNavs() {
+    if (!this._navRows || !this._navRows.length) return;
+    const buildings = this._mappableBuildings();
+    this._navRows = this._navRows.map(old => {
+      if (!old.isConnected) return old;
+      const fresh = this._buildingNav(buildings);
+      old.replaceWith(fresh);
+      return fresh;
+    });
   }
 
   /** Swap in a fresh build-action row in place, preserving page scroll. Assigning the last
@@ -1403,18 +1381,18 @@ class ImportFlow {
   }
 
   /** Scroll-preserving re-render of just the visible building's section (card grid + header),
-   *  for a floor edit that touches the whole building — `_autoNumber` (rewrites every card's
-   *  assignment) and `_addFloor` (mutates the shared `nbFloors`, so every sibling card's floor
+   *  for a floor edit that touches the whole building — a bulk action (`ImportBulk._apply`) and
+   *  `_addFloor` (mutates the shared `nbFloors`, so every sibling card's floor
    *  row must refresh). Swapping only the section leaves the header/summary/nav — and the page
    *  scroll — intact, unlike a full `_stepMap()` (IMPORT-2). `this._cards` is reset since the
    *  rebuilt section re-pushes every current card's hi-res upgrader; `_applyThumbSize` then
    *  re-applies the size / hi-res state and `_refreshBuildActions` re-evaluates the gate. Falls
-   *  back to a full render if the section hasn't been captured (defensive — both callers only
+   *  back to a full render if the section hasn't been captured (defensive — the callers only
    *  fire from within the map step). */
   _rerenderBuildingSection(b) {
     if (!this._buildingSectionEl) return this._stepMap();
     this._cards = [];
-    const fresh = this._buildingSection(b);
+    const fresh = this.cards.section(b);
     this._buildingSectionEl.replaceWith(fresh);
     this._buildingSectionEl = fresh;
     this._applyThumbSize();
@@ -1434,32 +1412,112 @@ class ImportFlow {
   _buildActions() {
     const unassigned = this._unassignedBuildings();
     const label = this.app.store.hasContent() ? 'Rebuild map' : 'Build facility map';
-    // Linear back to the code-region step (fresh only; null in edit → dropped by `Dom.el`).
+    // Linear back to the site-plan step (fresh only; null in edit → dropped by `Dom.el`).
     const actions = [this._backButton('map')];
     if (unassigned.length) {
       const blocked = Dom.el('button', { class: 'primary' }, label);
       blocked.disabled = true;
       actions.push(blocked);
-      const reasons = [];
-      // Name the offending buildings when there are few; a long list is just noise, so past a
-      // handful collapse it to a count.
-      reasons.push(unassigned.length <= 5
-        ? 'Unassigned drawings in: ' + unassigned.join(', ') + '.'
-        : unassigned.length + ' buildings have unassigned drawings.');
-      actions.push(Dom.el('span', { class: 'hint' }, reasons.join(' ')));
+      // Name the offending buildings when there are few, each one clickable straight into the
+      // carousel; a long list is just noise, so past a handful collapse it to a count instead.
+      actions.push(unassigned.length <= 5
+        ? this._unassignedHint(unassigned) : Dom.el('span', { class: 'hint' },
+          unassigned.length + ' buildings have unassigned drawings.'));
     } else {
       actions.push(Dom.el('button', { class: 'primary', onclick: () => this._build() }, label));
+      // Filename-suggested floors pass the gate (they're real assignments), so the only thing
+      // standing between a bad guess and a built map is the operator noticing it. Say how many are
+      // still unconfirmed right where they're about to press Build (IMPORT-28).
+      const n = this._suggestedCount();
+      if (n) {
+        // A faint read that still resolved is the one suggestion most likely to be wrong, so its
+        // count rides the same sentence rather than a second line (IMPORT-53).
+        const low = this._mappableBuildings()
+          .reduce((t, b) => t + this._lowConfidenceCount(b), 0);
+        actions.push(Dom.el('span', { class: 'hint' },
+          n + (n === 1 ? ' floor was' : ' floors were') + ' suggested from drawing names or floor '
+          + 'codes — worth a check before building.'
+          + (low ? ' ' + low + ' of them ' + (low === 1 ? 'was' : 'were')
+            + ' read with low confidence.' : '')));
+      }
+      // Floors the sweep committed on the operator's behalf (IMPORT-63). They pass the gate like
+      // any other assignment, so — exactly as with the suggestion count above — the count sits
+      // where Build is pressed, with the one action that reverses the whole set beside it.
+      const auto = this._autoAcceptedTotal();
+      if (auto) {
+        actions.push(Dom.el('span', { class: 'hint' },
+          auto + (auto === 1 ? ' floor was' : ' floors were') + ' set automatically from a '
+          + 'confident floor code. They’re marked on their cards.'));
+        actions.push(Dom.el('button', {
+          title: 'Turn every automatically-set floor back into a suggestion to confirm. The floors '
+            + 'themselves are kept.',
+          onclick: () => this._undoAutoAccepted() }, 'Undo automatic floors'));
+      }
+      // A building with no NetBox anchor still builds — its floors just carry a `siteSlug` no Site
+      // answers to, so nothing drawn on them can ever bind to a Location. The linear fresh walk
+      // can't reach Build in that state (`FreshImportFlow._buildingsActions` gates on
+      // `_allBuildingsBound`), but the edit hub jumps straight here, and an unbound building's
+      // drawings keep their Level 1..N defaults — never `unassigned` — so the gate above waves them
+      // through (IMPORT-29). **Warn, don't block:** a rebuild is the recovery path when a Site is
+      // renamed or removed in NetBox, and blocking it would strand the facility.
+      const unbound = this._unboundBuildings();
+      if (unbound.length)
+        actions.push(Dom.el('span', { class: 'imp-floor-warn' },
+          '⚠ ' + (unbound.length <= 5
+            ? 'Not bound to NetBox: ' + unbound.join(', ') + '.'
+            : unbound.length + ' buildings are not bound to NetBox.')
+          + ' Their floors will build, but nothing drawn on them can bind to a NetBox location.'
+          + ' Use “Edit binding” to bind them first.'));
     }
+    // The floor-label pick sits with the action it parameterizes (IMPORT-50): the label string is
+    // resolved fresh in `_build()`, so this is a build-time setting, not part of the mapping work.
+    actions.push(this._floorLabelFieldControl());
     actions.push(Dom.el('button', { onclick: () => this._addDrawings() }, '+ Add drawings'));
     actions.push(this._startOver());
     return Dom.el('div', { class: 'imp-actions' }, actions);
   }
 
+  /** Jump the carousel straight to building `b`, saving the current draft first — the same
+   *  contract `_buildingNav`'s Previous/Next/select follow. Used by the build gate's clickable
+   *  unassigned-building names and by "Next needing attention" (IMPORT-40). No-op if `b` has
+   *  fallen out of the mappable set (defensive; can't happen for a caller passing a building
+   *  drawn from `_unassignedBuildings`/`_mappableBuildings` themselves). */
+  async _jumpToBuilding(b) {
+    const idx = this._mappableBuildings().indexOf(b);
+    if (idx < 0) return;
+    await this._saveDraft();
+    this._bIdx = idx;
+    this._stepMap();
+  }
+
+  /** The build gate's "Unassigned drawings in: …" line (`_buildActions`, `unassigned.length <= 5`)
+   *  with each building name a jump straight to it in the carousel, so the operator doesn't have
+   *  to page around to find what's blocking Build (IMPORT-40). */
+  _unassignedHint(unassigned) {
+    const hint = Dom.el('span', { class: 'hint' }, 'Unassigned drawings in: ');
+    unassigned.forEach((b, i) => {
+      hint.append(Dom.el('button', { class: 'imp-link',
+        onclick: () => this._jumpToBuilding(b) }, b.name || b.folder));
+      hint.append(i < unassigned.length - 1 ? ', ' : '.');
+    });
+    return hint;
+  }
+
+  /** How many drawings across the whole import still carry an unconfirmed filename suggestion
+   *  (IMPORT-28) — counted over `_mappableBuildings`, the same population the carousel pages, so the
+   *  number matches what the operator can actually page to and check. */
+  _suggestedCount() {
+    return this._mappableBuildings()
+      .reduce((n, b) => n + b.pdfs.filter(p => b.assign[p.stem] && b.assign[p.stem].suggested).length, 0);
+  }
+
   /** Building paging: ← Previous / Next → with a building dropdown that jumps straight to any
-   *  building (in place of a "Building N of M" label). Navigating — via the buttons or the
-   *  select — saves the draft, sets `_bIdx`, and re-renders. `buildings` is the filtered carousel
-   *  list (`_mappableBuildings`) that `_bIdx` indexes, so the option values and bounds exclude the
-   *  site plan. Factored into a helper so it can be reused. */
+   *  building (in place of a "Building N of M" label), plus "Next needing attention →" that skips
+   *  straight to the next building still holding an unassigned drawing (IMPORT-40) — on a
+   *  many-building import that's a real jump, not just a page-flip. Navigating — via the buttons,
+   *  the select, or the attention jump — saves the draft, sets `_bIdx`, and re-renders. `buildings`
+   *  is the filtered carousel list (`_mappableBuildings`) that `_bIdx` indexes, so the option
+   *  values and bounds exclude the site plan. Factored into a helper so it can be reused. */
   _buildingNav(buildings) {
     const nav = Dom.el('div', { class: 'imp-nav' });
     const prev = Dom.el('button', { onclick: async () => { await this._saveDraft(); this._bIdx--; this._stepMap(); } }, '← Previous');
@@ -1468,124 +1526,167 @@ class ImportFlow {
     next.disabled = this._bIdx === buildings.length - 1;
     const sel = Dom.el('select', { class: 'imp-nav-select', onchange: async (e) => {
       await this._saveDraft(); this._bIdx = parseInt(e.target.value, 10); this._stepMap();
-    } }, buildings.map((b, i) => Dom.el('option', { value: String(i) }, b.name || b.folder)));
+    } }, buildings.map((b, i) => Dom.el('option', { value: String(i) }, this._buildingNavLabel(b))));
     sel.value = String(this._bIdx);   // mark the current building once the options are attached
-    nav.append(prev, sel, next);
+    const attnIdx = this._nextNeedingAttention(buildings);
+    const attn = Dom.el('button', {
+      title: 'Skip to the next building still holding a drawing with no floor, or a floor '
+        + 'suggested from a faint code read.' }, 'Next needing attention →');
+    attn.addEventListener('click', async () => {
+      await this._saveDraft(); this._bIdx = attnIdx; this._stepMap();
+    });
+    attn.disabled = attnIdx == null;
+    // Where in the walk this building sits. The `<select>` replaced the old "Building N of M"
+    // label outright, which cost the one number a long carousel most needs (IMPORT-63); the
+    // dropdown's own purpose is likewise named rather than left to be discovered by clicking.
+    nav.append(prev, Dom.el('span', { class: 'imp-nav-pos' },
+      'Building ' + (this._bIdx + 1) + ' of ' + buildings.length), next);
+    nav.append(Dom.el('label', { class: 'imp-field' },
+      [Dom.el('span', {}, 'Jump to'), sel]), attn);
     return nav;
   }
 
-  /** Lazily fetch a building's NetBox floor Locations so the per-card floor selector can offer
-   *  them as buttons. Cached on `b.nbFloors`; on completion the map step re-renders if this
-   *  building is still the visible one. A blank slug or empty result leaves `b.nbFloors = []`,
-   *  which drives the floor-type fallback. */
-  _ensureFloors(b) {
-    if (b.nbFloors !== undefined) return;
-    this._loadFloors(b).then(() => {
-      if (this._mapView && this._mappableBuildings()[this._bIdx] === b) this._stepMap();
-    });
-  }
-
-  /** Fetch and cache a building's NetBox floor Locations (idempotent). Resolves once
-   *  `b.nbFloors` is settled to an array — empty when unbound or the site has none (driving the
-   *  floor-type fallback). Driven by the lazy per-building load (`_ensureFloors`) when the map
-   *  step shows the building. */
-  async _loadFloors(b) {
-    if (Array.isArray(b.nbFloors)) return;   // already loaded
-    const slug = (b.slug || '').trim();
-    if (!slug) { b.nbFloors = []; return; }
-    b.nbFloors = 'loading';
-    // For a Site anchor the building Location is named after the bound NetBox site, so match on that
-    // (not the user-editable `b.name`); fall back to `b.name` when unbound. For a Location anchor the
-    // building Location is known by slug (`nbBuilding`), so its children are the floors directly.
-    const siteName = (b.nbSite && b.nbSite.name) || b.name;
-    const buildingSlug = b.nbBuilding && b.nbBuilding.slug;
-    let floors = [];
-    try {
-      const res = await this.app.netbox.locations(slug);
-      const locs = res.rooms || [];
-      floors = this._mergeAssignedFloors(b, this._floorsFromLocations(locs, siteName, buildingSlug), locs);
-    } catch (_) { floors = []; }
-    b.nbFloors = floors;
-    if (floors.length) this._normalizeToLocations(b);
-  }
-
-  /** Re-include any Location a drawing is already assigned to (`assign[*].token`) that the floor
-   *  heuristic didn't surface — i.e. a floor the user added via `_addFloor`'s Location search in a
-   *  prior session. Assignments persist in the draft but `nbFloors` is rebuilt each load, so
-   *  without this an added floor would lose its button (and its sibling drawings couldn't pick it).
-   *  Looks the token up in the full site Location list so the button reappears with its real
-   *  name/slug; a token whose Location no longer exists is left out (the user redoes it). Keeps the
-   *  natural sort order. */
-  _mergeAssignedFloors(b, floors, locs) {
-    const have = new Set(floors.map(f => f.slug));
-    const bySlug = new Map(locs.map(l => [l.slug, l]));
-    for (const p of b.pdfs) {
-      const tok = b.assign[p.stem] && b.assign[p.stem].token;
-      if (!tok || have.has(tok)) continue;
-      const loc = bySlug.get(tok);
-      if (!loc) continue;
-      have.add(tok); floors.push(loc);
-    }
-    return floors.sort((x, y) => (x.name || '').localeCompare(y.name || '', undefined, { numeric: true }));
-  }
-
-  /** Pick the floor Locations out of a site's flat Location list using the parent tree.
+  /** One `_buildingNav` select option's text: the building's name/folder plus what it still wants
+   *  looking at, so the operator can see where to go without opening every card (IMPORT-40) —
+   *  "Admin — 3 unassigned, 2 low-confidence" or, once clear, "Library ✓".
    *
-   *  **Location anchor (Site = campus, `buildingSlug` given — MODEL-4):** the building Location is
-   *  known exactly, so the floors are strictly its **children** (`l.parent === building.id`) — no
-   *  root/sibling guessing, and two buildings under one campus stay separated. An unknown slug (the
-   *  Location vanished) yields no floors, driving the floor-type fallback.
-   *
-   *  **Site anchor (no `buildingSlug`):** the building Location is the root named after the bound
-   *  site (e.g. "MAIN BUILDING"); its children are floors. Any OTHER root is itself a floor — some
-   *  sites park a floor like "Roof" or "Level B2" at the top level, as a sibling of the building.
-   *  When no root matches the site name the site has no building wrapper and the roots themselves are
-   *  the floors (e.g. ANNEX). Identifying the building by name — not by tree shape — works even when
-   *  the floors have no rooms under them yet.
-   *
-   *  Either way `depth`/`level` is avoided (MPTT-only, unreliable on NetBox 4.2+). Floors are sorted
-   *  by name for a stable, natural order (B1, B2, G, …, Roof). */
-  _floorsFromLocations(locs, siteName, buildingSlug) {
-    const sortByName = (arr) =>
-      arr.sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { numeric: true }));
-    if (buildingSlug) {
-      const building = locs.find(l => l.slug === buildingSlug);
-      return sortByName(building ? locs.filter(l => l.parent === building.id) : []);
-    }
-    const ids = new Set(locs.map(l => l.id));
-    const roots = locs.filter(l => l.parent == null || !ids.has(l.parent));
-    const nameLc = (siteName || '').trim().toLowerCase();
-    const building = nameLc
-      ? roots.find(r => (r.name || '').trim().toLowerCase() === nameLc) : null;
-    const floors = roots.filter(r => r !== building);
-    if (building) for (const l of locs) if (l.parent === building.id) floors.push(l);
-    return sortByName(floors);
+   *  A building the background sweep hasn't reached yet says so (IMPORT-53). Without that, a
+   *  building queued behind a hundred others is indistinguishable from one OCR read and found
+   *  nothing in — and the operator would work through the "clear" ones only to have them fill in
+   *  behind them. */
+  _buildingNavLabel(b) {
+    const name = b.name || b.folder;
+    const bits = [];
+    const n = this._unassignedCount(b);
+    if (n) bits.push(n + ' unassigned');
+    const low = this._lowConfidenceCount(b);
+    if (low) bits.push(low + ' low-confidence');
+    if (this.ocr && this.ocr.isQueued(b)) bits.push('reading…');
+    return bits.length ? name + ' — ' + bits.join(', ') : name + ' ✓';
   }
 
-  /** Entering Location mode: a drawing with no Location token yet is marked `unassigned` so it
-   *  contributes no floor and gates the build until the user picks a Location button — the auto
-   *  Level 1..N defaults only apply to the floor-type fallback. `unassigned` is distinct from a
-   *  deliberate `— none —` (`type:'none'`), which is a real choice and passes the build gate
-   *  (see `_unassignedBuildings`). */
-  _normalizeToLocations(b) {
-    for (const p of b.pdfs) {
+  /** How many of building `b`'s drawings carry an OCR suggestion the reader wasn't confident about
+   *  (below `LOW_OCR_CONF`, IMPORT-53). These pass the build gate — they are real assignments — so
+   *  they are exactly the outcome a facility-wide sweep produces that nothing else routes back to
+   *  the operator. */
+  _lowConfidenceCount(b) {
+    return b.pdfs.filter(p => {
       const a = b.assign[p.stem];
-      if (!a.token && a.type !== 'none') a.type = 'unassigned';   // keep a deliberate — none — (e.g. the site plan)
+      return a && a.suggested && a.suggestedFrom === 'ocr'
+        && (a.ocrConf || 0) < ImportFlow.LOW_OCR_CONF;
+    }).length;
+  }
+
+  /** What building `b` still wants the operator's eyes on: a drawing with no floor, or a floor
+   *  suggested from a faint read (IMPORT-53). Deliberately **not** the build gate — a low-confidence
+   *  suggestion is a real assignment and must not disable Build (that stays `_unassignedBuildings`);
+   *  this is the softer "worth a look" the carousel routes by.
+   *
+   *  An **auto-accepted** floor is deliberately absent (IMPORT-63). Routing every one of them here
+   *  would put the whole facility back in the queue and undo the point of accepting them; they are
+   *  surfaced instead by their own count, their card badge, and the overview panel's filter, which
+   *  is review on request rather than review demanded. */
+  _attentionCount(b) {
+    return this._unassignedCount(b) + this._lowConfidenceCount(b);
+  }
+
+  /** How many of building `b`'s floors the sweep set by itself and nobody has confirmed since
+   *  (IMPORT-63) — what the card badge, the overview's filter, and the build row's undo offer all
+   *  count. Any operator pick clears the marker (`clearUnanswered`), so this shrinks as the facility
+   *  is reviewed rather than standing at whatever the sweep landed. */
+  _autoAcceptedCount(b) {
+    return b.pdfs.filter(p => {
+      const a = b.assign[p.stem];
+      return !!a && !!a.autoAccepted;
+    }).length;
+  }
+
+  /** The same count across the whole floor-mapping carousel. */
+  _autoAcceptedTotal() {
+    return this._mappableBuildings().reduce((n, b) => n + this._autoAcceptedCount(b), 0);
+  }
+
+  /** Turn every auto-accepted floor back into a suggestion awaiting confirmation (IMPORT-63) — the
+   *  one action that reverses the whole set, and the reason accepting on the operator's behalf is
+   *  defensible at all. It restores exactly the state each drawing would have been in had
+   *  auto-accept never run: the same floor, now flagged `suggested` from the same source, so the
+   *  card badge, `_suggestedCount` and the build row's "worth a check" line all pick it up. The
+   *  match itself is deliberately kept — the read was real, and discarding it would just make the
+   *  operator re-derive it. */
+  async _undoAutoAccepted() {
+    const n = this._autoAcceptedTotal();
+    if (!n) return;
+    if (!confirm('Turn ' + n + (n === 1 ? ' automatically-set floor' : ' automatically-set floors')
+      + ' back into suggestions to confirm? The floors themselves are kept.')) return;
+    for (const b of this._mappableBuildings())
+      for (const p of b.pdfs) {
+        const a = b.assign[p.stem];
+        if (!a || !a.autoAccepted) continue;
+        delete a.autoAccepted;
+        a.suggested = true;
+        a.suggestedFrom = a.suggestedFrom || 'ocr';
+      }
+    await this._saveDraft();
+    Toast.show(n + (n === 1 ? ' floor is' : ' floors are') + ' back to suggestions — confirm or '
+      + 'change them on their cards.');
+    this._stepMap();
+  }
+
+  /** Whether the install can read floor codes but has **nowhere to read them** — the `ocr`
+   *  capability is present and not one region is marked, globally or per building (IMPORT-63).
+   *
+   *  This is the state that made the whole feature look broken: `ImportOcrSweep.available()`
+   *  declines silently by design (it runs on every render, so a toast per render would be noise),
+   *  which left an operator who skipped the Site-plan step's second half with no OCR at all and
+   *  nothing on screen saying why. The map step answers it with a visible row rather than silence —
+   *  see `_ocrIdleNotice`. */
+  _ocrNeedsRegion() {
+    const caps = (window.MAP && window.MAP.capabilities) || [];
+    if (!caps.includes('ocr')) return false;
+    if (this._codeRegion) return false;
+    return !this.buildings.some(b => b.codeRegion);
+  }
+
+  /** The map step's "OCR is idle, and here is why" row (IMPORT-63) — null unless
+   *  `_ocrNeedsRegion()`. Says what isn't happening, why, and offers the one action that fixes it:
+   *  the global floor-code region picker, which returns here. */
+  _ocrIdleNotice() {
+    if (!this._ocrNeedsRegion()) return null;
+    return Dom.el('div', { class: 'imp-ocr-idle' }, [
+      Dom.el('span', {}, 'Floor codes aren’t being read: no floor-code region is marked, so the '
+        + 'reader has nowhere to look. Mark the spot where a drawing says which floor it is and '
+        + 'every drawing in the facility is read in the background.'),
+      Dom.el('button', { class: 'imp-floor',
+        onclick: () => this.regions.openPick(null, { back: () => this._stepMap() }) },
+        'Set the floor-code region…'),
+    ]);
+  }
+
+  /** Index (into `buildings`) of the next building after the current one that needs attention,
+   *  wrapping around — the target of "Next needing attention →". Starts the search *after* `_bIdx`
+   *  so repeated clicks page forward through every offender in turn; only wraps back onto the
+   *  current index itself when it's the sole building left needing attention. null when nothing in
+   *  `buildings` needs attention (disables the button). */
+  _nextNeedingAttention(buildings) {
+    for (let i = 1; i <= buildings.length; i++) {
+      const idx = (this._bIdx + i) % buildings.length;
+      if (this._attentionCount(buildings[idx]) > 0) return idx;
     }
+    return null;
   }
 
   /** Picker for which Location field a Location-mode floor's card label is drawn from (see
-   *  `LABEL_FIELDS`). Applies to the whole import, not per-building — changing it just
-   *  re-renders the map step; the actual label string is resolved fresh at `_build()` time, so
-   *  switching this after floors are already assigned needs no re-clicking. A no-op for a
-   *  building using the floor-type fallback (no bound Locations), so it's shown unconditionally
-   *  rather than only when a building happens to be in Location mode. */
+   *  `LABEL_FIELDS`). Applies to the whole import, not per-building, and lives on the build row
+   *  (IMPORT-50) — the label string is resolved fresh at `_build()` time and nothing on the map
+   *  step renders it, so changing it only saves the draft (no re-render), and switching it after
+   *  floors are already assigned needs no re-clicking. A no-op for a building using the
+   *  floor-type fallback (no bound Locations), so it's shown unconditionally rather than only
+   *  when a building happens to be in Location mode. */
   _floorLabelFieldControl() {
     const sel = Dom.el('select', {
       onchange: async (e) => {
         this._floorLabelField = e.target.value;
         await this._saveDraft();
-        this._stepMap();
       },
     }, ImportFlow.LABEL_FIELDS.map(([value, text]) => {
       const o = Dom.el('option', { value }, text);
@@ -1620,37 +1721,110 @@ class ImportFlow {
       for (const c of this._cards) c.upgrade();
   }
 
-  /** Its own first step in the assign phase: pick which drawing is the site plan. The site plan
-   *  is the overall map of where the buildings sit — it carries no floor code, so it's chosen
-   *  here, before the code-region pick and floor assignment. */
+  /** The last step before floor assignment, asking the two facility-wide questions the drawings
+   *  themselves can't answer: **which drawing is the site plan** (the overall map of where the
+   *  buildings sit — it carries no floor code, so it is chosen apart from floor assignment) and
+   *  **where a drawing says which floor it is** (the code region every card is cropped to).
+   *
+   *  One step, not two (IMPORT-37, the IMPORT-34 precedent): both were full screens, sequenced by
+   *  hidden gates in `_stepMap`, and the first is usually a non-question — the site plan is
+   *  auto-detected from a `Site Plan` folder, so its half opens already answered and collapsed.
+   *  Neither half gates Continue: the site plan is optional (IMPORT-8) and the crop is skippable. */
   _stepSiteplan() {
-    const view = this._stage('Select the siteplan', 'siteplan');
+    const view = this._stage('Site plan & floor codes', 'siteplan');
+    view.append(Dom.el('h3', { class: 'imp-substep' }, 'Which drawing is the site plan?'));
     view.append(Dom.el('p', { class: 'hint' },
-      'The siteplan is the overall map of the site: the drawing that shows where the buildings '
-      + 'sit. It has no floor code, so choose it here first; it’s left out of floor assignment. '
+      'The site plan is the overall map of the site: the drawing that shows where the buildings '
+      + 'sit. It has no floor code, so it’s left out of floor assignment. '
       + 'It’s optional — if your facility has no overall site plan (a single building, or a site '
       + 'with no campus map), leave this as (none) and continue.'));
-    view.append(Dom.el('div', { class: 'imp-siteplan' }, [
-      Dom.el('label', {}, 'Siteplan image'), this._siteplanSelect(),
-    ]));
+    view.append(this._siteplanPicker());
+    // Null for a siteplan-only import: no floor drawing means nothing to crop, so the step is
+    // just its first half rather than a screen apologizing for an empty second one.
+    const codes = this.regions.codeSection();
+    if (codes) view.append(codes);
     view.append(Dom.el('div', { class: 'imp-actions' }, [
       this._backButton('siteplan'),
       Dom.el('button', { class: 'primary', onclick: async () => {
-        this._siteplanDone = true; await this._saveDraft(); this._stepMap();
+        this._siteplanStepDone = true; await this._saveDraft(); this._stepMap();
       } }, 'Continue'),
       this._startOver(),
     ]));
   }
 
+  /** The site-plan half of that step: which drawing is the site plan, with a look at it. Two
+   *  presentations of the controls:
+   *    - **answered** — a pick is already in force, normally auto-detected from a `Site Plan`
+   *      folder (`_modelFromInventory`), so the question opens collapsed to its answer + Change;
+   *    - **choosing** — the `<select>` of every uploaded drawing, opened by Change or shown
+   *      straight away when nothing was detected.
+   *  Either way it carries a thumbnail of the current pick — this was the wizard's one drawing
+   *  picker with no visual preview, and "is that the site plan?" is a question about the drawing.
+   *
+   *  The thumbnail and the controls repaint **separately, in place**: picking from the `<select>`
+   *  refreshes only the thumbnail, so the picker itself keeps focus (and the code sample below
+   *  keeps its zoom/scroll, which a step re-render would reset — IMPORT-2). */
+  _siteplanPicker() {
+    const thumb = Dom.el('div', { class: 'imp-siteplan-slot' });
+    const controls = Dom.el('div', { class: 'imp-siteplan-ctl' });
+    const paintThumb = () => {
+      thumb.innerHTML = '';
+      const picked = this._siteplanDrawing();
+      thumb.append(picked ? this._siteplanThumb(picked)
+        : Dom.el('span', { class: 'hint' },
+          this.site.file ? 'Preview unavailable.' : 'No site plan chosen.'));
+    };
+    const paintControls = (choosing) => {
+      controls.innerHTML = '';
+      if (choosing)
+        controls.append(Dom.el('label', {}, 'Site plan'), this._siteplanSelect(paintThumb));
+      else
+        controls.append(
+          Dom.el('strong', {}, this.site.folder + ' / ' + this.site.file),
+          Dom.el('button', { class: 'imp-link',
+            onclick: () => paintControls(true) }, 'Change'));
+    };
+    paintThumb();
+    paintControls(!this.site.file);
+    return Dom.el('div', { class: 'imp-siteplan' }, [thumb, controls]);
+  }
+
+  /** The scanned drawing `this.site` names, or null when none is chosen (or the pick no longer
+   *  exists — a folder can be regrouped away between sessions). Read from the scan inventory, not
+   *  the building model, so the site plan is found in a dedicated `Site Plan` folder too. */
+  _siteplanDrawing() {
+    if (!this.site.file) return null;
+    const f = (this.inv?.folders || []).find(x => x.folder === this.site.folder);
+    return (f && f.pdfs.find(p => p.file === this.site.file)) || null;
+  }
+
+  /** A look at one scanned drawing — the organize-row thumbnail idiom (IMPORT-23): the scan
+   *  thumbnail (always page 1), falling back to the on-demand preview when it failed to render,
+   *  with wheel-zoom / drag-pan and click-to-lightbox. */
+  _siteplanThumb(p) {
+    const img = Dom.el('img', {
+      src: p.thumb ? ImportFlow._media(p.thumb) : ImportPreview.previewUrl(p.pdf),
+      loading: 'lazy', title: 'Click to see the whole drawing',
+    });
+    const thumb = Dom.el('div', { class: 'imp-thumb imp-siteplan-thumb' }, [img]);
+    let hires = !p.thumb;
+    ImportPreview.attachZoomPan(thumb, img, { scale: 1, x: 0, y: 0 }, {
+      onClick: () => ImportPreview.lightbox(p),
+      onZoom: () => { if (!hires) { hires = true; img.src = ImportPreview.previewUrl(p.pdf); } },
+    });
+    return thumb;
+  }
+
   /** The folder/file `<select>` of every uploaded drawing, used by the site-plan step. Choosing
    *  an option routes through `_setSiteplan`, which also excludes the picked drawing from floor
-   *  assignment. */
-  _siteplanSelect() {
+   *  assignment, then `onPick` repaints the row around it (the thumbnail tracks the choice). */
+  _siteplanSelect(onPick) {
     const sel = Dom.el('select', {
       onchange: (e) => {
         const v = e.target.value;
-        if (!v) return this._setSiteplan('', '');
-        const [folder, file] = JSON.parse(v); this._setSiteplan(folder, file);
+        if (v) { const [folder, file] = JSON.parse(v); this._setSiteplan(folder, file); }
+        else this._setSiteplan('', '');
+        onPick();
       },
     });
     sel.append(Dom.el('option', { value: '' }, '(none)'));
@@ -1664,15 +1838,15 @@ class ImportFlow {
     return sel;
   }
 
-  /** Compact, read-only site-plan line shown atop the map step (selection now happens in its own
-   *  step). "Change" jumps back to that step. */
+  /** Compact, read-only site-plan line shown atop the map step (selection happens in the Site plan
+   *  step). "Change" jumps to that step — a plain step call, like every other navigation in the
+   *  wizard; it used to un-set the step's done-flag and re-enter `_stepMap` to be bounced back
+   *  there, which was a third way to navigate and the reason those gates existed (IMPORT-37). */
   _siteplanSummary() {
     const label = this.site.file ? (this.site.folder + ' / ' + this.site.file) : '(none)';
     return Dom.el('div', { class: 'imp-siteplan' }, [
       Dom.el('span', {}, 'Siteplan: '), Dom.el('strong', {}, label),
-      Dom.el('button', { class: 'imp-link', onclick: async () => {
-        this._siteplanDone = false; await this._saveDraft(); this._stepMap();
-      } }, 'Change'),
+      Dom.el('button', { class: 'imp-link', onclick: () => this._stepSiteplan() }, 'Change'),
     ]);
   }
 
@@ -1711,454 +1885,15 @@ class ImportFlow {
     return this.site.folder === b.folder && this.site.file === p.file && (!p.page || p.page === 1);
   }
 
-  /** Whether drawing `p` may be swept to "(none)" by a bulk action: not the chosen site plan (a
-   *  distinct no-floor state) and not a region-split drawing (whose per-region floors would be
-   *  silently discarded — left to the explicit Unsplit). Keeps `_bulkNone` and the header controls'
-   *  visibility in lockstep. */
-  _bulkEligible(b, p) {
-    return !this._isSiteplanPick(b, p) && !(b.regions[p.stem] && b.regions[p.stem].length);
-  }
-
-  /** Bulk-triage helper: set every card in building `b` matching `matchFn(p)` to "(none)", the same
-   *  `{type:'none', token:null, label:''}` the per-card `(none)` button produces (`_floorButtons`) —
-   *  so bulk-none is pure UX ergonomics with no new "ignored" state, and `max_pdfs` is satisfied for
-   *  free (a `type:'none'` drawing is dropped from the build, see `_resolveFloors`). Ineligible cards
-   *  (the chosen site plan; a region-split drawing) are skipped via `_bulkEligible`. Saves the draft,
-   *  re-renders the building section in place (preserving scroll, IMPORT-2; also re-runs the build
-   *  gate), and toasts the count. */
-  _bulkNone(b, matchFn) {
-    let n = 0;
-    for (const p of b.pdfs) {
-      if (!this._bulkEligible(b, p) || !matchFn(p)) continue;
-      const a = b.assign[p.stem];
-      a.type = 'none'; a.token = null; a.label = '';
-      n++;
-    }
-    if (!n) { Toast.show('No matching drawings to set to (none).'); return; }
-    this._saveDraft();
-    this._rerenderBuildingSection(b);
-    Toast.show('Set ' + n + (n === 1 ? ' drawing' : ' drawings') + ' to (none).');
-  }
-
-  /** Boundary validation for a building's editable `name`/`slug`, surfaced inline in the map step
-   *  so a problem shows as the user types rather than only as a late build-time toast (the empty-slug
-   *  and duplicate-slug guards in `_build` remain the hard safety net). Returns an error string, or
-   *  null when the field is fine. `name`: required. `slug`: required, a valid slug charset (lenient
-   *  enough never to flag a real bound `Location.slug`), and unique across floor-contributing
-   *  buildings (the collision `_build` rejects, caught earlier here). */
-  _buildingFieldError(b, key) {
-    const v = (b[key] || '').trim();
-    if (key === 'name') return v ? null : 'Building name is required.';
-    // slug
-    if (!v) return 'Site slug is required.';
-    if (!/^[-a-zA-Z0-9_]+$/.test(v)) return 'Use letters, numbers, hyphens, and underscores only.';
-    if (this._floorBuildings().some(o => o !== b && (o.slug || '').trim() === v))
-      return 'Another building already uses this slug.';
-    return null;
-  }
-
-  _buildingSection(b) {
-    const field = (label, key, w) => Dom.el('label', { class: 'imp-field' }, [
-      Dom.el('span', {}, label),
-      Dom.el('input', { value: b[key], style: 'width:' + w,
-        oninput: (e) => { b[key] = e.target.value; } }),
-    ]);
-    // A validated field (name/slug): the input plus an inline error line that updates as the user
-    // types, with the input flagged `.invalid` while a problem stands (see `_buildingFieldError`).
-    const vfield = (label, key, w) => {
-      const input = Dom.el('input', { value: b[key], style: 'width:' + w });
-      const err = Dom.el('span', { class: 'imp-field-err' });
-      const validate = () => {
-        const msg = this._buildingFieldError(b, key);
-        err.textContent = msg || '';
-        input.classList.toggle('invalid', !!msg);
-      };
-      input.addEventListener('input', () => { b[key] = input.value; validate(); });
-      validate();
-      return Dom.el('label', { class: 'imp-field' }, [Dom.el('span', {}, label), input, err]);
-    };
-    const fields = [
-      vfield('Building name', 'name', '15em'),
-      vfield('Site slug', 'slug', '9em'),
-    ];
-    // In Location mode the floor id must equal the real Location slug, so the floor prefix is
-    // forced empty (see `_build`) and the prefix + auto-number controls are hidden; they only
-    // apply to the floor-type fallback.
-    if (!(Array.isArray(b.nbFloors) && b.nbFloors.length)) {
-      fields.push(field('Floor prefix', 'abbr', '6em'));
-      fields.push(Dom.el('button', { class: 'imp-auto',
-        onclick: () => this._autoNumber(b) }, 'Number floors 1…N'));
-    }
-    // If the global code box doesn't fit this building (its title block sits elsewhere), offer a
-    // re-mark scoped to just it — overrides the crop region for this folder's cards only. Shown
-    // whenever the building has a markable drawing (the same `type !== 'none'` test `_stepRegionPick`
-    // uses to find a sample), so it's reachable even when the global region pick was skipped.
-    const markable = b.pdfs.some(p => b.assign[p.stem] && b.assign[p.stem].type !== 'none');
-    if (markable)
-      fields.push(Dom.el('button', { class: 'imp-auto',
-        onclick: () => this._stepRegionPick(b) }, 'Set this building’s code region'));
-    const bulk = this._bulkTriageControls(b);
-    if (bulk) fields.push(bulk);
-    const head = Dom.el('div', { class: 'imp-bhead' }, fields);
-    const grid = Dom.el('div', { class: 'imp-grid' });
-    for (const p of b.pdfs) grid.append(this._pdfCard(b, p));
-    return Dom.el('section', { class: 'imp-building' }, [head, grid]);
-  }
-
-  _pdfCard(b, p) {
-    const a = b.assign[p.stem];
-    // Straightening rotation for this card ({deg} clockwise, mutated in place by the rotate
-    // toolbar and read live by the src/lightbox closures below).
-    const holder = b.angle[p.stem] || { deg: 0 };
-    const deg = holder.deg || 0;
-    // A replaced drawing's image is regenerated at the same path, so bust the browser cache
-    // (`?v=` for a plain media thumb, `&v=` on a preview URL that already carries a query).
-    const rev = (sep) => (p._rev ? sep + 'v=' + p._rev : '');
-    const preview = () => ImportPreview.previewUrl(p.pdf, p.page, holder.deg) + rev('&');
-    // A code region (global or this building's override) crops every card to a close-up of the
-    // drawing's identifying code; without one, fall back to the full-drawing thumbnail. A page row
-    // of an exploded multi-page PDF has no scan thumbnail (`p.thumb == null`) — its card image is
-    // the per-page `preview` render, so it takes the same paths as a scanned drawing. A **rotated**
-    // card skips the crop: the code region was marked on the unrotated drawing, so crop + rotate
-    // don't compose — show the full reoriented preview (what the user needs to judge it anyway).
-    const region = b.codeRegion || this._codeRegion;
-    const hasImage = p.thumb || p.page;
-    let card;   // captured so a rotation can re-render just this card (crop↔full, new aspect)
-    let thumb;
-    if (hasImage && region && !deg) {
-      thumb = this._codeCropThumb(p, region);
-    } else if (hasImage) {
-      // When rotated (or a page row with no scan thumbnail) start on the full preview; otherwise
-      // the small scan thumbnail, upgraded to the full render on zoom / when the size slider grows.
-      const src = (deg || !p.thumb) ? preview() : ImportFlow._media(p.thumb) + rev('?');
-      const img = Dom.el('img', { src, loading: 'lazy' });
-      thumb = Dom.el('div', { class: 'imp-thumb' }, [img]);
-      let hires = !!deg || !p.thumb;
-      const upgrade = () => { if (!hires) { hires = true; img.src = preview(); } };
-      this._cards.push({ upgrade });
-      ImportPreview.attachZoomPan(thumb, img, b.frame[p.stem],
-        { onClick: () => ImportPreview.lightbox(p, holder.deg), onZoom: upgrade });
-    } else {
-      thumb = Dom.el('div', { class: 'imp-thumb imp-nothumb' }, p.file);
-    }
-    // Straighten a scanned-rotated drawing before build. Rotating re-renders just this card (its
-    // aspect ratio and crop-vs-full choice both change), resets its framing, and saves the draft.
-    if (hasImage) {
-      thumb.append(ImportPreview.rotateControls(holder, () => {
-        // Region-split boxes are marked in the drawing's straightened space (FLOOR-4), so a
-        // rotation invalidates them (like it resets the framing below) — clear them, so the
-        // natural order is straighten first, then split.
-        if (b.regions[p.stem] && b.regions[p.stem].length) b.regions[p.stem] = [];
-        b.frame[p.stem] = { scale: 1, x: 0, y: 0 };
-        card.replaceWith(card = this._pdfCard(b, p));
-        this._saveDraft();
-      }));
-    }
-    // The chosen site plan carries no floor — show a badge instead of the floor selector so it
-    // isn't presented as a card asking for a floor. Keyed on the `this.site` match, not merely
-    // `type:'none'`, so a card manually set to "— none —" keeps its floor buttons.
-    const isSite = this._isSiteplanPick(b, p);
-    // A plain floor click only touches this drawing's assignment, so it patches just this card in
-    // place (+ the build gate) rather than re-running `_stepMap()`, which would reset the page
-    // scroll (IMPORT-2). Same in-place swap the rotate control uses above; `card` is the `let card`
-    // assigned below, so this closure resolves it at click time.
-    const isOverlay = ImportUploader.isOverlay(p.file);
-    // Snapshot the resolved floor at render time so the rerender callback below can tell a real
-    // floor *change* from a same-floor click (it fires on every assignment button press).
-    const tokenAtRender = this._assignToken(a, null);
-    const rerenderCard = () => {
-      // Re-assigning an overlay's floor invalidates its control-point alignment — the dst
-      // points are 0..1 of the OLD floor's canvas — so clear it, mirroring how a rotation
-      // clears region-split boxes (FMT-6).
-      if (isOverlay && (b.align[p.stem] || []).length
-          && this._assignToken(a, null) !== tokenAtRender) {
-        b.align[p.stem] = [];
-        Toast.show('Alignment cleared — this overlay was aligned on its previous floor. '
-          + 'Use “Align on plan…” to re-align it.');
-      }
-      card.replaceWith(card = this._pdfCard(b, p));
-      this._applyThumbSize();      // keep the hi-res upgrade state at large thumbnail sizes
-      this._refreshBuildActions(); // assigning the last unassigned drawing opens the gate
-    };
-    const floorRow = isSite
-      ? Dom.el('div', { class: 'imp-floors' }, Dom.el('span', { class: 'hint' }, 'Siteplan (no floor needed)'))
-      : this._floorRow(b, p, a, rerenderCard);
-    // A page row of an exploded multi-page PDF shows its page number so several cards from one PDF
-    // are distinguishable at a glance.
-    const fileParts = [Dom.el('span', { class: 'imp-cardname' }, p.file)];
-    if (p.page) fileParts.push(Dom.el('span', { class: 'imp-cardpage' }, 'page ' + p.page));
-    fileParts.push(this._replaceControl(b, p));
-    const body = Dom.el('div', { class: 'imp-cardbody' }, [
-      Dom.el('div', { class: 'imp-cardfile' }, fileParts),
-      floorRow,
-      // A GIS overlay card grows the align affordance (FMT-6): its placement state plus the
-      // jump into the align editor. Base drawings are untouched.
-      isOverlay && !isSite ? this._alignRow(b, p) : null,
-    ]);
-    // Flag a still-unassigned drawing so it stands out in the grid (and in the gated build hint) —
-    // region-aware, so a region-split card with an unassigned region is flagged too (FLOOR-4).
-    const cls = 'imp-card' + (this._cardUnassigned(b, p) ? ' unassigned' : '');
-    card = Dom.el('div', { class: cls }, [thumb, body]);
-    return card;
-  }
-
-  /** A card thumbnail cropped to just the marked code `region` (normalized 0..1) of the drawing's
-   *  full-scale render. The crop is pure CSS: the hi-res preview <img> is widened to `1/region.w`
-   *  of the box and translated by `-region.x/-region.y` of its own size, so the region exactly
-   *  fills an overflow-clipped box. Those are percentages, so the crop rescales for free when the
-   *  size slider changes the card width — only the box's aspect ratio needs the render's intrinsic
-   *  size, set once on load. Clicking opens the full drawing in the lightbox — the escape hatch
-   *  for an outlier whose code sits outside the marked spot. */
-  _codeCropThumb(p, region) {
-    const img = Dom.el('img', { class: 'imp-crop-img',
-      src: ImportPreview.previewUrl(p.pdf, p.page) + (p._rev ? '&v=' + p._rev : ''), loading: 'lazy' });
-    img.style.width = (100 / region.w) + '%';
-    img.style.transform = 'translate(' + (-region.x * 100) + '%,' + (-region.y * 100) + '%)';
-    const box = Dom.el('div', { class: 'imp-thumb imp-codecrop', title: 'Click to see the whole drawing',
-      onclick: () => ImportPreview.lightbox(p) }, [img]);
-    const fit = () => {
-      const iw = img.naturalWidth, ih = img.naturalHeight;
-      if (iw && ih) box.style.aspectRatio = (region.w * iw) + ' / ' + (region.h * ih);
-    };
-    if (img.complete) fit(); else img.addEventListener('load', fit);
-    return box;
-  }
-
-  /** Per-drawing "Replace" control: upload a newer drawing for this floor in place. The new bytes
-   *  are written to the EXISTING upload path (same folder + filename), so the drawing's stem — and
-   *  therefore its floor id and any rooms already drawn on that floor — are preserved. The picker
-   *  is pinned to the existing file's extension: the fixed filename keeps the on-disk extension,
-   *  and the render dispatches by extension, so a same-format replacement can't desync the two. */
-  _replaceControl(b, p) {
-    const sameExt = '.' + (p.file.split('.').pop() || '').toLowerCase();
-    const input = Dom.el('input', { type: 'file', accept: sameExt, style: 'display:none',
-      onchange: (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) this._replacePdf(b, p, f); } });
-    const btn = Dom.el('button', { class: 'imp-replace',
-      title: 'Upload a newer drawing for this floor. Keeps the same floor assignment, so rooms '
-        + 'already drawn on it stay.',
-      onclick: () => input.click() }, 'Replace');
-    return Dom.el('span', { class: 'imp-replace-wrap' }, [btn, input]);
-  }
-
-  /** Overwrite one drawing's PDF in place, then re-scan to refresh its thumbnail. The upload path
-   *  is fixed to the existing filename (regardless of the picked file's name) so the floor id is
-   *  unchanged — id-preserving, so rooms drawn on that floor survive the next build. */
-  async _replacePdf(b, p, file) {
-    try {
-      // Fixed to the existing filename (`p.file`) regardless of the picked file's name, so the
-      // stem — and therefore the floor id — is unchanged.
-      await ImportUploader.uploadFile(b.folder + '/' + p.file, file, p.file);
-      try { const inv = await Api.post('/api/import/scan', {}); if (inv.ok) this.inv = inv; }
-      catch (_) { /* the existing thumbnail stays until the next scan */ }
-      p._rev = (p._rev || 0) + 1;
-      // Remember that this drawing's bytes changed, so the pre-build desync guard warns that any
-      // rooms/hotspots placed on it may no longer line up (REPL-1) — a margin/crop shift keeps the
-      // id, pixel size, and aspect ratio, so nothing else would flag it.
-      this._replaced.add(b.folder + '/' + p.stem);
-      Toast.show('Replaced ' + p.file);
-      this._stepMap();
-    } catch (e) { Toast.show('Replace failed: ' + e.message, true); }
-  }
-
-  /** A non-siteplan card's floor-assignment area. When the drawing is region-split (FLOOR-4) it's a
-   *  read-only summary (`_regionSummary`); otherwise the whole-page floor buttons plus an opt-in
-   *  "Split into floors…" affordance that opens the split editor. Splitting is per card, so the
-   *  common single-floor card is unchanged (just floor buttons + the split link). */
-  _floorRow(b, p, a, rerenderCard) {
-    if (b.regions[p.stem] && b.regions[p.stem].length) return this._regionSummary(b, p);
-    const split = Dom.el('button', { class: 'imp-floor imp-floor-split',
-      title: 'Split this one plan into several floors by drawing a box around each',
-      onclick: () => this._stepSplitRegions(b, p) }, '⧉ Split into floors…');
-    return Dom.el('div', { class: 'imp-floor-row' }, [this._floorButtons(b, a, rerenderCard), split]);
-  }
-
-  /** Read-only card summary for a region-split drawing (FLOOR-4): how many floor regions are
-   *  defined (flagging any still unassigned), with an Edit-regions jump into the split editor and an
-   *  Unsplit that drops back to one whole-page floor. */
-  _regionSummary(b, p) {
-    const regions = b.regions[p.stem];
-    const unassigned = regions.filter(r => r.assign.type === 'unassigned').length;
-    const text = regions.length + (regions.length === 1 ? ' floor region' : ' floor regions')
-      + (unassigned ? ' · ' + unassigned + ' unassigned' : '');
-    return Dom.el('div', { class: 'imp-floors imp-region-summary' }, [
-      Dom.el('span', { class: 'imp-region-count' + (unassigned ? ' warn' : '') }, text),
-      Dom.el('button', { class: 'imp-floor', onclick: () => this._stepSplitRegions(b, p) }, 'Edit regions'),
-      Dom.el('button', { class: 'imp-floor', onclick: () => this._unsplit(b, p) }, 'Unsplit'),
-    ]);
-  }
-
-  /** Drop a drawing's region-split back to a single whole-page floor (FLOOR-4): clear its region
-   *  list so `_resolveFloors` re-emits the scalar token from `assign`. Confirmed first — it discards
-   *  the per-region floor assignments. Re-renders the section in place (preserving scroll). */
-  _unsplit(b, p) {
-    if (b.regions[p.stem].length
-        && !confirm('Remove the region split and treat this drawing as one whole-page floor?'))
-      return;
-    b.regions[p.stem] = [];
-    this._saveDraft();
-    this._rerenderBuildingSection(b);
-  }
-
-  /** Floor selector for one drawing, as a row of buttons. In Location mode (the building's
-   *  bound site has floor Locations) it offers one button per Location — clicking writes the
-   *  Location slug as the assignment token so the build's floor id equals the real
-   *  `Location.slug`. Otherwise it falls back to the floor-type vocabulary
-   *  (none/basement/ground/level N/roof). A drawing left `unassigned` (Location mode, no token
-   *  yet) is flagged so it stands out and gates the build until the user picks a floor. */
-  _floorButtons(b, a, rerender) {
-    const row = Dom.el('div', { class: 'imp-floors' });
-    if (b.nbFloors === 'loading') {
-      row.append(Dom.el('span', { class: 'hint' }, 'Loading floors…'));
-      return row;
-    }
-    if (a.type === 'unassigned')
-      row.append(Dom.el('span', { class: 'imp-floor-warn' }, '⚠ pick a floor'));
-    const btn = (label, active, onClick) =>
-      Dom.el('button', { class: 'imp-floor' + (active ? ' active' : ''), onclick: onClick }, label);
-    // "(none)" excludes a drawing from the floor set in either mode.
-    row.append(btn('(none)', a.type === 'none' && !a.token, () => {
-      a.token = null; a.label = ''; a.type = 'none'; rerender();
-    }));
-    if (Array.isArray(b.nbFloors) && b.nbFloors.length) {
-      for (const loc of b.nbFloors)
-        row.append(btn(loc.name, a.token === loc.slug, () => {
-          a.token = loc.slug; a.label = loc.name; a.type = 'level'; rerender();
-        }));
-      // Location mode only: an escape hatch for a floor the auto-detect heuristic missed —
-      // search the bound site's Locations and pull one in (see `_floorAddControl`).
-      const { toggle, adder } = this._floorAddControl(b, a);
-      row.append(toggle);
-      return Dom.el('div', { class: 'imp-floor-sel' }, [row, adder]);
-    }
-    const set = (type, num) => () => {
-      a.token = null; a.label = ''; a.type = type; a.num = num; rerender();
-    };
-    row.append(btn('Basement', a.type === 'basement', set('basement', 1)));
-    row.append(btn('Ground', a.type === 'ground', set('ground', 1)));
-    for (let i = 1; i <= b.pdfs.length; i++)
-      row.append(btn('Level ' + i, a.type === 'level' && a.num === i, set('level', i)));
-    row.append(btn('Roof', a.type === 'roof', set('roof', 1)));
-    return row;
-  }
-
-  /** The "+ Add floor" affordance for Location mode: a toggle button (placed in the floor row)
-   *  and the collapsible search panel it reveals. Returns both so `_floorButtons` can put the
-   *  button in the row and the panel below it. The panel searches the building's bound site for
-   *  Locations (`netbox.locations`, free-text), excluding ones already offered as a floor button,
-   *  and reuses the `.room-item` autocomplete markup from `_bindRow`. Picking a result routes
-   *  through `_addFloor`. The first time the panel opens it loads the site's full Location list
-   *  (so the user can browse) — lazily, so an unopened panel never fetches. */
-  _floorAddControl(b, a) {
-    const input = Dom.el('input', { placeholder: 'Search NetBox locations…' });
-    const list = Dom.el('div', { class: 'imp-bind-list' });
-    const adder = Dom.el('div', { class: 'imp-floor-adder hidden' }, [input, list]);
-    let seq = 0, loaded = false;
-    const run = async (q) => {
-      const mine = ++seq;
-      let res;
-      try { res = await this.app.netbox.locations(b.slug, q); } catch (_) { return; }
-      if (mine !== seq) return;   // a newer keystroke superseded this fetch
-      const have = new Set(b.nbFloors.map(f => f.slug));
-      // A Location anchor's floors must be children of its building Location, or the 3-segment key
-      // (`site/building/floor`) wouldn't resolve — so restrict the site-wide search to that
-      // building's direct children. A Site anchor searches the whole site, as before.
-      const bId = b.nbBuilding && b.nbBuilding.id;
-      const hits = (res.rooms || []).filter(l => !have.has(l.slug) && (!bId || l.parent === bId));
-      list.innerHTML = '';
-      if (!hits.length) { list.append(Dom.el('div', { class: 'hint' }, 'No other locations found.')); return; }
-      for (const loc of hits) {
-        const item = Dom.el('div', { class: 'room-item' }, [
-          Dom.el('div', { class: 'nm' }, loc.name),
-          Dom.el('div', { class: 'sl' }, loc.slug),
-        ]);
-        item.onclick = async () => { await this._addFloor(b, a, loc); };
-        list.append(item);
-      }
-    };
-    input.addEventListener('input', () => run(input.value));
-    const toggle = Dom.el('button', { class: 'imp-floor imp-floor-add', onclick: () => {
-      const hidden = adder.classList.toggle('hidden');
-      if (hidden) return;
-      input.focus();
-      if (!loaded) { loaded = true; run(''); }   // show the site's locations on first open
-    } }, '+ Add floor');
-    return { toggle, adder };
-  }
-
-  /** Pull a searched Location into the building's floor list and assign this drawing to it.
-   *  Dedupes by slug and re-sorts (natural order, matching `_floorsFromLocations`) so it lands
-   *  beside the auto-detected floors; the writes to `a` mirror clicking a normal Location button.
-   *  Once a drawing references the token it survives a resume — `_loadFloors` rebuilds `nbFloors`
-   *  each load but `_mergeAssignedFloors` re-adds floors referenced by a persisted assignment. */
-  async _addFloor(b, a, loc) {
-    if (!b.nbFloors.some(f => f.slug === loc.slug)) {
-      b.nbFloors.push({
-        id: loc.id, name: loc.name, slug: loc.slug, description: loc.description,
-        parent: loc.parent,
-      });
-      b.nbFloors.sort((x, y) => (x.name || '').localeCompare(y.name || '', undefined, { numeric: true }));
-    }
-    a.token = loc.slug; a.label = loc.name; a.type = 'level';
-    await this._saveDraft();
-    // Adds a floor to the whole building's shared `nbFloors`, so re-render the building section
-    // (every sibling card gains the new button) in place, preserving scroll (IMPORT-2).
-    this._rerenderBuildingSection(b);
-  }
-
-  _autoNumber(b) {
-    b.pdfs.forEach((p, i) => { b.assign[p.stem] = { type: 'level', num: i + 1, token: null, label: '' }; });
-    // Renumbers every drawing in the building, so re-render the section in place (IMPORT-2).
-    this._rerenderBuildingSection(b);
-  }
-
-  /** Bulk-triage cluster for the building header (a `.imp-bulk` sub-row): the affordances that let a
-   *  large multi-page set be dispatched to "(none)" many cards at once instead of one-by-one
-   *  (IMPORT-9). All route through `_bulkNone` (siteplan + region cards skipped there). Returns null
-   *  for a trivial single-drawing building, where per-card triage is already quick. Controls:
-   *   - **Set all to (none)** — nones every card, for a mostly-non-floor set (none all, then pick the
-   *     few real floors); the bulk counterpart to `_autoNumber`.
-   *   - **Unassigned → (none)** — nones only still-`unassigned` cards; shown only when there is at
-   *     least one (Location mode, where untouched cards default to `unassigned`) so it's never a
-   *     no-op button. The finisher for "assign the real floors, then none the rest".
-   *   - **Ignore pages N–M** — nones cards whose page number is in the inclusive range; shown only
-   *     for exploded multi-page sets (cards carrying `p.page`). The range matches the page number on
-   *     every PDF in the building — exact for the common one-multipage-PDF-per-building case. */
-  _bulkTriageControls(b) {
-    if (b.pdfs.length <= 1) return null;
-    const btn = (label, title, onclick) =>
-      Dom.el('button', { class: 'imp-floor', title, onclick }, label);
-    const children = [Dom.el('span', { class: 'imp-bulk-label' }, 'Bulk:')];
-    children.push(btn('Set all to (none)',
-      'Set every drawing in this building to (none) — then pick a floor on just the real plans.',
-      () => this._bulkNone(b, () => true)));
-    // Only meaningful (and only shown) when an eligible card is still unassigned — Location mode's
-    // default. Uses `_bulkEligible` so the button appears iff `_bulkNone` would actually act.
-    if (b.pdfs.some(p => this._bulkEligible(b, p) && b.assign[p.stem].type === 'unassigned'))
-      children.push(btn('Unassigned → (none)',
-        'Set every drawing still without a floor to (none).',
-        () => this._bulkNone(b, p => b.assign[p.stem].type === 'unassigned')));
-    // Page-range ignore, for an exploded multi-page set. Defaults span the building's page numbers.
-    const pages = b.pdfs.map(p => p.page || 0).filter(n => n > 0);
-    if (pages.length) {
-      const maxPage = Math.max(...pages);
-      const num = (val) => Dom.el('input', { type: 'number', class: 'imp-bulk-num',
-        min: '1', max: String(maxPage), value: String(val) });
-      const from = num(1);
-      const to = num(maxPage);
-      const apply = Dom.el('button', { class: 'imp-floor',
-        title: 'Set every page in this range to (none). Matches the page number on each PDF in the '
-          + 'building (one multi-page PDF per building is the usual case).',
-        onclick: () => {
-          let lo = parseInt(from.value, 10);
-          let hi = parseInt(to.value, 10);
-          if (!Number.isInteger(lo) || !Number.isInteger(hi)) { Toast.show('Enter a page range.', true); return; }
-          if (lo > hi) { const t = lo; lo = hi; hi = t; }   // tolerate a reversed range
-          this._bulkNone(b, p => p.page && p.page >= lo && p.page <= hi);
-        } }, 'Ignore');
-      children.push(Dom.el('span', { class: 'imp-bulk-range' },
-        [Dom.el('span', {}, 'Ignore pages'), from, Dom.el('span', {}, '–'), to, apply]));
-    }
-    return Dom.el('div', { class: 'imp-bulk' }, children);
+  /** The buildings as the draft stores them: everything except the **fetched** NetBox state
+   *  (`nbFloors` + its `nbFloorsError` verdict). `_applyDraft` deliberately never reads those back —
+   *  they are re-fetched per session by `_loadFloors`, since a Location renamed in NetBox must not be
+   *  resurrected from a stale draft — so persisting them is pure weight, and the draft is rewritten
+   *  on *every* carousel click. A site's whole Location list is now read in one shot, which would
+   *  multiply that weight by the row cap. A shallow per-building copy is enough: nothing else on a
+   *  building is mutated by serializing it. */
+  _draftBuildings() {
+    return this.buildings.map(({ nbFloors, nbFloorsError, ...rest }) => rest);
   }
 
   /** POST the current building model to the server as a draft so it can be restored on next
@@ -2170,9 +1905,10 @@ class ImportFlow {
       if (window.MAP && window.MAP.csrf) headers['X-CSRFToken'] = window.MAP.csrf;
       await fetch(Api.withFacility(apiBase + 'import/save-draft'), {
         method: 'POST', headers,
-        body: JSON.stringify({ buildings: this.buildings, site: this.site,
-          codeRegion: this._codeRegion, codeRegionDone: this._codeRegionDone, bIdx: this._bIdx,
-          siteplanDone: this._siteplanDone, floorLabelField: this._floorLabelField }),
+        body: JSON.stringify({ buildings: this._draftBuildings(), site: this.site,
+          codeRegion: this._codeRegion, bIdx: this._bIdx,
+          siteplanStepDone: this._siteplanStepDone, floorLabelField: this._floorLabelField,
+          campus: this.campus, campusPromptDone: this._campusPromptDone }),
       });
     } catch (e) { console.warn('Draft save failed:', e); }
   }
@@ -2212,8 +1948,11 @@ class ImportFlow {
       }
       if (draft.site?.file) this.site = draft.site;
       if (draft.codeRegion) this._codeRegion = draft.codeRegion;
-      if (draft.codeRegionDone) this._codeRegionDone = true;
-      if (draft.siteplanDone) this._siteplanDone = true;
+      if (ImportFlow._draftStepDone(draft)) this._siteplanStepDone = true;
+      // The campus pick (site-as-campus mode) and its once-per-session prompt guard. Validated like
+      // any other draft field — a corrupt entry falls back to "unchosen", never throws.
+      if (ImportFlow._validCampus(draft.campus)) this.campus = draft.campus;
+      if (draft.campusPromptDone) this._campusPromptDone = true;
       if (ImportFlow.LABEL_FIELDS.some(([f]) => f === draft.floorLabelField))
         this._floorLabelField = draft.floorLabelField;
       // Resume on the building the user last viewed. Clamp to the floor-mapping carousel
@@ -2225,6 +1964,200 @@ class ImportFlow {
         this._bIdx = Math.max(0, Math.min(n, mappable.length - 1));
       }
     } catch (e) { console.warn('Draft load failed:', e); }
+  }
+
+  // ---- floor resolution: NetBox floor Locations -> the import-map floor table ----
+  // One section for the whole theme: loading a building's floor Locations (and keeping stale
+  // tokens out), restoring bindings from the built manifest, and resolving the per-drawing
+  // assignment controls into the floor tokens `_buildMap` emits.
+
+
+  /** Lazily fetch a building's NetBox floor Locations so the per-card floor selector can offer
+   *  them as buttons. Cached on `b.nbFloors`; on completion the map step re-renders if this
+   *  building is still the visible one. A blank slug or empty result leaves `b.nbFloors = []`,
+   *  which drives the floor-type fallback.
+   *
+   *  The re-render is the **in-place section swap**, not a full `_stepMap()` (IMPORT-2): floors land
+   *  asynchronously, so re-rendering the whole stage yanked the page back to the top under an
+   *  operator who had already scrolled into the grid. The floor arrival only changes this building's
+   *  header + cards, which is exactly what `_rerenderBuildingSection` replaces (re-running
+   *  `_applyThumbSize` and `_refreshBuildActions` with it). `_stepMap` assigns
+   *  `_buildingSectionEl` synchronously, before this promise can settle, so the section is always
+   *  captured by the time we get here — and `_rerenderBuildingSection` falls back to a full render
+   *  if it somehow isn't. */
+  _ensureFloors(b) {
+    if (b.nbFloors !== undefined) return;
+    this._loadFloors(b).then(() => {
+      if (this._mapView && this._mappableBuildings()[this._bIdx] === b)
+        this._rerenderBuildingSection(b);
+    });
+  }
+
+  /** Fetch and cache a building's NetBox floor Locations (idempotent). Resolves once
+   *  `b.nbFloors` is settled to an array — empty when unbound or the site has none (driving the
+   *  floor-type fallback). Driven by the lazy per-building load (`_ensureFloors`) when the map
+   *  step shows the building.
+   *
+   *  **Why the list is what it is is recorded alongside it, in `b.nbFloorsError`** (null = a clean,
+   *  complete read): `'fetch'` the request threw, `'site-missing'` no NetBox Site answers to
+   *  `b.slug`, `'truncated'` the server's row cap clipped the list **where the floors live**. All
+   *  three used to land as a bare empty/partial array, indistinguishable from "this site genuinely
+   *  has no floor Locations" — so a broken binding or a network blip quietly demoted the building to
+   *  the floor-**type** vocabulary and built floor ids that match nothing in NetBox.
+   *  `ImportCards._floorButtons` names the real cause instead.
+   *
+   *  The whole site Location list is read in ONE shot (`full`), not per keystroke: rooms are
+   *  Locations too, so the per-keystroke cap is exceeded by an ordinary site long before a campus
+   *  (IMPORT-29). Those rooms are also why `'truncated'` is not simply `res.truncated`: the answer
+   *  comes back shallowest-first, so a cap clips rooms long before floors, and only
+   *  `_clippedTheFloors` can say whether this building's floors were actually affected
+   *  (IMPORT-49). */
+  async _loadFloors(b) {
+    if (Array.isArray(b.nbFloors)) return;   // already loaded
+    const slug = (b.slug || '').trim();
+    if (!slug) { b.nbFloors = []; b.nbFloorsError = null; return; }
+    b.nbFloors = 'loading';
+    b.nbFloorsError = null;
+    // For a Site anchor the building Location is named after the bound NetBox site, so match on that
+    // (not the user-editable `b.name`); fall back to `b.name` when unbound. For a Location anchor the
+    // building Location is known by slug (`nbBuilding`), so its children are the floors directly.
+    const siteName = (b.nbSite && b.nbSite.name) || b.name;
+    const buildingSlug = b.nbBuilding && b.nbBuilding.slug;
+    let floors = [], complete = false, error = null;
+    try {
+      const res = await this.app.netbox.locations(slug, '', true);
+      const locs = res.rooms || [];
+      this._siteLocs.set(slug, locs);   // tree cache for the anchor controls (see the constructor)
+      floors = this._mergeAssignedFloors(b, this._floorsFromLocations(locs, siteName, buildingSlug),
+                                         locs, buildingSlug);
+      // A slug naming no Site is a broken binding, not an empty site — say which.
+      if (res.site_not_found) error = 'site-missing';
+      else if (res.truncated && ImportFlow._clippedTheFloors(res, locs, buildingSlug))
+        error = 'truncated';
+      complete = !error;
+    } catch (_) { floors = []; error = 'fetch'; }
+    b.nbFloors = floors;
+    b.nbFloorsError = error;
+    // **Only sweep against a list we know is complete.** A failed request yields an empty list and a
+    // floor-clipping read a partial one; sweeping on either discards assignments whose Location is
+    // merely absent from *this answer*, not from NetBox — a transient blip silently resetting a page
+    // of confirmed floor picks (IMPORT-29). What "complete" means is the whole point of
+    // `_clippedTheFloors`: before IMPORT-49 any clipped tail of *rooms* counted, so on a real
+    // facility the sweep never ran at all and a genuinely stale token survived every reload.
+    if (complete && buildingSlug) this._dropUnanchoredTokens(b, floors);
+    if (floors.length) this._normalizeToLocations(b);
+    // Order matters: the two passes above are what *blank* an assignment (entering Location mode, or
+    // an anchor change stranding a token), and this fills those blanks back in from each drawing's
+    // filename (IMPORT-28). Running it last means a re-anchor re-suggests against the new anchor's
+    // Locations rather than leaving a page of "⚠ pick a floor", and — because it only ever writes to
+    // a blank — an assignment the operator made still wins.
+    this.bulk.suggestFloors(b);
+  }
+
+  /** Location anchor only: reset any assignment whose Location token isn't one of the anchor's
+   *  floors, so the wizard can never emit a `floor_key` that won't resolve.
+   *
+   *  A 3-segment key is `"<site>/<anchor>/<floor>"` and the backend resolves the floor **under the
+   *  anchor** (`parent__slug`, `frontend_api.resolve_floor_location`), so a token that isn't a child
+   *  of the current anchor is dead on arrival. Tokens can go stale two ways: re-binding the folder to
+   *  a different building Location, and `_reanchorBuilding` drilling the anchor down to a wing. Both
+   *  land here via the `nbFloors = undefined` re-fetch. Downgrading to `unassigned` (never to a
+   *  silently-wrong floor) routes the drawing into the existing build gate, so the user re-picks
+   *  rather than discovering a dead floor after the build. A deliberate `— none —` is left alone.
+   *  Region-split boxes (FLOOR-4) carry the same `assign` shape and the same key, so they are swept
+   *  alongside the scalar assignment. */
+  _dropUnanchoredTokens(b, floors) {
+    const valid = new Set(floors.map(f => f.slug));
+    const drop = (a) => {
+      if (!a || !a.token || valid.has(a.token)) return;
+      a.token = null; a.label = ''; a.type = 'unassigned';
+    };
+    for (const p of b.pdfs) {
+      drop(b.assign[p.stem]);
+      for (const r of (b.regions[p.stem] || [])) drop(r.assign);
+    }
+  }
+
+  /** Re-include any Location a drawing is already assigned to (`assign[*].token`) that the floor
+   *  heuristic didn't surface — i.e. a floor the user added via `_addFloor`'s Location search in a
+   *  prior session. Assignments persist in the draft but `nbFloors` is rebuilt each load, so
+   *  without this an added floor would lose its button (and its sibling drawings couldn't pick it).
+   *  Looks the token up in the full site Location list so the button reappears with its real
+   *  name/slug; a token whose Location no longer exists is left out (the user redoes it). Keeps the
+   *  natural sort order.
+   *
+   *  **Scoped to the anchor's children for a Location anchor** (`buildingSlug` given): a 3-segment
+   *  key resolves the floor *under* the anchor, so re-adding a Location from anywhere else in the
+   *  site would restore a button whose key can never resolve. `_dropUnanchoredTokens` then clears
+   *  the assignment that pointed at it. A Site anchor is unscoped, as before — its whole-site search
+   *  is the deliberate escape hatch for a floor parked outside the building root. */
+  _mergeAssignedFloors(b, floors, locs, buildingSlug) {
+    const have = new Set(floors.map(f => f.slug));
+    const anchorId = buildingSlug
+      ? (locs.find(l => l.slug === buildingSlug) || {}).id : null;
+    const bySlug = new Map(locs.map(l => [l.slug, l]));
+    for (const p of b.pdfs) {
+      const tok = b.assign[p.stem] && b.assign[p.stem].token;
+      if (!tok || have.has(tok)) continue;
+      const loc = bySlug.get(tok);
+      if (!loc) continue;
+      if (buildingSlug && loc.parent !== anchorId) continue;
+      have.add(tok); floors.push(loc);
+    }
+    return floors.sort((x, y) => (x.name || '').localeCompare(y.name || '', undefined, { numeric: true }));
+  }
+
+  /** Pick the floor Locations out of a site's flat Location list using the parent tree.
+   *
+   *  **Location anchor (Site = campus, `buildingSlug` given — MODEL-4):** the building Location is
+   *  known exactly, so the floors are strictly its **children** (`l.parent === building.id`) — no
+   *  root/sibling guessing, and two buildings under one campus stay separated. An unknown slug (the
+   *  Location vanished) yields no floors, driving the floor-type fallback.
+   *
+   *  **Site anchor (no `buildingSlug`):** the building Location is the root named after the bound
+   *  site (e.g. "MAIN BUILDING"); its children are floors. Any OTHER root is itself a floor — some
+   *  sites park a floor like "Roof" or "Level B2" at the top level, as a sibling of the building.
+   *  When no root matches the site name the site has no building wrapper and the roots themselves are
+   *  the floors (e.g. ANNEX). Identifying the building by name — not by tree shape — works even when
+   *  the floors have no rooms under them yet.
+   *
+   *  **Children, never descendants — the anchor is the floors' *direct parent* (MULTI-5).** A
+   *  3-segment key writes the anchor's slug in the middle and the backend resolves the floor with
+   *  `parent__slug=<anchor>`, so offering a grandchild here would emit a key that can never resolve.
+   *  A deeper tree (campus → building → wing → floor) is therefore handled by anchoring the folder
+   *  on the **wing** — which yields the ordinary, already-working `site/wing/floor` key — not by
+   *  widening this scan. `_anchorDrillControl` is the affordance that lets the operator drill the
+   *  anchor down to it; see architecture §7.
+   *
+   *  Either way `depth`/`level` is avoided (MPTT-only, unreliable on NetBox 4.2+). Floors are sorted
+   *  by name for a stable, natural order (B1, B2, G, …, Roof). */
+  _floorsFromLocations(locs, siteName, buildingSlug) {
+    const sortByName = (arr) =>
+      arr.sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { numeric: true }));
+    if (buildingSlug) {
+      const building = locs.find(l => l.slug === buildingSlug);
+      return sortByName(building ? locs.filter(l => l.parent === building.id) : []);
+    }
+    const ids = new Set(locs.map(l => l.id));
+    const roots = locs.filter(l => l.parent == null || !ids.has(l.parent));
+    const nameLc = (siteName || '').trim().toLowerCase();
+    const building = nameLc
+      ? roots.find(r => (r.name || '').trim().toLowerCase() === nameLc) : null;
+    const floors = roots.filter(r => r !== building);
+    if (building) for (const l of locs) if (l.parent === building.id) floors.push(l);
+    return sortByName(floors);
+  }
+
+  /** Entering Location mode: a drawing with no Location token yet is marked `unassigned` so it
+   *  contributes no floor and gates the build until the user picks a Location button — the auto
+   *  Level 1..N defaults only apply to the floor-type fallback. `unassigned` is distinct from a
+   *  deliberate `— none —` (`type:'none'`), which is a real choice and passes the build gate
+   *  (see `_unassignedBuildings`). */
+  _normalizeToLocations(b) {
+    for (const p of b.pdfs) {
+      const a = b.assign[p.stem];
+      if (!a.token && a.type !== 'none') a.type = 'unassigned';   // keep a deliberate — none — (e.g. the site plan)
+    }
   }
 
   /** Fill each still-unbound building's NetBox binding from the last-built manifest. The edit
@@ -2254,6 +2187,18 @@ class ImportFlow {
           { id: null, slug: m.buildingSlug, name: m.name || b.name }, false);
       else
         this._bindSite(b, { id: null, slug: m.siteSlug, name: m.name || b.name }, false);
+    }
+    // Seed the campus (site-as-campus mode) from the built manifest so a re-opened facility shows
+    // its campus rather than re-prompting: the first Location-anchored building's `siteSlug` is the
+    // campus (every building under one campus shares it). Only fills an unset campus, so a draft's
+    // in-progress pick still wins; no site *name* is stored, so the slug stands in (cosmetic — the
+    // scoping keys off the slug). Also marks the prompt done, since a built facility already chose.
+    if (this._isCampusMode() && !this.campus) {
+      const anchored = manifest.buildings.find(m => m.siteSlug && m.buildingSlug);
+      if (anchored) {
+        this.campus = { id: null, slug: anchored.siteSlug, name: anchored.siteSlug };
+        this._campusPromptDone = true;
+      }
     }
   }
 
@@ -2296,15 +2241,30 @@ class ImportFlow {
     return floors;
   }
 
-  /** Names of buildings that still hold an `unassigned` drawing (Location mode, untouched —
-   *  see `_normalizeToLocations`). The build gate lists these so the user knows where to look.
-   *  A cheap synchronous pass over the in-memory model — `_stepMap` recomputes it every render.
-   *  Buildings the user hasn't visited keep their `_modelFromInventory` level defaults (never
-   *  `unassigned`), so they don't gate the build; only visited Location-mode buildings can. */
+  /** Buildings that still hold an `unassigned` drawing (Location mode, untouched — see
+   *  `_normalizeToLocations`). The build gate lists these so the user knows where to look, and
+   *  (IMPORT-40) links each one straight back into the carousel — returning the building objects
+   *  rather than names keeps that jump a plain `_jumpToBuilding(b)` at the call site. A cheap
+   *  synchronous pass over the in-memory model — `_stepMap` recomputes it every render. Buildings
+   *  the user hasn't visited keep their `_modelFromInventory` level defaults (never `unassigned`),
+   *  so they don't gate the build; only visited Location-mode buildings can. */
   _unassignedBuildings() {
-    return this.buildings
-      .filter(b => b.pdfs.some(p => this._cardUnassigned(b, p)))
-      .map(b => b.name || b.folder);
+    return this.buildings.filter(b => this._unassignedCount(b) > 0);
+  }
+
+  /** How many of building `b`'s drawings still need a floor (Location mode `unassigned`, or a
+   *  region-split drawing with an unassigned region) — the count `_buildingNavLabel` and
+   *  `_unassignedBuildings` both key off (IMPORT-40). */
+  _unassignedCount(b) {
+    return b.pdfs.filter(p => this._cardUnassigned(b, p)).length;
+  }
+
+  /** Names of floor-contributing buildings with no NetBox anchor — the build row warns about these
+   *  (IMPORT-29). Keyed off `_floorBuildings()`, so a folder that resolves no floor at all (a
+   *  siteplan-only folder) is correctly silent: it needs no anchor because it emits nothing to bind.
+   *  Advisory only — unlike `_unassignedBuildings` this never disables Build; see `_buildActions`. */
+  _unboundBuildings() {
+    return this._floorBuildings().filter(b => !b.nbSite).map(b => b.name || b.folder);
   }
 
   /** Whether one drawing still needs a floor (gates the build). A region-split drawing (FLOOR-4)
@@ -2316,314 +2276,79 @@ class ImportFlow {
     return b.assign[p.stem].type === 'unassigned';
   }
 
-  /** The manifest `dir` a built building writes — the prefix its floor keys hang off. A Site anchor
-   *  is the bare site slug (`<siteSlug>`, a 2-segment key); a Location anchor nests one level
-   *  (`<siteSlug>/<buildingSlug>`, a 3-segment key), matching `preprocess.build_building_from_pdfs`'s
-   *  `rel_dir` and the manifest's `dir`. Every floor-key comparison against the live manifest
-   *  (`_orphanedFloors`/`_desyncedFloors`/`_resplitReprojections`) keys off this, so a rebuilt
-   *  Location-anchored floor matches its manifest entry instead of being falsely orphaned. */
-  static _dirOf(mb) {
-    return mb.buildingSlug ? mb.slug + '/' + mb.buildingSlug : mb.slug;
-  }
-
-  /** Floors that currently hold rooms but whose id won't exist after this build — i.e. the
-   *  rebuild would orphan their rooms. Compares the keys the build will produce
-   *  (`<dir>/(abbr+token)`, mirroring `preprocess.build` — `dir` per `_dirOf`) against the live
-   *  manifest's floors and their room counts. Returns `[{ key, label, count }]`; empty when nothing
-   *  is at risk (e.g. a pure PDF replacement, where the id is unchanged). */
-  async _orphanedFloors(map) {
-    const store = this.app.store;
-    if (!store || !store.manifest) return [];
-    const newKeys = new Set();
-    for (const folder in map.buildings) {
-      const mb = map.buildings[folder];
-      // A region-split floor value is a `[{token, region}]` list (FLOOR-4), not a scalar token —
-      // expand it so each region floor's real key is compared, not a stringified array (which would
-      // falsely orphan every real floor when rebuilding a region-split facility). A whole→region
-      // split that would strand rooms is caught earlier by `_resplitReprojections` (FLOOR-5) and
-      // reprojected, not discarded; `_build` excludes those keys before warning here.
-      const dir = ImportFlow._dirOf(mb);
-      for (const stem in mb.floors) {
-        const v = mb.floors[stem];
-        const toks = Array.isArray(v) ? v.map(e => e.token) : [v];
-        for (const t of toks) newKeys.add(dir + '/' + (mb.abbr + t));
-      }
-    }
-    // Fetch annotations fresh so the room counts reflect the current DB, not a stale cache.
-    let anns = store.annotations || {};
-    try { anns = await Api.get('/api/annotations'); } catch (_) { /* fall back to the cache */ }
-    const out = [];
-    for (const b of store.manifest.buildings) {
-      for (const f of b.floors) {
-        const key = b.dir + '/' + f.id;
-        const n = (anns[key] && anns[key].rooms && anns[key].rooms.length) || 0;
-        if (n && !newKeys.has(key)) out.push({ key, label: b.name + ' / ' + f.label, count: n });
-      }
-    }
-    return out;
-  }
-
-  /** Built floors (and the siteplan) whose id survives this rebuild but whose drawing changes shape
-   *  (or is replaced in place), so the rooms/hotspots already drawn on them would be misaligned. A
-   *  floor is flagged when either its sorted set of sheet angles differs from the live manifest's
-   *  (`pages[].angle`, default 0) OR its drawing's bytes were replaced this session (REPL-1) — a
-   *  Replace keeps the id/pixel-size/aspect but a margin or crop shift, undetectable from manifest
-   *  metadata, still desyncs its rooms, so a replaced-with-rooms floor warns unconditionally. For
-   *  the siteplan, aspect ratio is additionally compared (via `_siteplanAspectChanged`) — the
-   *  overlay stretches hotspots `preserveAspectRatio:'none'`, so a new drawing of a different aspect
-   *  skews them even with no rotation — and a replaced siteplan drawing flags the same way. Floors
-   *  whose id vanishes are left to `_orphanedFloors`. Returns `[{ key, label, count, unit,
-   *  hotspots? }]`; empty when nothing at risk (a plain rebuild or an untouched, same-shape floor).
-   *  Async to fetch fresh room counts (mirroring `_orphanedFloors`) and to measure the new
-   *  siteplan's rendered aspect. */
-  async _desyncedFloors(map) {
-    const store = this.app.store;
-    if (!store || !store.manifest) return [];
-    // Angles the build will render, per surviving floor key (`<dir>/(abbr+token)`, `dir` per
-    // `_dirOf`). Compared as
-    // a sorted signature so a single-sheet floor matches exactly and a multi-sheet floor matches
-    // order-independently. `replacedKeys` collects the surviving keys whose drawing was replaced
-    // this session (REPL-1), an unconditional desync trigger alongside the angle diff.
-    const newAngles = new Map();
-    const replacedKeys = new Set();
-    for (const folder in map.buildings) {
-      const mb = map.buildings[folder];
-      const am = mb.angles || {};
-      const dir = ImportFlow._dirOf(mb);
-      for (const stem in mb.floors) {
-        const v = mb.floors[stem];
-        const toks = Array.isArray(v) ? v.map(e => e.token) : [v];
-        const wasReplaced = this._replaced.has(folder + '/' + stem);
-        // A page's straightening angle is page-keyed and shared across every region floor split
-        // from it (FLOOR-4), so each expanded key takes the same `am[stem]`; likewise a replaced
-        // page desyncs every region floor split from it.
-        for (const t of toks) {
-          const key = dir + '/' + (mb.abbr + t);
-          if (!newAngles.has(key)) newAngles.set(key, []);
-          newAngles.get(key).push(am[stem] || 0);
-          if (wasReplaced) replacedKeys.add(key);
-        }
-      }
-    }
-    const sig = (arr) => JSON.stringify(arr.slice().sort((x, y) => x - y));
-    let anns = store.annotations || {};
-    try { anns = await Api.get('/api/annotations'); } catch (_) { /* fall back to the cache */ }
-    const out = [];
-    for (const b of store.manifest.buildings) {
-      for (const f of b.floors) {
-        const key = b.dir + '/' + f.id;
-        const n = (anns[key] && anns[key].rooms && anns[key].rooms.length) || 0;
-        const next = newAngles.get(key);
-        if (!n || !next) continue;   // no rooms, or id vanishing (→ `_orphanedFloors`)
-        const cur = (f.pages || []).map(pg => pg.angle || 0);
-        if (sig(cur) !== sig(next) || replacedKeys.has(key))
-          out.push({ key, label: b.name + ' / ' + f.label, count: n, unit: 'room' });
-      }
-    }
-    // The siteplan keeps a fixed id but its hotspots are drawn against its orientation *and* its
-    // aspect ratio (the overlay stretches them `preserveAspectRatio:'none'`, SiteplanEditor). Count
-    // from the DB blob (`store.siteHotspots`) — the manifest's `siteplan.hotspots` is a permanent
-    // `[]` placeholder (preprocess.build_siteplan_from_pdf), so it never reflects real hotspots.
-    const sp = store.manifest.siteplan;
-    const hs = (store.siteHotspots || []).length;
-    if (hs && map.siteplan) {
-      const angleChanged = (sp.angle || 0) !== (map.siteplan.angle || 0);
-      const aspectChanged = await this._siteplanAspectChanged(map.siteplan, sp);
-      // The site drawing lives in a building folder; resolve its stem the way `_build` does to see
-      // whether its bytes were replaced this session (REPL-1) — a same-aspect margin shift wouldn't
-      // trip the angle/aspect checks yet still skews the hotspots.
-      const sb = this.buildings.find(x => x.folder === map.siteplan.folder);
-      const spd = sb && sb.pdfs.find(p => p.file === map.siteplan.pdf);
-      const replaced = !!(spd && this._replaced.has(map.siteplan.folder + '/' + spd.stem));
-      if (angleChanged || aspectChanged || replaced)
-        out.push({ key: 'siteplan', label: 'Siteplan', count: hs, unit: 'hotspot', hotspots: true });
-    }
-    return out;
-  }
-
-  /** True when the newly-chosen siteplan drawing `next` (`{folder, pdf, angle?}` from the build
-   *  map) will render to a different aspect ratio than the live siteplan image `live`
-   *  (`manifest.siteplan`, with `w`/`h`). Because the overlay stretches hotspots
-   *  `preserveAspectRatio:'none'`, a same-aspect swap (any pixel size) keeps them aligned but a
-   *  different-aspect swap silently skews them — this drives the desync warning. The build's dims
-   *  aren't known until it runs, so measure them pre-build off the drawing's **full-scale preview**
-   *  render (`preprocess.preview` → `render_full`, same pipeline/angle as the build, so the same
-   *  aspect). Degrades to `false` — no false alarm — when the live dims are missing or the preview
-   *  can't be loaded. */
-  async _siteplanAspectChanged(next, live) {
-    if (!live || !live.w || !live.h) return false;
-    const rel = 'uploads/' + next.folder + '/' + next.pdf;
-    const dims = await new Promise((resolve) => {
-      const img = new Image();
-      img.onload = () => resolve(img.naturalWidth && img.naturalHeight
-        ? { w: img.naturalWidth, h: img.naturalHeight } : null);
-      img.onerror = () => resolve(null);
-      img.src = ImportPreview.previewUrl(rel, 1, next.angle || 0);
-    });
-    if (!dims) return false;
-    return Math.abs((dims.w / dims.h) / (live.w / live.h) - 1) > 0.01;   // >1% drift = visible skew
-  }
-
-  // ---- region-split room reprojection (FLOOR-5) ----
-
-  /** The centroid (mean vertex) of a normalized polygon / point list, or the origin when empty. */
-  _centroid(pts) {
-    if (!pts || !pts.length) return [0, 0];
-    let sx = 0, sy = 0;
-    for (const [x, y] of pts) { sx += x; sy += y; }
-    return [sx / pts.length, sy / pts.length];
-  }
-
-  /** The first region whose `[x, y, w, h]` box contains `pt` (assign-by-centroid), or null. */
-  _regionFor(pt, regions) {
-    const [px, py] = pt;
-    return regions.find(r => {
-      const [x, y, w, h] = r.box;
-      return px >= x && px < x + w && py >= y && py < y + h;
-    }) || null;
-  }
-
-  /** Remap a whole-page 0..1 point into a region's local 0..1 space: `(p - box) / box`, rounded
-   *  to 5 dp like `FloorEditor._remapLayout`. Points outside the box get out-of-range coords that
-   *  simply clip visually — the same tolerance the editor already has for stray coords. */
-  _remapPt(pt, box) {
-    const [px, py] = pt, [x, y, w, h] = box;
-    return [+((px - x) / w).toFixed(5), +((py - y) / h).toFixed(5)];
-  }
-
-  /** Reproject plan for floors a whole→region split (FLOOR-5) would strand. When a previously-whole
-   *  floor holding rooms is split into region crops, its rooms/arrows/notes are in whole-page 0..1
-   *  space but each region floor renders a *crop*, so the coordinates — and, when a region takes a
-   *  new token, the floor id — no longer fit. For each such source floor this assigns every shape to
-   *  the region **containing its centroid**, remapping its coordinates into that region's local 0..1
-   *  space, and drops shapes outside every region. Arrows follow their bound room's region (centroid
-   *  fallback); rack/device placements (a separate blob) are deliberately left in place. Returns one
-   *  entry per source with the precomputed destination writes — `_build` warns from the counts and
-   *  `_applyReprojection` writes them after the build (through the authoritative `sync_rooms`).
-   *
-   *  Skipped (→ the plain `_orphanedFloors`/`_desyncedFloors` warnings) when the split also rotates
-   *  the page (the room coords would be in the pre-rotation space) or when the old whole-page key
-   *  can't be resolved / holds nothing — an already-split plan among them, whose old region boxes
-   *  aren't retained, so its rooms can't be remapped. Async only to fetch fresh room geometry,
-   *  mirroring the sibling guards. */
-  async _resplitReprojections(map) {
-    const store = this.app.store;
-    if (!store || !store.manifest) return [];
-    let anns = store.annotations || {};
-    try { anns = await Api.get('/api/annotations'); } catch (_) { /* fall back to the cache */ }
-    const liveFloor = (dir, fid) => {
-      const mb = store.manifest.buildings.find(x => x.dir === dir);
-      return mb && mb.floors.find(f => f.id === fid);
-    };
-    const out = [];
-    for (const b of this.buildings) {
-      const mb = map.buildings[b.folder];
-      if (!mb) continue;
-      const dir = ImportFlow._dirOf(mb);   // 2- or 3-segment key prefix (Location anchor nests, MODEL-4)
-      // Whole-page token per drawing (resolve `b.assign` ignoring regions, chaining `last` for the
-      // `same` case) — the floor id the drawing produced before it was split.
-      const whole = {}; let last = null;
-      for (const p of b.pdfs) {
-        const t = this._assignToken(b.assign[p.stem], last);
-        if (t) { whole[p.stem] = t; last = t; }
-      }
-      for (const p of b.pdfs) {
-        const entry = mb.floors[p.stem];
-        if (!Array.isArray(entry)) continue;   // not region-split
-        const wtok = whole[p.stem];
-        if (!wtok) continue;                   // no derivable whole-page id
-        const oldFid = mb.abbr + wtok, oldKey = dir + '/' + oldFid;
-        const lf = liveFloor(dir, oldFid);
-        const newDeg = (b.angle[p.stem] && b.angle[p.stem].deg) || 0;
-        const curDeg = (lf && lf.pages && lf.pages[0] && lf.pages[0].angle) || 0;
-        if (lf && newDeg !== curDeg) continue; // split + rotate → leave to orphan/desync
-        const rec = anns[oldKey];
-        if (!rec) continue;
-        const rooms = rec.rooms || [], arrows = rec.arrows || [], notes = rec.notes || [];
-        if (!rooms.length && !arrows.length && !notes.length) continue;
-        const regions = entry
-          .filter(e => Array.isArray(e.region) && e.region.length === 4 && e.region[2] > 0 && e.region[3] > 0)
-          .map(e => ({ box: e.region, fid: mb.abbr + e.token, key: dir + '/' + (mb.abbr + e.token) }));
-        if (!regions.length) continue;
-        const dests = new Map();
-        const dest = (r) => {
-          if (!dests.has(r.key)) dests.set(r.key, { dir, fid: r.fid, rooms: [], arrows: [], notes: [] });
-          return dests.get(r.key);
-        };
-        let moved = 0, dropped = 0;
-        const landedIn = new Map();   // room id → region it landed in, so arrows can follow it
-        for (const room of rooms) {
-          const r = this._regionFor(this._centroid(room.polygon), regions);
-          if (!r) { dropped++; continue; }
-          landedIn.set(room.id, r);
-          room.polygon = (room.polygon || []).map(pt => this._remapPt(pt, r.box));
-          dest(r).rooms.push(room); moved++;
-        }
-        for (const a of arrows) {
-          let r = a.room != null ? landedIn.get(a.room) : null;
-          if (!r) r = this._regionFor(this._centroid(a.points), regions);
-          if (!r) { dropped++; continue; }
-          a.points = (a.points || []).map(pt => this._remapPt(pt, r.box));
-          dest(r).arrows.push(a);
-        }
-        for (const nt of notes) {
-          const r = this._regionFor([nt.x, nt.y], regions);
-          if (!r) { dropped++; continue; }
-          [nt.x, nt.y] = this._remapPt([nt.x, nt.y], r.box);
-          if (nt.labelStyle && nt.labelStyle.x != null)
-            [nt.labelStyle.x, nt.labelStyle.y] = this._remapPt([nt.labelStyle.x, nt.labelStyle.y], r.box);
-          dest(r).notes.push(nt);
-        }
-        if (dests.size)
-          out.push({ oldKey, label: (b.name || b.folder) + ' / ' + (lf ? lf.label : oldFid),
-            moved, dropped, dests });
-      }
-    }
-    return out;
-  }
-
-  /** Write a `_resplitReprojections` plan into the freshly-loaded store: clear the source floor's
-   *  migrated shapes (it may itself be a destination when a region reuses the whole-page token) and
-   *  push each remapped shape onto its region floor's record (created from the new manifest via
-   *  `store.floorData`). The caller's one `saveAnnotations` routes the moves/deletes through the
-   *  authoritative, permission-scoped `sync_rooms`. */
-  _applyReprojection(r) {
-    const store = this.app.store;
-    const src = store.annotations[r.oldKey];
-    if (src) { src.rooms = []; src.arrows = []; src.notes = []; }
-    for (const d of r.dests.values()) {
-      const rec = store.floorData(d.dir, d.fid);
-      if (d.rooms.length) rec.rooms.push(...d.rooms);
-      if (d.arrows.length) { rec.arrows = rec.arrows || []; rec.arrows.push(...d.arrows); }
-      if (d.notes.length) { rec.notes = rec.notes || []; rec.notes.push(...d.notes); }
-    }
-  }
-
   // ---- step 3: build ----
+
+  /** Render the facility from the current model (step 3), in three stages: assemble the
+   *  import-map (`_buildMap`), get the user's consent for whatever the rebuild does to rooms they
+   *  have already drawn (`_confirmBuild`), then POST it and settle up (`_afterBuild`). Split that
+   *  way because the three have genuinely different jobs — a pure model->JSON transform, one review
+   *  dialog over `ImportDiff`'s findings, and the post-success bookkeeping — and the middle one is
+   *  the only part that can send the user back to the map step. */
   async _build() {
+    // Stop the background floor-code sweep first (IMPORT-53). It reads the rendered previews of
+    // the same uploads a rebuild re-renders, and it applies its results to a model the build has
+    // already snapshotted — so letting it run into a build buys nothing and races the working dir.
+    // OCR itself stays lock-free (§10 in-app-import); this is the client end of that bargain.
+    // Not suppressed: a build the operator backs out of, or one that fails, leaves them on the map
+    // step, where the facility should carry on being read.
+    this.ocr.cancel({ suppress: false });
+    const map = await this._buildMap();
+    if (!map) return;              // a boundary rejection (anchor collision, blank slug, no floors)
+    const plan = await this._confirmBuild(map);
+    if (!plan) return this._stepMap();   // the user declined one of the room-safety warnings
+
+    const view = this._stage('Building facility map…');
+    view.append(Dom.el('div', { class: 'imp-spinner' },
+      'Rendering ' + Object.keys(map.buildings).length + ' buildings. This can take a minute.'));
+    try {
+      const r = await Api.post('/api/import/build', map);
+      // Carry the server's actionable hint (e.g. an HQ render that outran render_mem_mb, HEALTH-3)
+      // onto the Error so the catch can add it to the otherwise-reassuring failure toast.
+      if (!r.ok) { const err = new Error(r.error || 'build failed'); err.hint = r.hint; throw err; }
+      await this._afterBuild(r, plan);
+    } catch (e) {
+      // A failed build never deletes anything: `build()` overwrites the manifest only on success
+      // (and atomically), and we never reached `store.load()`, so the store still holds the
+      // last-good map. Reassure the user rather than toasting a raw render traceback that reads as
+      // "everything was wiped", and keep them on the review step to fix a drawing and retry.
+      console.error('Facility rebuild failed', e);
+      // Keep the reassuring "nothing was lost" lead, then append the server's actionable hint when
+      // it named one (an HQ render that outgrew its memory/time budget, HEALTH-3) so the fix is in
+      // front of the user instead of buried in the console.
+      let msg = 'Rebuild failed. Your existing map is unchanged and still active. Nothing was lost.';
+      if (e && e.hint) msg += ' ' + e.hint;
+      Toast.show(msg, true);
+      this._stepMap();
+    }
+  }
+
+  /** Assemble the import-map `/api/import/build` consumes from the current building model — the
+   *  pure model->JSON half of the build. Returns null (after toasting) for the three boundary
+   *  rejections that must never reach a render: two buildings resolving to the same NetBox anchor,
+   *  a building with a blank site slug, and a model that contributes no floor at all. */
+  async _buildMap() {
     const map = { siteplan: this.site.file
       ? { folder: this.site.folder, pdf: this.site.file, slug: '00-site' } : null, buildings: {} };
     // Two floor-contributing buildings that resolve to the SAME **anchor** would produce colliding
     // floor keys (`<dir>/(abbr+token)`, see `preprocess.build`) and silently clobber each other's
-    // floors (and rooms). The anchor is the site slug for a Site anchor, or `siteSlug/buildingSlug`
-    // for a Location anchor (MODEL-4) — so two buildings may share a site slug iff they anchor to
-    // *distinct* building Locations (the Site = campus case). Reject at the boundary before any
-    // render — the per-building empty-slug guard below still catches a blank slug.
+    // floors (and rooms). The anchor identity is `ImportFlow.anchorKey` — so two buildings may share
+    // a site slug iff they anchor to *distinct* building Locations (the Site = campus case). Reject
+    // at the boundary before any render — the per-building empty-slug guard below still catches a
+    // blank slug (`anchorKey` returns '' for one, which is skipped here).
     const byAnchor = {};
     for (const b of this._floorBuildings()) {
-      const s = b.slug.trim();
-      if (!s) continue;
-      const anchor = b.nbBuilding ? s + '/' + b.nbBuilding.slug : s;
+      const anchor = ImportFlow.anchorKey(b);
+      if (!anchor) continue;
       (byAnchor[anchor] = byAnchor[anchor] || []).push(b.name || b.folder);
     }
     const collision = Object.entries(byAnchor).find(([, names]) => names.length > 1);
     if (collision) {
       Toast.show('Two buildings resolve to the same NetBox anchor “' + collision[0] + '” ('
         + collision[1].join(', ') + '). Bind each to its own site or building.', true);
-      return;
+      return null;
     }
     for (const b of this.buildings) {
-      if (!b.slug.trim()) { Toast.show('Every building needs a site slug (' + b.folder + ')', true); return; }
+      if (!b.slug.trim()) { Toast.show('Every building needs a site slug (' + b.folder + ')', true); return null; }
       const floors = this._resolveFloors(b);
       if (!Object.keys(floors).length) continue;   // a siteplan-only folder, etc.
       // Floor tokens that are real Location slugs must not be re-prefixed: `preprocess.py`
@@ -2658,14 +2383,31 @@ class ImportFlow {
       // Key labels off the *resolved* `floors` table (not the raw assignments) so a region floor's
       // `<stem>@rN` index matches the list entry `_page_entries` emits (FLOOR-4). A non-Location
       // token resolves no label — the backend falls back to `floor_label(token)`, as before.
+      // Alongside `labels`, `locationTokens` marks the same keys `true` whenever the origin is a
+      // direct Location slug (`assign.token`) — independent of whether a friendly label text
+      // resolved (INTL-2). `preprocess.py`'s `floor_label` uses it to skip the compact floor-code
+      // grammar for a Location slug that happens to collide with it (e.g. a Spanish "Bloque 1"
+      // slugged `b1`, with no label text chosen, must not become "Basement 1"). Only the *anchor*
+      // sheet of a `same`-chained multi-sheet floor has `assign.token` set, but that's enough —
+      // `preprocess.py` tracks the marker per floor id, scanning every contributing sheet.
       const labels = {};
+      const locationTokens = {};
       for (const p of b.pdfs) {
         const f = floors[p.stem];
         if (Array.isArray(f)) {
-          f.forEach((e, i) => { const l = labelFor(e.token); if (l) labels[p.stem + '@r' + (i + 1)] = l; });
+          const regions = b.regions[p.stem] || [];
+          f.forEach((e, i) => {
+            const r = regions[i];
+            if (!r || !r.assign.token) return;
+            locationTokens[p.stem + '@r' + (i + 1)] = true;
+            const l = labelFor(e.token); if (l) labels[p.stem + '@r' + (i + 1)] = l;
+          });
         } else if (f) {
           const a = b.assign[p.stem];
-          if (a.token) { const l = labelFor(a.token); if (l) labels[p.stem] = l; }
+          if (a.token) {
+            locationTokens[p.stem] = true;
+            const l = labelFor(a.token); if (l) labels[p.stem] = l;
+          }
         }
       }
       // Overlay control points (FMT-6), keyed by stem like `angles`: only a mapped OVERLAY
@@ -2685,9 +2427,10 @@ class ImportFlow {
         ...(b.nbBuilding ? { buildingSlug: b.nbBuilding.slug } : {}),
         ...(Object.keys(angles).length ? { angles } : {}),
         ...(Object.keys(labels).length ? { labels } : {}),
+        ...(Object.keys(locationTokens).length ? { locationTokens } : {}),
         ...(Object.keys(overlayAlign).length ? { overlayAlign } : {}) };
     }
-    if (!Object.keys(map.buildings).length) { Toast.show('Assign at least one floor', true); return; }
+    if (!Object.keys(map.buildings).length) { Toast.show('Assign at least one floor', true); return null; }
     // Carry the site drawing's own straightening angle into the siteplan block.
     if (map.siteplan) {
       const sb = this.buildings.find(x => x.folder === this.site.folder);
@@ -2695,65 +2438,58 @@ class ImportFlow {
       const sdeg = sp && sb.angle[sp.stem] && sb.angle[sp.stem].deg;
       if (sdeg) map.siteplan.angle = sdeg;
     }
+    return map;
+  }
 
+  /** Ask the user about everything this rebuild would do to rooms and hotspots they have already
+   *  drawn, from `ImportDiff`'s three reads. Returns the plan `_afterBuild` needs
+   *  (`{orphaned, reprojections, refit}`), or null when the user backed out — the caller then
+   *  returns them to the map step, having written nothing.
+   *
+   *  The three reads run in a deliberate order: reprojections are computed first so the orphan list
+   *  can exclude the floors whose rooms are being *moved* rather than discarded. Presenting them is
+   *  `ImportBuildReview`'s job (IMPORT-39) — one dialog showing every finding at once, rather than
+   *  the chain of up to four native `confirm()`s this used to fire at the flow's most consequential
+   *  action. A rebuild with nothing at risk still asks nothing at all. */
+  async _confirmBuild(map) {
     // A whole→region split (FLOOR-5) changes a floor's id *and* coordinate space. Rather than orphan
-    // its rooms, remap each into the region it sits in; compute that plan first so the orphan warning
+    // its rooms, remap each into the region it sits in; compute that plan first so the orphan list
     // below can exclude these sources — their rooms are moved, not discarded.
-    const reprojections = await this._resplitReprojections(map);
+    const reprojections = await this.diff.resplitReprojections(map);
     const reprojectedKeys = new Set(reprojections.map(r => r.oldKey));
 
     // Re-assigning a drawing's floor or re-binding a building changes the floor id; rooms drawn
-    // on the old id are no longer in the rebuilt manifest. Warn before discarding them (excluding
-    // the whole→region splits above, whose rooms are reprojected onto their new region floors).
-    const orphaned = (await this._orphanedFloors(map)).filter(o => !reprojectedKeys.has(o.key));
-    if (orphaned.length) {
-      const lines = orphaned.map(o => '  • ' + o.label + '  ('
-        + o.count + (o.count === 1 ? ' room' : ' rooms') + ')');
-      if (!confirm('This rebuild changes these floors’ ids, so the rooms drawn on them will be '
-          + 'removed:\n\n' + lines.join('\n') + '\n\nContinue and discard those rooms?'))
-        return this._stepMap();
-    }
+    // on the old id are no longer in the rebuilt manifest — they are discarded (excluding the
+    // whole→region splits above, whose rooms are reprojected onto their new region floors).
+    const orphaned = (await this.diff.orphanedFloors(map)).filter(o => !reprojectedKeys.has(o.key));
 
-    // A whole→region split keeps the user's rooms but moves each into the region it sits in,
-    // remapping its coordinates; a room outside every region is dropped. Warn+confirm, mirroring
-    // the orphan/desync pattern above.
-    if (reprojections.length) {
-      const lines = reprojections.map(r => {
-        const parts = [r.moved + (r.moved === 1 ? ' room moved' : ' rooms moved')];
-        if (r.dropped) parts.push(r.dropped + ' outside every region, dropped');
-        return '  • ' + r.label + '  (' + parts.join(', ') + ')';
-      });
-      if (!confirm('Splitting these floors into regions moves each room into the region it sits '
-          + 'in, remapping its coordinates:\n\n' + lines.join('\n') + '\n\nContinue and remap them?'))
-        return this._stepMap();
-    }
+    // Rebuilding a floor (or the siteplan) can keep its id (so `ImportDiff.orphanedFloors` won't
+    // catch it) but change the underlying drawing — a different orientation, a different (siteplan)
+    // aspect ratio, or a drawing replaced in place (REPL-1, where even a same-size margin/crop shift
+    // is undetectable from manifest metadata) — desyncing rooms/hotspots already placed against the
+    // old drawing. Non-destructive: they are kept, just worth re-checking.
+    const desynced = await this.diff.desyncedFloors(map);
 
-    // Rebuilding a floor (or the siteplan) can keep its id (so `_orphanedFloors` won't catch it)
-    // but change the underlying drawing — a different orientation, a different (siteplan) aspect
-    // ratio, or a drawing replaced in place (REPL-1, where even a same-size margin/crop shift is
-    // undetectable from manifest metadata) — desyncing rooms/hotspots already placed against the
-    // old drawing. Warn, but keep them: the change is reversible, so we never silently delete the
-    // user's work.
-    const desynced = await this._desyncedFloors(map);
-    if (desynced.length) {
-      const lines = desynced.map(o => '  • ' + o.label + '  ('
-        + o.count + ' ' + (o.count === 1 ? o.unit : o.unit + 's') + ')');
-      if (!confirm('Rebuilding these changes their underlying drawing (a different orientation or '
-          + 'shape, or a replaced plan), so the '
-          + (desynced.some(o => o.hotspots) ? 'features' : 'rooms') + ' already drawn on them may '
-          + 'no longer line up and should be re-checked:\n\n' + lines.join('\n')
-          + '\n\nContinue and keep them?'))
-        return this._stepMap();
-    }
+    if (!orphaned.length && !reprojections.length && !desynced.length)
+      return { orphaned, reprojections, refit: null };   // nothing at risk — don't interrupt at all
 
-    const view = this._stage('Building facility map…');
-    view.append(Dom.el('div', { class: 'imp-spinner' },
-      'Rendering ' + Object.keys(map.buildings).length + ' buildings. This can take a minute.'));
-    try {
-      const r = await Api.post('/api/import/build', map);
-      // Carry the server's actionable hint (e.g. an HQ render that outran render_mem_mb, HEALTH-3)
-      // onto the Error so the catch can add it to the otherwise-reassuring failure toast.
-      if (!r.ok) { const err = new Error(r.error || 'build failed'); err.hint = r.hint; throw err; }
+    // An aspect-only siteplan swap skews the hotspots by a known amount, so beyond listing the
+    // desync we can offer to correct it (IMPORT-11). The dialog carries it as an opt-in checkbox,
+    // default off — the fit assumes the new drawing shows the same area, and a wrong automatic
+    // transform is worse than a skew the user can see — and it stays undoable from the completion
+    // toast. The transform itself is applied after the build, against the rebuilt manifest's real
+    // dimensions.
+    const spRefit = desynced.find(o => o.refit);
+    return ImportBuildReview.open({ orphaned, reprojections, desynced,
+      refit: spRefit ? spRefit.refit : null });
+  }
+
+  /** Settle up after a successful render: reload the store from the new manifest, persist the room
+   *  bookkeeping the rebuild implied, apply an opted-into hotspot re-fit, and land the user on the
+   *  siteplan with one toast folding in every notice. `plan` is `_confirmBuild`'s return; `r` is
+   *  the build response, whose render diagnostics ride that same toast. */
+  async _afterBuild(r, plan) {
+    const { orphaned, reprojections, refit } = plan;
       await this.app.store.load();
       // The manifest is now rebuilt from the current drawings, so any replace this session is
       // reconciled — clear the tracker so a later no-op rebuild doesn't re-warn (REPL-1).
@@ -2766,9 +2502,13 @@ class ImportFlow {
       // rooms keep their id and Location binding, upserted under the region floor's key.
       if (orphaned.length || reprojections.length) {
         for (const o of orphaned) delete this.app.store.annotations[o.key];
-        for (const r of reprojections) this._applyReprojection(r);
+        for (const rp of reprojections) this.diff.applyReprojection(rp);
         try { await this.app.store.saveAnnotations(); } catch (_) { /* best effort cleanup */ }
       }
+      // Re-fit the siteplan hotspots the user opted into (IMPORT-11), now that the rebuilt manifest
+      // carries the new image's real dimensions — more authoritative than the pre-build preview
+      // measurement, which is kept only as the fallback.
+      const refitted = refit ? await this.diff.applySiteplanRefit(refit) : null;
       // Warn when any imported data overlay is still placed by the approximate fit-to-bounds
       // default rather than a control-point georeference (FMT-6): a transient heads-up pointing
       // at the align editor, not a blocking confirm (the overlay is wanted either way). Drives
@@ -2805,22 +2545,16 @@ class ImportFlow {
         msg += ' ' + c + (c === 1 ? ' large plan' : ' large plans') + ' rendered just below full '
           + 'high quality (reached the built-in size cap).';
       }
-      Toast.show(msg, n > 0);
+      // A completed re-fit moved user geometry, so its notice carries an Undo button — the UX-17
+      // idiom `Editor._deleteToast` uses for the app's other instant-but-reversible writes. The
+      // wizard lands on the siteplan itself, so the user is looking at the re-fitted hotspots while
+      // the button is up. The action toast replaces the plain one (a second call would clobber it),
+      // winning over the `err` styling of a render diagnostic — the reversible data change is the
+      // more urgent thing to surface, and every diagnostic is folded into `msg` either way.
+      if (refitted) msg += refitted.note;
+      if (refitted && refitted.undo) Toast.action(msg, 'Undo re-fit', refitted.undo);
+      else Toast.show(msg, n > 0 || !!refitted);
       this.app.go('#/');
-    } catch (e) {
-      // A failed build never deletes anything: `build()` overwrites the manifest only on success
-      // (and atomically), and we never reached `store.load()`, so the store still holds the
-      // last-good map. Reassure the user rather than toasting a raw render traceback that reads as
-      // "everything was wiped", and keep them on the review step to fix a drawing and retry.
-      console.error('Facility rebuild failed', e);
-      // Keep the reassuring "nothing was lost" lead, then append the server's actionable hint when
-      // it named one (an HQ render that outgrew its memory/time budget, HEALTH-3) so the fix is in
-      // front of the user instead of buried in the console.
-      let msg = 'Rebuild failed. Your existing map is unchanged and still active. Nothing was lost.';
-      if (e && e.hint) msg += ' ' + e.hint;
-      Toast.show(msg, true);
-      this._stepMap();
-    }
   }
 
   /** The destructive "Start over" (reset) button, or `null` when the user may not reset — reset
@@ -2834,7 +2568,18 @@ class ImportFlow {
   }
 
   async _reset() {
-    if (!confirm('Clear the uploaded drawings and start the import over?')) return;
+    // Wiping the working dir out from under a live upload strands a half-written tree (and
+    // `ResetView` holds the render lock, so it would fail anyway) — IMPORT-30. A scan in flight is
+    // the same hazard from the other side (IMPORT-47): `ResetView` takes the very lock the scan
+    // holds, so this would 409 with the server's raw wording on a button the user was invited to
+    // press. "Start over" is built by every step, so it is guarded here rather than in
+    // `_setUploadPhase` — through the same `busyGate` decision those disabled controls read, so the
+    // refusal can't say something different from what the upload step is showing.
+    const gate = ImportFlow.busyGate({ phase: this.uploader.phase, scanBusy: this.scanBusy });
+    if (gate.busy) { Toast.show(gate.message, true); return; }
+    if (!confirm('Clear the uploaded drawings and start the import over? This does not change the '
+      + 'facility grouping or NetBox organization settings — those are install-wide and survive a '
+      + 'reset; change them from the Facility layout step (or Settings) if needed.')) return;
     try {
       await Api.post('/api/import/reset', {});
     } catch (e) {
@@ -2846,11 +2591,20 @@ class ImportFlow {
     this.inv = null; this.buildings = []; this.site = { folder: '', file: '' };
     this._bIdx = 0;
     this._autoMapDone = false;
+    this.organize.reset();
+    this.ocr.reset();     // the previews its reads came from are gone with the working dir
     this._codeRegion = null;
-    this._codeRegionDone = false;
-    this._siteplanDone = false;
-    this._regionZoom = 1;
+    this._siteplanStepDone = false;
+    this._regionZoom.z = 1;
     this._mergeMode = false;
+    // The old drawings are gone, so a replace tracked against their bytes is no longer evidence of
+    // anything (IMPORT-36) — same rationale as `organize.reset()` above. The campus pick is
+    // per-facility draft state that `ResetView` just deleted along with the draft/manifest it would
+    // otherwise be restored from, so it goes too (unlike the install-wide grouping/org settings the
+    // confirm copy above promises survive).
+    this._replaced.clear();
+    this.campus = null;
+    this._campusPromptDone = false;
     this._stepUpload();
   }
 }

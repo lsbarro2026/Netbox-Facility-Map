@@ -1,4 +1,7 @@
 recursive-include netbox_facilitymap/templates *
 recursive-include netbox_facilitymap/static *
+# The vendored OCR recognition model. It must reach the sdist too, or a source build produces a
+# wheel whose `ocr` capability gates itself off — see netbox_facilitymap/models/README.md.
+recursive-include netbox_facilitymap/models *
 include README.md
 include LICENSE

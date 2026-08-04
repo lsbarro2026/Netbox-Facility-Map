@@ -63,7 +63,8 @@ class _FacilityWidget(DashboardWidget):
         return self._message('You do not have permission to view the facility map.')
 
     def _facility(self):
-        """The configured facility (a Site Group / Region slug) validated via `valid_facility`, or
+        """The configured facility slug (a Site Group / Region — or, under the `location`
+        grouping, a top-level Location) validated via `valid_facility`, or
         '' when blank/invalid — an invalid slug falls back to the default facility and never leaks
         into the iframe src. The SPA reads it from the leading `#/y/<slug>` hash segment."""
         try:
@@ -90,8 +91,8 @@ class FacilityMapWidget(_FacilityWidget):
         )
         facility = forms.CharField(
             required=False,
-            help_text='Optional facility (Site Group / Region slug) to show. Blank = the default '
-                      'facility.',
+            help_text='Optional facility slug (Site Group / Region — or top-level Location under '
+                      'the Location grouping) to show. Blank = the default facility.',
         )
         link = forms.CharField(
             required=False,
@@ -173,8 +174,8 @@ class FacilitySearchWidget(_FacilityWidget):
         )
         facility = forms.CharField(
             required=False,
-            help_text='Optional facility (Site Group / Region slug) to search. Blank = the default '
-                      'facility.',
+            help_text='Optional facility slug (Site Group / Region — or top-level Location under '
+                      'the Location grouping) to search. Blank = the default facility.',
         )
 
     def render(self, request):
@@ -209,8 +210,8 @@ class FacilityTodoWidget(_FacilityWidget):
     Loads the same `MapView` iframe as the map/search widgets, at the `#/todo` route — the router
     dispatches `App.showTodo` regardless of embed, and the to-do scripts ship eagerly, so the rollup
     renders chrome-free inside the card exactly as on the plugin's To-do nav tab. This mirrors the
-    in-app to-do *page*, deliberately not the dev `TODO.local.md` backlog (an internal tool with no
-    user-facing role). There is no map to shape the card to, so the iframe is a plain fill; a to-do
+    in-app to-do *page* that end users see, deliberately not any internal development backlog (which
+    plays no user-facing role). There is no map to shape the card to, so the iframe is a plain fill; a to-do
     row click escapes to the full map in the top window (`App.navigateOut`) rather than stranding the
     user on a breadcrumb-free floor view inside the card.
 
@@ -227,8 +228,8 @@ class FacilityTodoWidget(_FacilityWidget):
     class ConfigForm(WidgetConfigForm):
         facility = forms.CharField(
             required=False,
-            help_text='Optional facility (Site Group / Region slug) to show to-dos for. Blank = the '
-                      'default facility.',
+            help_text='Optional facility slug (Site Group / Region — or top-level Location under '
+                      'the Location grouping) to show to-dos for. Blank = the default facility.',
         )
 
     def render(self, request):

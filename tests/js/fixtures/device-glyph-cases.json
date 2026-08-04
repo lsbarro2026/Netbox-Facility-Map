@@ -1,0 +1,131 @@
+{
+  "_readme": [
+    "The SHARED corpus behind the DeviceShapes lockstep. `static/.../device-shapes.js` (typeFor)",
+    "and `netbox_facilitymap/device_shapes.py` (type_for) are a hand-maintained 1:1 mirror — there",
+    "is no build step, so the classification rules are duplicated, not shared. This file is the one",
+    "set of cases BOTH sides are driven through:",
+    "",
+    "  JS     -> tests/js/device-shapes.test.js",
+    "  Python -> tests/test_device_shapes.py::test_shared_corpus_matches_the_js_tier",
+    "",
+    "so a rule edited on one side and forgotten on the other fails on whichever side drifted,",
+    "instead of only ever being checked from Python.",
+    "",
+    "Cases are stated in a SHAPE-NEUTRAL way, because the two ports take different item shapes:",
+    "the JS reads `item.role.slug`/`item.role.name`/`item.name`, Python reads flat `role_slug`/",
+    "`role_name`/`name`. Each side adapts these fields into its own shape. Fields are optional;",
+    "omitted ones are absent on both sides. `kind` defaults to 'device'.",
+    "",
+    "Scope: the BUILT-IN English rules and the normalizer. The operator's `role_glyphs` vocabulary",
+    "needs per-test config on both sides and stays in each side's own tests.",
+    "",
+    "`box` cases pin the per-type footprints, the other half of the lockstep."
+  ],
+
+  "typeFor": [
+    { "kind": "rack", "label": "wifi ap", "want": "rack",
+      "note": "`kind` wins outright — a rack never keyword-classifies, even with a misleading label." },
+    { "kind": "rack", "role_name": "Access Point", "want": "rack",
+      "note": "Same, via the role rather than the label." },
+
+    { "role_name": "Access Point", "want": "ap" },
+    { "role_name": "Wireless", "want": "ap" },
+    { "role_slug": "access-point", "want": "ap",
+      "note": "The slug alone resolves because _normalize folds the hyphen to a space." },
+    { "label": "AP-01", "want": "ap",
+      "note": "`\\bap\\b` — a hyphen is a word boundary, so a plain substring match would miss this." },
+    { "label": "WAP 5", "want": "ap" },
+    { "label": "kneecap", "want": "generic",
+      "note": "...but 'ap' inside a longer word is NOT a standalone token." },
+    { "name": "Wireless Host Controller", "want": "ap",
+      "note": "RULE ORDER: `ap` is tried before the broad server/storage catch-alls, so 'host' loses." },
+
+    { "role_name": "access point", "want": "ap" },
+    { "role_name": "ACCESS POINT", "want": "ap" },
+    { "role_name": "AccessPoint", "want": "ap",
+      "note": "camelCase split — the four spellings above must all collapse to one haystack." },
+    { "role_name": "Access_Point", "want": "ap" },
+
+    { "role_name": "Access Switch", "want": "accessswitch",
+      "note": "RULE ORDER: the access/edge switch rule sits ahead of the broad `switch` catch-all." },
+    { "role_name": "access-switch", "want": "accessswitch" },
+    { "role_name": "AccessSwitch", "want": "accessswitch" },
+    { "role_name": "ASW-1", "want": "accessswitch", "note": "`\\basw\\b`" },
+    { "role_name": "Core Switch", "want": "switch", "note": "A plain switch still falls through." },
+    { "role_name": "Leaf 3", "want": "switch" },
+    { "role_name": "TOR-2", "want": "switch", "note": "`\\btor\\b`" },
+
+    { "role_name": "Edge Firewall", "want": "firewall" },
+    { "label": "FW-1", "want": "firewall", "note": "`\\bfw\\b`" },
+    { "role_name": "Fire Wall", "want": "firewall", "note": "the optional space in `fire ?wall`" },
+
+    { "role_name": "Patch Panel", "want": "patchpanel" },
+    { "role_name": "Router", "want": "router" },
+    { "role_name": "Gateway", "want": "router" },
+    { "label": "GW-4", "want": "router", "note": "`\\bgw\\b`" },
+
+    { "role_name": "Wall Outlet", "want": "outlet",
+      "note": "RULE ORDER: outlet/receptacle is tried before pdu, so a single socket is not a power strip." },
+    { "role_name": "outlet", "want": "outlet" },
+    { "role_name": "Socket", "want": "outlet" },
+    { "role_name": "receptacle", "want": "outlet" },
+    { "role_name": "PDU", "want": "pdu" },
+    { "role_name": "Rack PDU", "want": "pdu" },
+    { "role_name": "Power Strip", "want": "pdu" },
+    { "label": "RPP 2", "want": "pdu", "note": "`\\brpp\\b`" },
+
+    { "role_name": "UPS", "want": "ups" },
+    { "role_name": "Battery Backup", "want": "ups" },
+
+    { "role_name": "Storage Array", "want": "storage" },
+    { "label": "NAS-1", "want": "storage", "note": "`\\bnas\\b`" },
+    { "label": "SAN 2", "want": "storage", "note": "`\\bsan\\b`" },
+
+    { "role_name": "Server", "want": "server" },
+    { "role_name": "Hypervisor", "want": "server" },
+    { "role_name": "ESXi Host", "want": "server" },
+
+    { "name": "core-switch-1", "want": "switch",
+      "note": "FALLBACK CHAIN: no role, so the device's own name classifies it." },
+    { "label": "Edge Firewall", "want": "firewall",
+      "note": "FALLBACK CHAIN: no role and no name, so the placement label classifies it." },
+    { "role_slug": "unknown-role-slug", "role_name": "Access Point", "want": "ap",
+      "note": "An unrecognized slug must not stop the role NAME from matching." },
+
+    { "label": "Widget 7", "want": "generic" },
+    { "want": "generic", "note": "Nothing at all to classify on — must not throw." },
+
+    { "label": "Pare-Feu #2", "want": "generic",
+      "note": "A non-English role with no configured vocabulary stays generic on BOTH sides (INTL-1)." },
+    { "role_name": "パッチパネル", "want": "generic",
+      "note": "Non-Latin text survives normalization (it is no longer deleted outright) but matches no English rule." }
+  ],
+
+  "box": [
+    { "type": "rack", "w": 30, "h": 40, "note": "The reference footprint — the widest object." },
+    { "type": "server", "w": 22, "h": 18 },
+    { "type": "router", "w": 20, "h": 18 },
+    { "type": "firewall", "w": 20, "h": 18 },
+    { "type": "storage", "w": 22, "h": 18 },
+    { "type": "ups", "w": 16, "h": 20 },
+    { "type": "switch", "w": 26, "h": 10 },
+    { "type": "accessswitch", "w": 24, "h": 10 },
+    { "type": "patchpanel", "w": 26, "h": 12 },
+    { "type": "pdu", "w": 24, "h": 8 },
+    { "type": "outlet", "w": 12, "h": 7 },
+    { "type": "ap", "w": 16, "h": 16 },
+    { "type": "generic", "w": 22, "h": 15 },
+    { "type": "no-such-type", "w": 22, "h": 15, "note": "Unknown types fall back to the generic footprint." }
+  ],
+
+  "normalize": [
+    { "label": "Pare-Feu #2", "want": "pare feu 2" },
+    { "label": "パッチパネル", "want": "パッチパネル",
+      "note": "The INTL-1 regression: `[^a-z0-9]` used to delete this outright, leaving nothing to match." },
+    { "label": "AccessPoint_01", "want": "access point 01",
+      "note": "camelCase split plus the separator fold, in one haystack." },
+    { "role_slug": "access-point", "role_name": "Access Point", "name": "ap-1", "label": "AP 1",
+      "want": "access point access point ap 1 ap 1",
+      "note": "Field ORDER in the haystack: role slug, role name, device name, then placement label." }
+  ]
+}

@@ -1,0 +1,347 @@
+{
+  "_readme": [
+    "Corpus for ImportMatch.bestOf() — the filename-stem -> BUILDING scorer. This is a measurement",
+    "harness, not just a regression net: a change to the scoring formula is judged against these",
+    "cases rather than eyeballed. See ../README.md for the tests that read this file.",
+    "",
+    "`candidates` is one plausible campus's building Locations, in the {name, slug} shape",
+    "`ImportMatch.candidateKey` reads. It is deliberately BIG and deliberately REPETITIVE — several",
+    "`Hall`s, several `Center`s, a North/South/East sibling set, two `Shop N`s. The scorer weights",
+    "every token by its inverse document frequency over this list, so a corpus of eight unique names",
+    "would measure nothing about the thing most likely to go wrong on a real campus: that `hall`,",
+    "`center` and `building` are near-useless discriminators while `astronomy` is decisive. Adding a",
+    "candidate CHANGES existing results by design — that is the feature under test, not corpus drift.",
+    "",
+    "`matches` are stems with one correct answer; `ambiguous` are stems that genuinely do not say",
+    "which building they mean and so must never reach the one-click bulk-accept path. A case",
+    "carrying `knownGap: true` is one the matcher gets WRONG today — a wish list, inventoried so",
+    "closing one is a visible, deliberate event.",
+    "",
+    "`groups` is a THIRD shape, for the collective evidence pass (IMPORT-21). Its cases are not",
+    "filenames but PILES: a set of stems that arrive at the split step together, scored in one",
+    "`bestOfAll` call. A group measures what the batch knows that a single filename cannot — which",
+    "of the pile's numbers name buildings and which are sheet indices — so its rows are only",
+    "meaningful together and MUST NOT be flattened into `matches`. Each row carries `want` (the",
+    "building a human says it means) and `minTier`; `want: null` marks a row that must never reach",
+    "the prefill bar however the rest of its pile scores, which is where a group states what the",
+    "pass is forbidden to do as sharply as what it should.",
+    "",
+    "Do NOT put floor-axis cases here: ImportBulk's matchers map a filename to a FLOOR and have",
+    "their own tests. The two axes are easy to conflate and a drawing carries both signals."
+  ],
+
+  "candidates": [
+    { "name": "Administration", "slug": "bldg-001" },
+    { "name": "Library", "slug": "bldg-002" },
+    { "name": "Facilities Services", "slug": "bldg-003" },
+    { "name": "Architecture and Environmental Design", "slug": "bldg-005" },
+    { "name": "Health Center", "slug": "bldg-008" },
+    { "name": "Recreation Center", "slug": "bldg-010" },
+    { "name": "Performing Arts Center", "slug": "bldg-012" },
+    { "name": "Engineering Science Building", "slug": "bldg-014" },
+    { "name": "Astronomy Observatory", "slug": "bldg-016" },
+    { "name": "Chemistry Building", "slug": "bldg-017" },
+    { "name": "Business Administration Building", "slug": "bldg-018" },
+    { "name": "Student Union", "slug": "bldg-021" },
+    { "name": "Student Services Building", "slug": "bldg-022" },
+    { "name": "Alumni Hall", "slug": "bldg-024" },
+    { "name": "Founders Hall", "slug": "bldg-025" },
+    { "name": "Heritage Hall", "slug": "bldg-026" },
+    { "name": "Central Plant", "slug": "bldg-030" },
+    { "name": "Water Treatment Plant", "slug": "bldg-031" },
+    { "name": "Grounds Warehouse", "slug": "bldg-033" },
+    { "name": "Public Safety", "slug": "bldg-035" },
+    { "name": "Residence Hall North", "slug": "bldg-041" },
+    { "name": "Residence Hall South", "slug": "bldg-042" },
+    { "name": "Residence Hall East", "slug": "bldg-043" },
+    { "name": "Graduate Housing", "slug": "bldg-045" },
+    { "name": "Dining Commons", "slug": "bldg-047" },
+    { "name": "Shop 3", "slug": "bldg-050" },
+    { "name": "Shop 7", "slug": "bldg-051" },
+    { "name": "Corporation Yard", "slug": "bldg-053" },
+    { "name": "Aquatics Center", "slug": "bldg-055" },
+    { "name": "Track and Field Support", "slug": "bldg-058" },
+    { "name": "Mathematics and Statistics", "slug": "bldg-061" },
+    { "name": "Modern Languages", "slug": "bldg-062" }
+  ],
+
+  "matches": [
+    {
+      "stem": "Administration-L1",
+      "want": "bldg-001",
+      "minTier": "exact",
+      "note": "The whole building name spelled out — the exact rung, ImportFlow._confidentMatch's bar applied to a drawing stem. 'Business Administration Building' scores here too; the exact rung is deliberately exempt from the margin demotion, because a candidate that merely CONTAINS the name is not a better answer than the literal one."
+    },
+    {
+      "stem": "001-Admin-FL1",
+      "want": "bldg-001",
+      "minTier": "strong",
+      "note": "The reported real-world shape: a leading building CODE plus an abbreviated name. Neither signal alone is enough — 'admin' answers to two buildings here — but the code is carried by exactly one, so together they settle it."
+    },
+    {
+      "stem": "Library-Floor2",
+      "want": "bldg-002",
+      "minTier": "exact",
+      "note": "'floor2' is a FLOOR_TOKEN and drops out, leaving a clean exact name match."
+    },
+    {
+      "stem": "002-LIBRARY-L1",
+      "want": "bldg-002",
+      "minTier": "exact",
+      "note": "Case must not matter, and a leading code that agrees with the name must not weaken the match."
+    },
+    {
+      "stem": "A101-Library-L2",
+      "want": "bldg-002",
+      "minTier": "exact",
+      "note": "'a101' is a drawing-SHEET number (SHEET_TOKEN) and is dropped, not read as building 101."
+    },
+    {
+      "stem": "Student-Union-Plan-L1",
+      "want": "bldg-021",
+      "minTier": "exact",
+      "note": "'plan' is STEM_NOISE: dropped from the stem so it cannot inflate the score. 'Student Services Building' shares 'student', but the exact rung settles it."
+    },
+    {
+      "stem": "Central-Plant-Basement",
+      "want": "bldg-030",
+      "minTier": "exact",
+      "note": "'basement' is a floor marker, not a building word. 'Water Treatment Plant' shares 'plant' — which is why 'plant' alone is not enough, in the ambiguous set below."
+    },
+    {
+      "stem": "Residence-Hall-North-FL3",
+      "want": "bldg-041",
+      "minTier": "exact",
+      "note": "The discriminating word ('north') is what separates this from its two siblings — see the ambiguous case below."
+    },
+    {
+      "stem": "BLDG14-L2",
+      "want": "bldg-014",
+      "minTier": "weak",
+      "note": "An explicit BUILDING_TOKEN with its number. Code-only, so deliberately weak whatever it normalizes to: a bare number is as often a sheet number as a building code."
+    },
+    {
+      "stem": "Shop-3-L1",
+      "want": "bldg-050",
+      "minTier": "strong",
+      "note": "A building whose NAME carries a digit, with a sibling 'Shop 7' to make the digit do real work. Candidate tokens are unfiltered, so 'Shop 3' keeps both its word and its number."
+    },
+    {
+      "stem": "Engineering-Science-Building-FL1",
+      "want": "bldg-014",
+      "minTier": "strong",
+      "note": "A multi-word name spelled out in full. 'building' is a BUILDING_TOKEN in the stem, so the exact rung is not reachable here — strong is."
+    },
+    {
+      "stem": "Astronomy-Observatory-L1",
+      "want": "bldg-016",
+      "minTier": "exact",
+      "note": "IDF's happy case: both words are carried by exactly one building, so nothing else comes close."
+    },
+    {
+      "stem": "Astronomy-FL2",
+      "want": "bldg-016",
+      "minTier": "strong",
+      "note": "HALF a name, but the half nobody else shares. One decisive word is enough — contrast 'Hall-L1' and 'Center-FL2' in the ambiguous set, which are also one word and must NOT prefill."
+    },
+    {
+      "stem": "ESB-FL2",
+      "want": "bldg-014",
+      "minTier": "strong",
+      "note": "ACRONYM — banked from a knownGap. 'esb' is the initialism of Engineering Science Building and no other candidate offers it, so it is decisive. Initialisms match by EQUALITY only: a soft-matched three-letter acronym would reach half a campus."
+    },
+    {
+      "stem": "Adminstration-L1",
+      "want": "bldg-001",
+      "minTier": "weak",
+      "note": "TYPO (a dropped 'i') — banked from a knownGap. Jaro-Winkler rates it ~0.99 against 'administration', so the stem now resolves at all, where the prefix/containment-only rung it replaced scored it ZERO and returned nothing. It stays weak because 'Business Administration Building' answers to it too."
+    },
+    {
+      "stem": "005-Architecture-Environmental-L1",
+      "want": "bldg-005",
+      "minTier": "strong",
+      "note": "The IMPORT-19 screenshot's shape: a leading code plus a truncated multi-word name. 'and'/'Design' are absent from the stem, which costs nothing — a stem word the candidate cannot explain is what costs, not a candidate word the stem omits."
+    },
+    {
+      "stem": "AdminBldg1FL2",
+      "want": "bldg-001",
+      "minTier": "strong",
+      "note": "UNDELIMITED camelCase stem — the old tokenizer produced one unmatchable blob and returned null. It sub-splits to admin + BLDG1 (code 1) + FL2 (dropped). The rejoin step is load-bearing: split naively, 'FL2' becomes floor-marker 'fl' plus a bare '2' that would read as BUILDING 2."
+    },
+    {
+      "stem": "005ArchEnv",
+      "want": "bldg-005",
+      "minTier": "strong",
+      "note": "Undelimited AND abbreviated: 005 + Arch + Env, all three signals agreeing on one building. Both abbreviations clear the >=3-char prefix floor, and the code is carried by exactly one candidate."
+    },
+    {
+      "stem": "Sciences-L1",
+      "want": "bldg-014",
+      "minTier": "strong",
+      "note": "A plural where the building is singular. Jaro-Winkler's prefix bonus carries 'sciences' -> 'science'; no other candidate has the word."
+    },
+    {
+      "stem": "Modern-Languages-002",
+      "want": "bldg-062",
+      "minTier": "exact",
+      "note": "A trailing number belonging to a DIFFERENT building (002 is the Library). The stray code costs score but must not change the answer — word evidence outweighs a code the winner does not carry."
+    },
+    {
+      "stem": "Dining-Commons-FL1",
+      "want": "bldg-047",
+      "minTier": "exact",
+      "note": "Two words, both unique. The straightforward case, kept as a control."
+    },
+    {
+      "stem": "Corp-Yard-L1",
+      "want": "bldg-053",
+      "minTier": "strong",
+      "note": "'corp' prefixes 'corporation' and 'yard' is exact and unique — an abbreviation plus a decisive word, which is exactly the shape that SHOULD prefill."
+    },
+    {
+      "stem": "Public-Safety-FL1",
+      "want": "bldg-035",
+      "minTier": "exact",
+      "note": "Control case: an unambiguous two-word name on a campus where 'services', 'center' and 'hall' are everywhere."
+    },
+    {
+      "stem": "Admin-FL2",
+      "want": "bldg-001",
+      "minTier": "weak",
+      "note": "Abbreviation only, and on THIS campus it is ambiguous: 'admin' is a >=3-char prefix of both 'Administration' and 'Business Administration Building'. Weak is the honest answer — under the eight-candidate corpus this replaced the same stem was strong, purely because the twin did not exist."
+    },
+    {
+      "stem": "Admin_Bldg_FL1",
+      "want": "bldg-001",
+      "minTier": "weak",
+      "note": "Underscore separators, and a bare 'bldg' marker classified as a BUILDING_TOKEN rather than scored as a word — which matters, because every candidate slug here also contains 'bldg' and scoring it would tie the whole campus. Weak for the same reason as 'Admin-FL2'."
+    },
+    {
+      "stem": "Rec-Center-L1",
+      "want": "bldg-010",
+      "minTier": "strong",
+      "note": "ABBREVIATION PLUS A NEAR-STOPWORD, and the clearest demonstration of what IDF buys. 'center' is carried by four buildings and so weighs almost nothing; 'rec' prefixes exactly one. The stem therefore clears the other Centers by a wide margin, while bare 'Center-FL2' in the ambiguous set — the same word without the discriminator — cannot choose at all."
+    },
+    {
+      "stem": "Building 005-0_Architecture & Environmental Design",
+      "want": "bldg-005",
+      "minTier": "strong",
+      "knownGap": true,
+      "note": "The IMPORT-19 screenshot's LITERAL filename. It resolves to the right building, but only at weak: the '-0' is a sheet/discipline suffix and tokenizes as a bare digit run, i.e. a building code no candidate carries, which costs the score enough to miss the prefill bar (0.77 against a 0.82 bar). Closing this means recognizing a second bare number beside an already-matched code as a sheet suffix rather than a rival code — do it without weakening 'Shop-5-L1' or 'Modern-Languages-002', where an unexplained code SHOULD cost."
+    }
+  ],
+
+  "ambiguous": [
+    {
+      "stem": "Residence-Hall-FL3",
+      "note": "Three buildings explain this stem equally well. The margin demotion is what stops bulk-accept guessing which sibling it is."
+    },
+    {
+      "stem": "Hall-L1",
+      "note": "One word, carried by five buildings. IDF alone does not save this — the margin does, since every 'Hall' scores identically."
+    },
+    {
+      "stem": "Center-FL2",
+      "note": "The same shape with a different near-stopword: four Centers, no way to choose between them."
+    },
+    {
+      "stem": "Shop-5-L1",
+      "note": "The RIGHT word and the WRONG number: there is a Shop 3 and a Shop 7, but no Shop 5. A matcher that simply ignored the failed code would confidently pick one of the two — the unexplained code has to cost score. (The winner it does return is whichever candidate the stray 5 touches; that it is not a Shop at all is the point, and weak is what keeps it harmless.)"
+    },
+    {
+      "stem": "North-Annex-L1",
+      "note": "One matching word ('north', from Residence Hall North) and one no building explains. Half a filename is not an answer."
+    },
+    {
+      "stem": "Plant-Ops-L1",
+      "note": "'plant' matches two buildings and 'ops' matches none — both failure modes in one stem."
+    },
+    {
+      "stem": "Admin-Annex-L1",
+      "note": "The classic near-miss: 'admin' matches, 'annex' names a building that is not in NetBox. Prefilling this would file the annex's drawings into Administration."
+    },
+    {
+      "stem": "Student-FL1",
+      "note": "'student' is shared by the Union and Student Services — one word, two buildings, no margin."
+    },
+    {
+      "stem": "Building-3",
+      "note": "A bare BUILDING_TOKEN plus a code. Code-only can never exceed weak however cleanly it normalizes, because a filename's bare number is as often a sheet number."
+    },
+    {
+      "stem": "M203",
+      "note": "A pure drawing-sheet number: no words, no building code. Nothing to match on at all."
+    },
+    {
+      "stem": "FL2",
+      "note": "A floor marker alone — every token is a FLOOR_TOKEN, so the stem carries no building signal."
+    },
+    {
+      "stem": "Rev-B-Sheet-04",
+      "note": "Revision/sheet bookkeeping only. The trailing 04 is a bare digit run and so a code candidate, but no building carries it."
+    },
+    {
+      "stem": "",
+      "note": "Empty stem (a dotfile, or a filename that was all extension). Must return null, not throw."
+    }
+  ],
+
+  "groups": [
+    {
+      "name": "sheet-suffix convention",
+      "note": "The IMPORT-19 screenshot's real convention: every filename carries its building code AND a trailing sheet/discipline index, and nothing in ONE filename says which number is which. Collectively it is obvious — a '0' rides on Administration's drawings and on the Library's, so it names no building. Waiving its cost is what lifts the Architecture stem, whose isolated score misses the bar (0.77 against 0.82) purely because that suffix reads as a rival building code. Kept as a knownGap in `matches`, where it is still one filename and still fails.",
+      "stems": [
+        { "stem": "Building 001-0_Administration", "want": "bldg-001", "minTier": "exact",
+          "note": "A corroborating row: the exact rung ignores codes, so this resolves on its name alone — which is what makes it evidence rather than something needing evidence." },
+        { "stem": "Building 001-1_Administration", "want": "bldg-001", "minTier": "exact",
+          "note": "The same building's next sheet. Note '001' and the sheet '1' parse to ONE code key, which is exactly why 'noise beats ownership' has to be the tie-break in _pileEvidence." },
+        { "stem": "Building 002-0_Library", "want": "bldg-002", "minTier": "exact",
+          "note": "The second, DIFFERENT building carrying the same '0'. Two distinct confident winners leaving one number unexplained is the whole quorum — one would be a coincidence." },
+        { "stem": "Building 005-0_Architecture & Environmental Design", "want": "bldg-005", "minTier": "strong", "corroborated": true,
+          "note": "THE CASE. Three name words all match and the code is carried by exactly one building; only the sheet suffix held it under the bar. With the pile's own convention read off the rows above, it prefills." },
+        { "stem": "Building 000-0_Center", "want": null,
+          "note": "The guard on that waiver: strip the noise code and this stem is the word 'center' alone, which four buildings answer to. Removing a term that cost score must not turn an unanswerable stem into a confident one — the margin still has to do its job." }
+      ]
+    },
+    {
+      "name": "corroborated building code",
+      "note": "What a pile can say that a filename cannot. A code-only stem is refused by a STRUCTURAL guard — a bare number is as often a sheet number as a building code — and that doubt is precisely what the siblings answer here: two drawings clear the bar on their WORDS while carrying the same number the winning building carries, so in this pile that number demonstrably keys a building.",
+      "stems": [
+        { "stem": "001-Admin-FL1", "want": "bldg-001", "minTier": "strong" },
+        { "stem": "001-Admin-FL2", "want": "bldg-001", "minTier": "strong" },
+        { "stem": "001-A101", "want": "bldg-001", "minTier": "strong", "corroborated": true,
+          "note": "The sheet number drops and nothing is left but the code, so in isolation this is weak forever. The promotion never moves the proposal — only its tier." }
+      ]
+    },
+    {
+      "name": "one corroboration is not a convention",
+      "note": "The same shape one row short. A single agreeing drawing is a coincidence, not a demonstrated convention, so the code-only guard stands and the row keeps its per-row Use.",
+      "stems": [
+        { "stem": "001-Admin-FL1", "want": "bldg-001", "minTier": "strong" },
+        { "stem": "001-A101", "want": "bldg-001", "minTier": "weak", "maxTier": "weak",
+          "note": "The right answer, still not confident enough to apply unasked. `maxTier` is the point of the case." }
+      ]
+    },
+    {
+      "name": "siblings never resolve a word ambiguity",
+      "note": "The line the collective pass does not cross, stated as a fixture. A pile full of one sibling is NOT evidence that the unlabelled drawing is that sibling — it is exactly as consistent with a South drawing whose other floors were not included in the upload.",
+      "stems": [
+        { "stem": "Residence-Hall-North-FL1", "want": "bldg-041", "minTier": "exact" },
+        { "stem": "Residence-Hall-North-FL2", "want": "bldg-041", "minTier": "exact" },
+        { "stem": "Residence-Hall-North-FL3", "want": "bldg-041", "minTier": "exact" },
+        { "stem": "Residence-Hall-FL3", "want": null,
+          "note": "Three confident siblings agreeing on North, and this must STILL not prefill. A stem carrying no code is untouchable by this pass however loudly its neighbours agree." }
+      ]
+    },
+    {
+      "name": "a wrong number is still wrong in company",
+      "note": "The unexplained-code cost is what keeps 'Shop-5' from confidently picking a Shop, and a pile of Shops must not waive it: '5' is unexplained on ONE weak row, and weak rows are not read as evidence at all — only confidently-matched drawings vote.",
+      "stems": [
+        { "stem": "Shop-3-L1", "want": "bldg-050", "minTier": "strong" },
+        { "stem": "Shop-7-L1", "want": "bldg-051", "minTier": "strong" },
+        { "stem": "Shop-5-L1", "want": null,
+          "note": "There is no Shop 5. Surrounded by two confidently-matched Shops, it must still refuse to name one." }
+      ]
+    }
+  ]
+}

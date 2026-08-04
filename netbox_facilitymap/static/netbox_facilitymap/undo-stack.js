@@ -23,6 +23,13 @@ class UndoStack {
   /** Remove and return the most recent snapshot, or null when empty. */
   pop() { return this._items.length ? this._items.pop() : null; }
 
+  /** The most recent snapshot without removing it, or null when empty. Callers use its
+   *  IDENTITY as a token for "the top is still the operation I captured" — the post-delete
+   *  Undo toast (Editor._deleteToast) pins it so a later mutation can't make its button revert
+   *  the wrong thing. Identity survives the depth cap (which drops from the bottom), where a
+   *  size comparison would not. */
+  peek() { return this._items.length ? this._items[this._items.length - 1] : null; }
+
   clear() { this._items.length = 0; }
 
   get size() { return this._items.length; }

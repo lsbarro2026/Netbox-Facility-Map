@@ -9,12 +9,12 @@
    panel; it owns its whole stage like `SettingsPage` does.
 
    Reads `/api/todos/all` (the facility-scoped `floor_key -> room_id -> [todo]` rollup) plus
-   `store.annotations` for the rooms each to-do names. It **shares** the two things every to-do
-   surface must agree on rather than restating them: the ordering is `TodoModel.compare` and the
-   create form is a `TodoComposer` (see `foundations.md` §3). Two surfaces that disagreed on either
-   would rank or create the same to-do differently depending on where you looked at it. The
-   reference mockup duplicates its composer per surface; that is prototype expedience, not a
-   pattern to copy.
+   `store.annotations` for the rooms each to-do names. It **shares** the things every to-do surface
+   must agree on rather than restating them: the ordering is `TodoModel.compare`, the create form is
+   a `TodoComposer`, and the row's chips/pills are `TodoChips` (see `foundations.md` §3). Two
+   surfaces that disagreed on any of them would rank, create or describe the same to-do differently
+   depending on where you looked at it. The reference mockup duplicates its composer per surface;
+   that is prototype expedience, not a pattern to copy.
 
    Rows are clickable — a click opens the room on its floor plan (the existing `#/r/` deep-link
    route) — and, since TASK-6, carry their own status pills, so the one status change a triage pass
@@ -36,9 +36,6 @@ const TODO_PG_FILTERS = [
   { key: 'completed', label: 'Completed', empty: 'completed',
     match: (t) => t.status === 'completed' },
 ];
-
-//: Matches `FloorTodo`'s cap, so an assignee row reads identically on both surfaces.
-const TODO_PG_AVATAR_MAX = 2;
 
 //: The Display menu's group axes (TASK-7). `location` is the historical Building → Floor tree and
 //: stays two-level; the rest bucket the flat entry list into a single level. "Building" is a
@@ -164,17 +161,16 @@ class TodoPage {
 
   // ---- the Display menu (TASK-7): group by / sort by ----
   /** The Display popover: one button opening a menu of Group-by / Sort-by selects. Built in the same
-   *  shape as the building page's `FloorViewMenu` and reusing its `.view-menu*` styling and open/close
-   *  mechanics — the two are kept as independent standalone popovers rather than a shared class, the
-   *  same call `FloorViewMenu` already makes. Held on `this` so `_toggleView` can anchor and fill it. */
+   *  shape as the building page's `FloorViewMenu`, reusing its `.view-menu*` styling and — since
+   *  QUAL-9 — the shared `Popover` (lib.js) that owns the click, anchoring, dismissal and teardown
+   *  for both. `_viewPop` is held on `this` so `_paintView` can refill it. */
   _viewControl() {
     this._viewBtn = Dom.el('button', { class: 'tb-labeled todo-pg-view',
       title: 'Group and sort the to-do list', html: Icons.sliders + '<span>View</span>' });
     this._viewPop = Dom.el('div', { class: 'view-menu' });
     this._viewWrap = Dom.el('div', { class: 'view-menu-wrap' }, [this._viewBtn, this._viewPop]);
     this._paintView();
-    // stopPropagation so the just-opened popover isn't immediately closed by the document handler.
-    this._viewBtn.addEventListener('click', (e) => { e.stopPropagation(); this._toggleView(); });
+    this._viewPopover = new Popover({ trigger: this._viewBtn, panel: this._viewPop, align: 'right' });
     return this._viewWrap;
   }
 
@@ -223,33 +219,6 @@ class TodoPage {
   _setGroup(group) { this.group = group; this._saveView(); this._renderList(); }
   _setSort(sort) { this.sort = sort; this._saveView(); this._renderList(); }
 
-  _toggleView() {
-    this._viewPop.classList.contains('open') ? this._closeView() : this._openView();
-  }
-
-  _openView() {
-    // The popover is `position: fixed` (shared `.view-menu` CSS) to escape any overflow clip, so
-    // anchor it to the button's current viewport rect — just under it, right edges aligned.
-    const r = this._viewBtn.getBoundingClientRect();
-    this._viewPop.style.top = Math.round(r.bottom + 6) + 'px';
-    this._viewPop.style.right = Math.round(window.innerWidth - r.right) + 'px';
-    this._viewPop.classList.add('open');
-    this._viewBtn.classList.add('active');
-    // Close on any outside click or Escape; both handlers are removed again on close.
-    this._onViewDoc = (e) => { if (!this._viewWrap.contains(e.target)) this._closeView(); };
-    this._onViewKey = (e) => { if (e.key === 'Escape') this._closeView(); };
-    document.addEventListener('click', this._onViewDoc);
-    document.addEventListener('keydown', this._onViewKey);
-  }
-
-  _closeView() {
-    this._viewPop.classList.remove('open');
-    this._viewBtn.classList.remove('active');
-    if (this._onViewDoc) document.removeEventListener('click', this._onViewDoc);
-    if (this._onViewKey) document.removeEventListener('keydown', this._onViewKey);
-    this._onViewDoc = this._onViewKey = null;
-  }
-
   _composerHost() {
     this.composerHost = Dom.el('div', { class: 'todo-pg-composer-host' });
     return this.composerHost;
@@ -257,11 +226,7 @@ class TodoPage {
 
   _setFilter(key) {
     this.filter = key;
-    for (const f of TODO_PG_FILTERS) {
-      const on = f.key === key;
-      this.filterBtns[f.key].btn.classList.toggle('active', on);
-      this.filterBtns[f.key].btn.setAttribute('aria-pressed', String(on));
-    }
+    TodoChips.markActive(this.filterBtns, key);
     this._renderList();
   }
 
@@ -315,10 +280,6 @@ class TodoPage {
     return out;
   }
 
-  _roomName(room) {
-    return room.label || (room.location && room.location.name) || room.id;
-  }
-
   /** Whether an entry survives the active filter + search box. The search spans the fields a person
    *  would actually recall — what the job was, and where it is. Case folding happens **here**, not
    *  where `query` is set: a match rule that silently required its caller to pre-lowercase would
@@ -328,7 +289,7 @@ class TodoPage {
     if (f && !f.match(e.todo)) return false;
     if (!this.query) return true;
     const q = this.query.toLowerCase();
-    return [e.todo.text, this._roomName(e.room), e.building.name, e.floor.label]
+    return [e.todo.text, TodoChips.roomName(e.room), e.building.name, e.floor.label]
       .some(s => (s || '').toLowerCase().includes(q));
   }
 
@@ -542,7 +503,7 @@ class TodoPage {
     const row = Dom.el('div', {
       class: 'todo-item todo-pg-item status-' + todo.status + (mine ? ' mine' : ''),
       role: 'button', tabindex: '0',
-      title: 'Show ' + this._roomName(room) + ' on the ' + floor.label + ' plan',
+      title: 'Show ' + TodoChips.roomName(room) + ' on the ' + floor.label + ' plan',
     }, parts);
     // The room's own uid, not its Location slug: both resolve (`FloorEditor._resolveFocusSeg`), but
     // the uid is unique per floor by construction and needs no binding to still be addressable.
@@ -560,24 +521,17 @@ class TodoPage {
     return row;
   }
 
-  /** The status pills (TASK-6), ported from `FloorTodo._pills` so the two surfaces render the same
-   *  vocabulary the same way. Unlike the floor panel's row, this page's row is itself a clickable
-   *  `role=button` that opens the deep link — so, unlike `FloorTodo._pills`, this wrapper must stop
-   *  both `click` and `keydown` from reaching it. `keydown` needs its own guard: a native `<button>`
-   *  fires the Enter/Space `keydown` up through the DOM before the browser synthesizes the resulting
-   *  `click`, so a click-only guard would still let the row's own keydown handler navigate away on a
-   *  keyboard activation. Stopping propagation once on the wrapping `<div>`, rather than per button,
-   *  also covers a bare click on the already-active pill (which has no `_setStatus` listener of its
-   *  own to stop it). */
+  /** The shared `TodoChips.pills` (TASK-6), wrapped in the one guard this surface needs. Unlike the
+   *  floor panel's row, this page's row is itself a clickable `role=button` that opens the deep link
+   *  — so this wrapper must stop both `click` and `keydown` from reaching it. `keydown` needs its
+   *  own guard: a native `<button>` fires the Enter/Space `keydown` up through the DOM before the
+   *  browser synthesizes the resulting `click`, so a click-only guard would still let the row's own
+   *  keydown handler navigate away on a keyboard activation. Stopping propagation once on the
+   *  wrapping `<div>`, rather than per button, also covers a bare click on the already-active pill
+   *  (which has no status listener of its own to stop it). The guard lives here and not in
+   *  `TodoChips` because it's a fact about *this* row, not about the pills. */
   _pills(todo, room) {
-    const div = Dom.el('div', { class: 'todo-pills' }, TodoModel.STATUSES.map(s => {
-      const b = Dom.el('button', {
-        class: 'todo-pill' + (todo.status === s.key ? ' active' : ''),
-        title: 'Mark ' + s.label.toLowerCase(),
-      }, s.label);
-      if (todo.status !== s.key) b.addEventListener('click', () => this._setStatus(todo, room, s.key));
-      return b;
-    }));
+    const div = TodoChips.pills(todo, (status) => this._setStatus(todo, room, status));
     div.addEventListener('click', (e) => e.stopPropagation());
     div.addEventListener('keydown', (e) => e.stopPropagation());
     return div;
@@ -586,17 +540,13 @@ class TodoPage {
   /** The meta chip row: [building · floor ·] room · priority · assignees · due. Carries the place as
    *  well as the room — the whole point of this surface is that a row can come from anywhere. */
   _meta(todo, room, place) {
-    const chips = [
-      Dom.el('span', { class: 'todo-chip todo-room-chip', title: this._roomName(room) },
-        [Dom.el('span', { class: 'todo-room-dot' }), Dom.el('span', {}, this._roomName(room))]),
-      this._priorityChip(todo),
-    ];
+    const chips = [TodoChips.roomChip(room), TodoChips.priorityChip(todo)];
     // Under `location` grouping the building/floor is the group heading above the row, so a place
     // chip would just repeat it; in every flat/grouped view the row must name where it lives itself.
     if (place && this.group !== 'location') chips.unshift(this._placeChip(place));
-    const avatars = this._avatars(todo);
+    const avatars = TodoChips.avatars(todo);
     if (avatars) chips.push(avatars);
-    if (todo.due) chips.push(this._dueChip(todo));
+    if (todo.due) chips.push(TodoChips.dueChip(todo));
     return Dom.el('div', { class: 'todo-meta' }, chips);
   }
 
@@ -605,32 +555,6 @@ class TodoPage {
   _placeChip({ building, floor }) {
     const label = building.name + ' · ' + floor.label;
     return Dom.el('span', { class: 'todo-chip todo-pg-place', title: label }, label);
-  }
-
-  _priorityChip(todo) {
-    const p = TodoModel.PRIORITIES.find(x => x.key === todo.priority);
-    return Dom.el('span', { class: 'todo-prio prio-' + todo.priority,
-      title: (p ? p.label : todo.priority) + ' priority' },
-      [Dom.el('span', { class: 'todo-prio-dot' }), Dom.el('span', {}, p ? p.short : todo.priority)]);
-  }
-
-  _avatars(todo) {
-    const users = todo.assignees || [];
-    if (!users.length) return null;
-    const shown = users.slice(0, TODO_PG_AVATAR_MAX);
-    const rest = users.slice(TODO_PG_AVATAR_MAX);
-    const els = shown.map(u => Dom.el('span', { class: 'todo-avatar', title: u.display }, u.initials));
-    if (rest.length) {
-      els.push(Dom.el('span', { class: 'todo-avatar todo-avatar-more',
-        title: rest.map(u => u.display).join(', ') }, '+' + rest.length));
-    }
-    return Dom.el('span', { class: 'todo-avatars' }, els);
-  }
-
-  _dueChip(todo) {
-    const overdue = TodoModel.isOverdue(todo);
-    return Dom.el('span', { class: 'todo-chip todo-due' + (overdue ? ' overdue' : ''),
-      title: (overdue ? 'Overdue — due ' : 'Due ') + todo.due }, TodoModel.dueLabel(todo.due));
   }
 
   // ---- the composer ----
@@ -700,7 +624,7 @@ class TodoPage {
 
   _composerRooms() {
     const fl = this._composerFloor();
-    return fl ? fl.rooms.map(r => ({ id: r.id, label: this._roomName(r) })) : [];
+    return fl ? fl.rooms.map(r => ({ id: r.id, label: TodoChips.roomName(r) })) : [];
   }
 
   /** Re-point the composer's room options at the chosen floor. `setRooms` keeps the draft (that's

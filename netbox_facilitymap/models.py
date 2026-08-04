@@ -3,8 +3,9 @@
 `FacilityMapBlob` stores editor state as whole-document JSON rows (one per `kind`), staying
 byte-compatible with the standalone tool's flat JSON files. `Room` is a `NetBoxModel`
 holding the authoritative, relational room geometry bound to a `dcim.Location`; the editor's
-`sync_rooms` owns its lifecycle (see CLAUDE.md §Data safety). See DESIGN.md §3 for how the
-two compose.
+`sync_rooms` owns its lifecycle and is the only code path allowed to delete `Room` rows,
+scoped to the user's own writes. The two models compose: blobs hold free-form editor
+state, `Room` holds the geometry NetBox itself needs to resolve.
 """
 
 from django.conf import settings
@@ -86,6 +87,14 @@ class FacilityMapBlob(ChangeLoggingMixin, models.Model):
         # `room_embed_zoom`), edited in-app via the Settings page. Unlike the editor
         # blobs it isn't a standalone-tool document — just the settings store.
         ('settings', 'Plugin settings'),
+        # A single install-wide row (`facility=''`, `key=''`) holding the explicit
+        # Site→facility assignment map `{site_slug: facility_slug}` — the plugin-owned
+        # facility axis (FACILITY-IDENTITY-DESIGN §4.1). Values are strict slugs
+        # (validated by `storage.valid_facility` on write); a Site absent from the map
+        # falls back to the SiteGroup/Region derivation. Its own kind on purpose: never
+        # smuggled into `key` (the CONC-1 per-floor shard) or `facility` (the namespace
+        # itself).
+        ('facility_map', 'Facility assignments'),
     )
 
     kind = models.CharField(max_length=20, choices=KIND_CHOICES)

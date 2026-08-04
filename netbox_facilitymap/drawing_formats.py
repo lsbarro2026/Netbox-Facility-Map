@@ -3,9 +3,9 @@
 Single source of truth for *which* source formats the import pipeline accepts, how each one is
 recognized (its extensions + header magic), and how it turns into map content. Both sides of the
 import pipeline read this one module, so adding a format is a single new handler entry instead of
-edits scattered across `preprocess.py`, `imports.py`, and the frontend:
+edits scattered across `preprocess.py`, `uploads.py`, and the frontend:
 
-  * the **NetBox worker** (`imports.py`/`views.py`) imports it for `DRAWING_EXTS` + `sniff`
+  * the **NetBox worker** (`uploads.py`/`views.py`) imports it for `DRAWING_EXTS` + `sniff`
     (accepted-extension list + cheap header check) — it never renders;
   * the **render subprocess** (`preprocess.py`) imports it for `format_for()` and the actual
     decode.
@@ -33,7 +33,7 @@ correct — see the class docstring.
 *set* — a `.shp` main file plus sibling `.shx`/`.dbf`/`.prj`/`.cpg` that its parser reads by shared
 basename. A format declares those siblings in its `companions` tuple. Companions are **not** in
 `DRAWING_EXTS`: the scan/build/mapping-grid layers still see one logical drawing (the `.shp`), while
-the upload layer (`imports.py`) additionally accepts the companions — gated by `sniff_companion`
+the upload layer (`uploads.py`) additionally accepts the companions — gated by `sniff_companion`
 and derived `COMPANION_EXTS` — and writes them into the same folder so the parser finds them at
 extract time. Companions carry weak/absent magic, so their sniff is only a first-line upload filter;
 the real validation is the parser running in the isolated render subprocess, same as every decoder.
@@ -42,7 +42,7 @@ Isolation contract (mirrors `preprocess.py`'s): the module top level is **pure s
 Django, no pypdfium2/Pillow, no geospatial parsers — so importing it into the long-lived worker
 loads no native decoder. Each handler **lazy-imports its decoder/parser inside its render/extract
 methods**, which run only in the isolated render subprocess. That is what makes this module safe
-to import from package code: `imports.py` may import `drawing_formats`, but must still NOT import
+to import from package code: `uploads.py` may import `drawing_formats`, but must still NOT import
 `preprocess` (the engine), which would pull the decoders into the worker.
 
 **Optional-format gating (PKG-1).** The default install carries only the always-present formats
@@ -60,6 +60,7 @@ restart (the same reload the deployment already requires after any Python change
 
 import importlib.util
 import io
+import itertools
 import math
 import os
 import shutil
@@ -357,6 +358,9 @@ class DrawingFormat:
       companions      sibling extensions that ride along with the primary file (a Shapefile set),
                       NOT themselves drawings — see the module docstring's companion note. Empty for
                       the common self-contained single-file format.
+      size_unit       unit `page_sizes` reports in ('pt' for a PDF's points), or "" when the format
+                      has no true page size. Two page sizes are only comparable when their units
+                      match — see `page_sizes`.
     """
 
     name = ""
@@ -367,6 +371,7 @@ class DrawingFormat:
     requires_binary = ()
     extra = ""
     companions = ()
+    size_unit = ""
 
     def available(self):
         """True if this format's decoder/binary is installed, so it should be offered for import.
@@ -450,6 +455,19 @@ class DrawingFormat:
         `preprocess.build_building_from_pdfs`). Never raises — an unreadable source counts as 1."""
         return 1
 
+    def page_sizes(self, path):
+        """Physical size of each mappable page as ``[[w, h], …]`` in `size_unit`, or None when this
+        format has no true page size. Never raises (None on any failure), like `page_count`.
+
+        Only a **vector page** format has one: a PDF page carries its size in points. A raster
+        deliberately reports None — its pixel dimensions are a scan *resolution*, not a sheet size
+        (the same 34x22 sheet scanned at 200 and 400 dpi differs by 4x in pixels at identical
+        physical size), so treating them as one would mislead every consumer that compares two
+        sheets. The wizard uses this to re-anchor the marked floor-code region onto a
+        differently-shaped sheet (`ImportRegions.adapt`), which is why None must mean "unknown"
+        rather than a guess."""
+        return None
+
 
 class PdfFormat(DrawingFormat):
     """PDF floor/siteplan drawings, rendered with PDFium. Facility PDFs carry no text layer, so
@@ -461,6 +479,7 @@ class PdfFormat(DrawingFormat):
     exts = (".pdf",)
     requires = "pypdfium2"
     requires_module = ("pypdfium2",)   # a core dep — always installed, so PDF is always available
+    size_unit = "pt"   # PDFium reports page geometry in PostScript points
 
     RENDER_SCALE = 2.0   # full floor-plan render scale; coords are normalized 0..1 downstream
     THUMB_SCALE = 0.6    # wizard thumbnail scale (legible enough to identify a plan)
@@ -510,6 +529,15 @@ class PdfFormat(DrawingFormat):
         except Exception:
             return 1
 
+    def page_sizes(self, path):
+        # Geometry only — `get_size()` reads the page box, so a 300-page set costs no rasterizing.
+        try:
+            import pypdfium2 as pdfium
+            doc = pdfium.PdfDocument(path)
+            return [[float(w), float(h)] for w, h in (pg.get_size() for pg in doc)]
+        except Exception:
+            return None
+
     def render_full(self, path, fmt="WEBP", page=0, quality=1.0):
         try:
             pg = self._page(path, page)
@@ -517,7 +545,8 @@ class PdfFormat(DrawingFormat):
             buf = io.BytesIO()
             pil.save(buf, fmt, **save_kwargs(fmt))
             return buf.getvalue(), pil.width, pil.height
-        except Exception:
+        except Exception as e:
+            print("WARN render %s: %s" % (path, e), file=sys.stderr)
             return None
 
     def render_thumb(self, path, out_path):
@@ -586,7 +615,8 @@ class RasterFormat(DrawingFormat):
             buf = io.BytesIO()
             im.save(buf, fmt, **save_kwargs(fmt))
             return buf.getvalue(), im.width, im.height
-        except Exception:
+        except Exception as e:
+            print("WARN render %s: %s" % (path, e), file=sys.stderr)
             return None
 
     def render_thumb(self, path, out_path):
@@ -807,6 +837,14 @@ class VsdFormat(SofficeFormat):
         return head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
 
 
+def _cap_features(feats, cap):
+    """Materialize a feature generator, stopping after `cap` items — the one shape every OVERLAY
+    decoder (Shapefile, GeoJSON, KML) pours its features through, so a new format has one idiom
+    to copy, not three. `islice` only pulls as many items as `cap` needs, so a source with more
+    than `cap` features never finishes generating the rest."""
+    return list(itertools.islice(feats, cap))
+
+
 # dBASE version flags (byte 0 of a `.dbf`) accepted for a Shapefile's attribute companion. The
 # low nibble is the dBASE level (III/IV/5) and the high bits flag a memo/DBT; this is the common
 # real-world set. A lenient upload gate only — pyshp does the real parse in the subprocess.
@@ -869,16 +907,15 @@ class ShapefileFormat(DrawingFormat):
         if not all_points:
             return None
         proj = OverlayProjector(all_points, crs=self._crs_kind(path), align=align)
-        feats = []
-        for i, shp in enumerate(shapes):
-            if len(feats) >= self.MAX_FEATURES:
-                break
-            props = self._record_props(reader, i)
-            for feat in self._shape_features(shp, proj.project):
-                feat["props"] = props
-                feats.append(feat)
-                if len(feats) >= self.MAX_FEATURES:
-                    break
+
+        def _feats():
+            for i, shp in enumerate(shapes):
+                props = self._record_props(reader, i)
+                for feat in self._shape_features(shp, proj.project):
+                    feat["props"] = props
+                    yield feat
+
+        feats = _cap_features(_feats(), self.MAX_FEATURES)
         if not feats:
             return None
         return {"features": feats, **proj.meta()}
@@ -1004,13 +1041,14 @@ class GeoJsonFormat(DrawingFormat):
         if not all_points:
             return None
         proj = OverlayProjector(all_points, crs=OverlayProjector.GEOGRAPHIC, align=align)
-        feats = []
-        for geom, props in geoms:
-            for feat in self._geom_features(geom, proj.project):
-                feat["props"] = props
-                feats.append(feat)
-                if len(feats) >= self.MAX_FEATURES:
-                    return {"features": feats, **proj.meta()}
+
+        def _feats():
+            for geom, props in geoms:
+                for feat in self._geom_features(geom, proj.project):
+                    feat["props"] = props
+                    yield feat
+
+        feats = _cap_features(_feats(), self.MAX_FEATURES)
         if not feats:
             return None
         return {"features": feats, **proj.meta()}
@@ -1215,16 +1253,17 @@ class KmlFormat(DrawingFormat):
         if not all_points:
             return None
         proj = OverlayProjector(all_points, crs=OverlayProjector.GEOGRAPHIC, align=align)
-        feats = []
-        for kind, pts, props in items:
-            if kind == "point":
-                feat = {"type": "point", "coords": list(proj.project(*pts[0]))}
-            else:
-                feat = {"type": kind, "coords": [list(proj.project(x, y)) for x, y in pts]}
-            feat["props"] = props
-            feats.append(feat)
-            if len(feats) >= self.MAX_FEATURES:
-                break
+
+        def _feats():
+            for kind, pts, props in items:
+                if kind == "point":
+                    feat = {"type": "point", "coords": list(proj.project(*pts[0]))}
+                else:
+                    feat = {"type": kind, "coords": [list(proj.project(x, y)) for x, y in pts]}
+                feat["props"] = props
+                yield feat
+
+        feats = _cap_features(_feats(), self.MAX_FEATURES)
         if not feats:
             return None
         return {"features": feats, **proj.meta()}
@@ -1394,7 +1433,7 @@ FORMATS = (PdfFormat(), PngFormat(), JpegFormat(), GifFormat(),
            KmlFormat(), KmzFormat())
 
 # Accepted source extensions, derived from the registry (was hand-duplicated in preprocess.py,
-# imports.py, and import-uploader.js). Only *available* formats contribute (an uninstalled extra's
+# uploads.py, and import-uploader.js). Only *available* formats contribute (an uninstalled extra's
 # format is recognized by `format_for`/`install_hint_for` for a helpful upload error, but is not
 # offered — see PKG-1). Probed once at import; a newly-installed extra takes effect on worker
 # restart. `endswith` accepts this tuple directly.

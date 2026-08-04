@@ -52,7 +52,7 @@ _BODY_STYLE = {
 
 # Room-embed crop zoom (how much surrounding floor the cropped per-room embed pulls in):
 # 1.0 = tight pad-only crop, higher = wider. Editable in-app via the Settings page; these
-# bound it on both write (the Settings view) and read (`RoomEmbedSettings.zoom`), the single source
+# bound it on both write (the Settings view) and read (`PluginSettings.zoom`), the single source
 # of truth for the range. `room_viewbox`'s own default param mirrors `ZOOM_DEFAULT`.
 ZOOM_MIN = 1.0
 ZOOM_MAX = 5.0
@@ -80,7 +80,7 @@ DEVICE_EMBED_CROP_FRAC = 0.25
 
 # Room-embed footprint: how much of its Location-page column the cropped embed occupies, as a
 # percent. Independent of zoom (magnification) — it drives a `max-width` on the template wrapper,
-# not the viewBox. Bounded on both write (Settings view) and read (`RoomEmbedSettings.size`).
+# not the viewBox. Bounded on both write (Settings view) and read (`PluginSettings.size`).
 SIZE_MIN = 40
 SIZE_MAX = 100
 SIZE_DEFAULT = 100
@@ -141,7 +141,7 @@ AP_COUNT_SCOPE_DEFAULT = 'none'
 
 def clamp_zoom(value):
     """Coerce `value` to a float within `[ZOOM_MIN, ZOOM_MAX]`, or `ZOOM_DEFAULT` if it
-    isn't a finite number. Shared by the Settings view (write) and `RoomEmbedSettings.zoom`
+    isn't a finite number. Shared by the Settings view (write) and `PluginSettings.zoom`
     (read) so a stored value is sane even if edited outside the form (admin/REST)."""
     try:
         z = float(value)
@@ -154,7 +154,7 @@ def clamp_zoom(value):
 
 def clamp_embed_size(value):
     """Coerce `value` to a float within `[SIZE_MIN, SIZE_MAX]`, or `SIZE_DEFAULT` if it isn't a
-    finite number. Shared by the Settings view (write) and `RoomEmbedSettings.size` (read) so a
+    finite number. Shared by the Settings view (write) and `PluginSettings.size` (read) so a
     stored value is sane even if edited outside the form (admin/REST)."""
     try:
         s = float(value)
@@ -178,7 +178,7 @@ def clamp_floor_label_field(value):
     return value if value in FLOOR_LABEL_FIELDS else FLOOR_LABEL_FIELD_DEFAULT
 
 
-def write_mode_enabled():
+def write_mode_enabled(settings=None):
     """True when the operator has switched **write mode** on (LOC-2) — the runtime replacement for
     the old install-wide `allow_location_create` `PLUGINS_CONFIG` flag. Read from the single
     `kind='settings'` blob's `write_mode` key (default `False` when the row or key is absent), so the
@@ -192,12 +192,14 @@ def write_mode_enabled():
     `window.MAP.writeMode`, which is UX only — each endpoint re-checks it here.
 
     Lives beside the other settings-blob resolvers (both `views` and `frontend_api` import
-    `previews`, avoiding a view↔api import cycle)."""
-    blob = FacilityMapBlob.objects.filter(kind='settings', key='').first()
-    return bool(blob and blob.data.get('write_mode'))
+    `previews`, avoiding a view↔api import cycle). A convenience wrapper for callers that need
+    this one setting; pass an existing `PluginSettings` to reuse its single settings-row query,
+    and a caller reading several settings should build one instance and thread it through these
+    wrappers rather than letting each issue its own query."""
+    return (settings or PluginSettings()).write_mode
 
 
-def inline_room_creation_enabled():
+def inline_room_creation_enabled(settings=None):
     """True when the **inline room creation** write add-on is switched on (SET-5) — the feature
     switch that lets a permitted user create a room's NetBox Location from the floor bind panel.
     Read from the single `kind='settings'` blob's `inline_room_creation` key, so the Settings-page
@@ -213,11 +215,10 @@ def inline_room_creation_enabled():
     makes the pre-SET-5 behaviour the exact behaviour an upgrader keeps — and it exposes nothing new,
     because write mode is itself off by default and gates this. A fresh install therefore reaches the
     same place as before: turn write mode on, and inline creation is available to users holding
-    `dcim.add_location`."""
-    blob = FacilityMapBlob.objects.filter(kind='settings', key='').first()
-    if blob is None:
-        return True
-    return bool(blob.data.get('inline_room_creation', True))
+    `dcim.add_location`.
+
+    Takes an optional `PluginSettings` to reuse, like every wrapper here."""
+    return (settings or PluginSettings()).inline_room_creation
 
 
 def clamp_ap_count_scope(value):
@@ -301,7 +302,7 @@ def expand_ap_name_template(template, room_name, room_slug, role_short, asset_ta
                     .replace('{asset_tag}', tag))
 
 
-def ap_tool_enabled():
+def ap_tool_enabled(settings=None):
     """True when the operator has switched the **access-point tool** on (DEV-3). Read from the single
     `kind='settings'` blob's `ap_tool` key (default `False` when the row or key is absent), so the
     Settings-page toggle takes effect without a worker restart.
@@ -313,12 +314,13 @@ def ap_tool_enabled():
     browser mirrors this one via `window.MAP.apTool`. Sits beside `write_mode_enabled`/
     `inline_room_creation_enabled`, the write add-on switches whose shape it follows (SET-5; the
     Settings page disables all three add-on rows while the master gate is off, so this value only
-    ever changes with write mode already on — but it is stored, and re-checked, independently)."""
-    blob = FacilityMapBlob.objects.filter(kind='settings', key='').first()
-    return bool(blob and blob.data.get('ap_tool'))
+    ever changes with write mode already on — but it is stored, and re-checked, independently).
+
+    Takes an optional `PluginSettings` to reuse, like every wrapper here."""
+    return (settings or PluginSettings()).ap_tool
 
 
-def todos_enabled():
+def todos_enabled(settings=None):
     """True when the operator has switched the **to-do feature** on (ADDON-4). Read from the single
     `kind='settings'` blob's `todos` key (default `False` when the row or key is absent), so the
     Settings-page toggle takes effect without a worker restart. Sits beside `ap_tool_enabled`, whose
@@ -333,12 +335,13 @@ def todos_enabled():
     Defaults **off** like `ap_tool`/`write_mode` (not on like `inline_room_creation_enabled`, whose
     asymmetry is a deliberate back-compat exception this must not copy) — the core ships without the
     feature and the operator, or a future setup wizard, turns it on. Being a plain install-wide
-    boolean in the settings blob is what keeps it wizard-settable the same way the toggle sets it."""
-    blob = FacilityMapBlob.objects.filter(kind='settings', key='').first()
-    return bool(blob and blob.data.get('todos'))
+    boolean in the settings blob is what keeps it wizard-settable the same way the toggle sets it.
+
+    Takes an optional `PluginSettings` to reuse, like every wrapper here."""
+    return (settings or PluginSettings()).todos
 
 
-def render_hq_enabled():
+def render_hq_enabled(settings=None):
     """True when the operator has switched **high-quality floor-plan rendering** on (READ-1). Read
     from the single `kind='settings'` blob's `render_hq` key (default `False` when the row or key is
     absent), so the Settings-page toggle takes effect without a worker restart. Sits beside
@@ -346,12 +349,14 @@ def render_hq_enabled():
 
     Unlike the other switches this one changes nothing until the **next import/rebuild**: it is read
     by `imports.RenderRunner` when it spawns a build, and already-rendered floor images keep serving
-    (the manifest stores filenames + per-sheet pixel dims, so only a rebuild re-renders)."""
-    blob = FacilityMapBlob.objects.filter(kind='settings', key='').first()
-    return bool(blob and blob.data.get('render_hq'))
+    (the manifest stores filenames + per-sheet pixel dims, so only a rebuild re-renders).
+
+    Takes an optional `PluginSettings` to reuse, like every wrapper here — and `RenderRunner.run`
+    resolves it **once** per run rather than per decision that depends on it."""
+    return (settings or PluginSettings()).render_hq
 
 
-def ap_settings():
+def ap_settings(settings=None):
     """The access-point tool's configuration from the single `kind='settings'` blob, resolved and
     clamped in one read: `{'enabled': bool, 'device_role': int|None, 'name_template': str,
     'count_scope': str}`.
@@ -360,37 +365,105 @@ def ap_settings():
     exactly like `room_embed_*`/`facility_grouping` were) or hand-edited outside the Settings page
     still resolves to something usable. Callers: `views.MapView` (stamping `window.MAP`) and
     `frontend_api._ap_write_gate`, which passes it on to the name-suggestion/Device-create endpoints
-    it guards (DEV-5) so they gate and expand a name off a single settings read."""
-    blob = FacilityMapBlob.objects.filter(kind='settings', key='').first()
-    data = blob.data if blob else {}
-    try:
-        template = clean_ap_name_template(data.get('ap_name_template'))
-    except ValueError:
-        # Only reachable for a value written outside the Settings page (admin/REST/fixture); the
-        # POST path refuses these. Fall back rather than raise — this runs during a page render.
-        template = AP_NAME_TEMPLATE_DEFAULT
-    return {
-        'enabled': bool(data.get('ap_tool')),
-        'device_role': clamp_ap_device_role(data.get('ap_device_role')),
-        'name_template': template,
-        'count_scope': clamp_ap_count_scope(data.get('ap_count_scope')),
-    }
+    it guards (DEV-5) so they gate and expand a name off a single settings read.
+
+    Takes an optional `PluginSettings` to reuse, like every wrapper here."""
+    return (settings or PluginSettings()).ap
 
 
-class RoomEmbedSettings:
-    """The per-room-embed controls from the single `kind='settings'` blob, loaded once.
+class PluginSettings:
+    """Every value in the single install-wide `settings` blob, read in one query.
 
-    Instantiate once per render — the per-room embed reads all three of `.zoom`/`.size`/
-    `.orientation`, and `__init__` queries the shared settings row a single time, so the three
-    reads never re-query it (the behaviour the old free-function + threaded-dict dance had to
-    arrange by hand). Each property re-clamps its stored value and falls back to the matching
-    default when the row, the key, or a sane value is absent — so a blob written before a setting
-    existed, or edited outside the form (admin/REST), still reads sane.
+    The **one** place that knows how the settings row is fetched and how each stored value is
+    clamped on the way out. Instantiate once per render and read as many properties as you need —
+    `__init__` queries the row a single time, so a caller reading five settings costs one query
+    instead of five (the behaviour the old free-function + threaded-dict dance had to arrange by
+    hand). Each property re-clamps its stored value and falls back to the matching default when the
+    row, the key, or a sane value is absent — so a blob written before a setting existed, or edited
+    outside the form (admin/REST), still reads sane.
+
+    The convenience wrappers below/above (`write_mode_enabled`, `todos_enabled`, `ap_settings`, …)
+    each delegate to one property here and document what the setting *means*; this class documents
+    only how it is stored and defaulted. Each of them takes an optional instance, so a caller
+    holding one threads it through rather than paying a query per wrapper call — the shape
+    `views.MapView.get_context_data` and `RenderRunner.run` use.
+
+    It is the settings-row reader for the **whole** plugin, `facilities` included: that module's
+    three settings (`facility_grouping`, `facility_org_modes`, `default_facility`) read through
+    `get` below and clamp on their own side, since their vocabularies live there.
+
+    **Deliberately not cached across requests.** Every one of those wrappers promises its toggle
+    "takes effect without a worker restart" — which holds only if the gunicorn workers, the
+    `netbox-rq` workers and the render subprocess all see a write immediately. A process-local
+    cache would break that silently (the write lands in worker A while worker B keeps serving the
+    old value), and NetBox's `CACHES` backend isn't guaranteed to be shared, so the failure would
+    be invisible. Loading once per *instance* collapses the N+1 without any staleness surface;
+    don't "optimise" it into a cache.
+
+    The row is install-wide (MULTI-1), so it is addressed by its full key — `facility=''` included,
+    matching `facilities.grouping`/`default_facility` — never by a loose `kind`/`key` match.
     """
 
     def __init__(self):
-        blob = FacilityMapBlob.objects.filter(kind='settings', key='').first()
+        blob = FacilityMapBlob.objects.filter(kind='settings', facility='', key='').first()
         self._data = (blob.data if blob else None) or {}
+
+    def get(self, key, default=None):
+        """One **raw** stored value, unclamped — the escape hatch for the three settings whose
+        clamp cannot live in this class: `facility_grouping`, `facility_org_modes` and
+        `default_facility` are clamped against vocabularies (`GROUPING_CHOICES`,
+        `ORG_MODE_CHOICES`) and a reachability check that live in `facilities`, which imports
+        *this* module — so moving those clamps here would be an import cycle. `facilities.grouping`
+        /`org_modes`/`default_facility` therefore keep their own clamps and take an instance of this
+        class to read through, which is what makes the settings row a single query per request
+        across both modules. Every setting whose clamp *can* live here gets a property instead;
+        don't reach for this to bypass one."""
+        return self._data.get(key, default)
+
+    @property
+    def write_mode(self):
+        """True when write mode — the master gate on NetBox core writes — is on (`write_mode_enabled`)."""
+        return bool(self._data.get('write_mode'))
+
+    @property
+    def inline_room_creation(self):
+        """True when the inline room-creation add-on is on (`inline_room_creation_enabled`).
+
+        Absent reads as **on**, unlike its `write_mode`/`ap_tool` siblings — the deliberate
+        pre-SET-5 back-compat exception documented on the wrapper. A stored `False` is never
+        mistaken for "not configured", since the endpoint only ever writes the key explicitly."""
+        return bool(self._data.get('inline_room_creation', True))
+
+    @property
+    def ap_tool(self):
+        """True when the access-point tool's own feature switch is on (`ap_tool_enabled`)."""
+        return bool(self._data.get('ap_tool'))
+
+    @property
+    def todos(self):
+        """True when the to-do feature is on (`todos_enabled`)."""
+        return bool(self._data.get('todos'))
+
+    @property
+    def render_hq(self):
+        """True when high-quality floor-plan rendering is on (`render_hq_enabled`)."""
+        return bool(self._data.get('render_hq'))
+
+    @property
+    def ap(self):
+        """The access-point tool's resolved configuration dict (`ap_settings`)."""
+        try:
+            template = clean_ap_name_template(self._data.get('ap_name_template'))
+        except ValueError:
+            # Only reachable for a value written outside the Settings page (admin/REST/fixture); the
+            # POST path refuses these. Fall back rather than raise — this runs during a page render.
+            template = AP_NAME_TEMPLATE_DEFAULT
+        return {
+            'enabled': self.ap_tool,
+            'device_role': clamp_ap_device_role(self._data.get('ap_device_role')),
+            'name_template': template,
+            'count_scope': clamp_ap_count_scope(self._data.get('ap_count_scope')),
+        }
 
     @property
     def zoom(self):
@@ -864,8 +937,8 @@ def room_arrows(floor_key, room_id, w, h, head_px=ARROW_HEAD_PX, facility=''):
 
     Reads the floor's `kind='annotations'` shard row (`key=floor_key`, CONC-1) `['arrows']` and keeps
     only the arrows the editor auto-bound to this room (`a['room'] == room_id`, the frontend room id
-    persisted verbatim as `Room.room_id`). For the per-room embed only — the caller passes
-    `crop_to.room_id`, so the result is already permission-scoped to a room the user may view.
+    persisted verbatim as `Room.room_id`). For the per-room embed only — the caller passes the
+    embedded room's `room_id`, so the result is already permission-scoped to a room the user may view.
 
     Each returned dict — `{'line', 'head', 'color'}` — mirrors `FloorEditor._drawArrows`
     (`static/.../floor-editor.js`) over the combined-canvas `w`×`h` (so it lines up with the

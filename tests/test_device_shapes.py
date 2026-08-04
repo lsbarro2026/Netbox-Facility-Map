@@ -9,11 +9,20 @@ The classification rules are a 1:1 lockstep mirror of the frontend `DeviceShapes
 (`static/.../device-shapes.js`); these tests pin the JS-faithful behaviour so a divergence in
 either file is caught (incl. the `\\b` word-boundary tokens, and that a slug alone that only
 matches via the role *name* still resolves).
+
+That mirror is also checked from **both** directions: the shared-corpus tests at the bottom of this
+file drive `tests/js/fixtures/device-glyph-cases.json` through the Python port, and
+`tests/js/device-shapes.test.js` drives the very same cases through the JS one. Before that corpus
+existed the lockstep was only ever asserted from this side, so a JS-only drift went unnoticed.
 """
 
-import pytest
+import json
+from pathlib import Path
 
-from netbox_facilitymap.device_shapes import DeviceShapes
+import pytest
+from django.conf import settings
+
+from netbox_facilitymap.device_shapes import DeviceShapes, custom_rules
 
 
 # ---- type_for (stateless, no DB) ----
@@ -37,12 +46,37 @@ def test_type_for_ap_word_boundary_tokens():
     assert DeviceShapes.type_for({'kind': 'device', 'label': 'kneecap'}) != 'ap'
 
 
-def test_type_for_slug_only_access_point_needs_the_name():
-    # The 'access-point' slug alone can't match (`access ?point` is defeated by the hyphen and
-    # there is no standalone 'ap' substring) — exactly as the JS behaves; the role NAME carries it.
-    assert DeviceShapes.type_for({'kind': 'device'}, {'role_slug': 'access-point'}) == 'generic'
+def test_type_for_slug_only_access_point_resolves_via_normalization():
+    # `_normalize` folds the hyphen to a space, so the 'access-point' slug alone now matches
+    # `access ?point` — the deliberate tolerance win over the old hyphen-defeated behaviour.
+    assert DeviceShapes.type_for({'kind': 'device'}, {'role_slug': 'access-point'}) == 'ap'
     assert DeviceShapes.type_for(
         {'kind': 'device'}, {'role_slug': 'access-point', 'role_name': 'Access Point'}) == 'ap'
+
+
+def test_type_for_normalizes_case_camel_and_separators():
+    # The same role written every plausible way — spaced, upper, camelCase, hyphen, underscore —
+    # all resolve identically (the `_normalize` lockstep with the JS). This is the tolerance the
+    # user asked for: a NetBox role could be any of these.
+    for value in ('access point', 'ACCESS POINT', 'AccessPoint', 'access-point', 'Access_Point'):
+        assert DeviceShapes.type_for({'kind': 'device'}, {'role_name': value}) == 'ap', value
+
+
+def test_type_for_access_switch_beats_generic_switch():
+    # 'access switch' (any spelling) classifies as the distinct access/edge glyph, NOT the broad
+    # `switch` — its rule sits ahead of the generic one. A plain 'switch' still falls through.
+    for value in ('Access Switch', 'access-switch', 'AccessSwitch', 'ASW-1'):
+        assert DeviceShapes.type_for({'kind': 'device'}, {'role_name': value}) == 'accessswitch', value
+    assert DeviceShapes.type_for({'kind': 'device'}, {'role_name': 'Core Switch'}) == 'switch'
+
+
+def test_type_for_outlet_distinct_from_pdu():
+    # A wall outlet/receptacle reads as `outlet`; power strips / PDUs stay `pdu`. 'outlet' no
+    # longer routes to pdu (the rule moved), so the two are visually distinguishable.
+    for value in ('Wall Outlet', 'outlet', 'Socket', 'receptacle'):
+        assert DeviceShapes.type_for({'kind': 'device'}, {'role_name': value}) == 'outlet', value
+    for value in ('PDU', 'Rack PDU', 'Power Strip'):
+        assert DeviceShapes.type_for({'kind': 'device'}, {'role_name': value}) == 'pdu', value
 
 
 def test_type_for_falls_back_to_device_name_then_label():
@@ -60,6 +94,102 @@ def test_type_for_rule_order_matches_js():
     # wireless token and 'host' resolves to 'ap', not 'server' (JS comment on that ordering).
     assert DeviceShapes.type_for(
         {'kind': 'device'}, {'name': 'Wireless Host Controller'}) == 'ap'
+
+
+# ---- role_glyphs: the operator's own vocabulary (INTL-1) ----
+
+@pytest.fixture
+def role_glyphs(monkeypatch):
+    """Set `PLUGINS_CONFIG role_glyphs` for one test. `custom_rules` memoizes on the raw setting
+    value, so swapping it here is picked up rather than serving a stale cache."""
+    def apply(value):
+        monkeypatch.setitem(
+            settings.PLUGINS_CONFIG['netbox_facilitymap'], 'role_glyphs', value)
+    return apply
+
+
+def test_role_glyphs_unset_leaves_english_rules_untouched():
+    # The shipped default is empty, so an install that configures nothing is exactly as before.
+    assert custom_rules() == ()
+    assert DeviceShapes.type_for({'kind': 'device', 'label': 'Commutateur'}) == 'generic'
+
+
+def test_role_glyphs_classifies_a_non_english_role(role_glyphs):
+    role_glyphs({'switch': ['commutateur'], 'firewall': ['pare-feu']})
+    assert DeviceShapes.type_for({'kind': 'device'}, {'role_name': 'Commutateur'}) == 'switch'
+    # The keyword is folded like the haystack is, so the hyphen in 'pare-feu' matches 'Pare Feu'.
+    assert DeviceShapes.type_for({'kind': 'device'}, {'role_name': 'Pare-Feu'}) == 'firewall'
+    assert DeviceShapes.type_for({'kind': 'device'}, {'role_slug': 'pare-feu'}) == 'firewall'
+
+
+def test_role_glyphs_merges_rather_than_replaces(role_glyphs):
+    # Adding a French vocabulary must not cost the English one — merge, not replace.
+    role_glyphs({'switch': ['commutateur']})
+    assert DeviceShapes.type_for({'kind': 'device', 'label': 'Core Switch'}) == 'switch'
+    assert DeviceShapes.type_for({'kind': 'device', 'label': 'AP-01'}) == 'ap'
+
+
+def test_role_glyphs_win_over_a_conflicting_builtin_rule(role_glyphs):
+    # Custom rules are tried first, so an operator can override a built-in classification: 'panel'
+    # normally resolves to patchpanel, and here it is claimed for 'outlet' instead.
+    role_glyphs({'outlet': ['panel']})
+    assert DeviceShapes.type_for({'kind': 'device', 'label': 'Panel'}) == 'outlet'
+
+
+def test_role_glyphs_match_whole_words_only(role_glyphs):
+    # Same boundary semantics as the built-in `\bap\b` tokens — a keyword never fires mid-word.
+    role_glyphs({'switch': ['sw']})
+    assert DeviceShapes.type_for({'kind': 'device', 'label': 'SW 3'}) == 'switch'
+    assert DeviceShapes.type_for({'kind': 'device', 'label': 'Sweater'}) == 'generic'
+
+
+def test_role_glyphs_match_multi_word_phrases(role_glyphs):
+    role_glyphs({'ap': ['punto de acceso']})
+    assert DeviceShapes.type_for({'kind': 'device'}, {'role_name': 'Punto de Acceso'}) == 'ap'
+    # The phrase must appear contiguously; the words alone are not enough.
+    assert DeviceShapes.type_for({'kind': 'device', 'label': 'punto final'}) == 'generic'
+
+
+def test_role_glyphs_support_non_latin_scripts(role_glyphs):
+    # The regression the normalizer widening fixes: `[^a-z0-9]` used to delete these characters
+    # outright, leaving an empty haystack that no keyword could ever match.
+    role_glyphs({'patchpanel': ['パッチパネル'], 'firewall': ['экран']})
+    assert DeviceShapes.type_for({'kind': 'device'}, {'role_name': 'パッチパネル'}) == 'patchpanel'
+    assert DeviceShapes.type_for({'kind': 'device'}, {'role_name': 'Пожарный экран'}) == 'firewall'
+
+
+def test_normalize_keeps_unicode_letters_and_digits():
+    assert DeviceShapes._normalize({'label': 'Pare-Feu #2'}, None) == 'pare feu 2'
+    assert DeviceShapes._normalize({'label': 'パッチパネル'}, None) == 'パッチパネル'
+    # ASCII behaviour is unchanged, incl. the camelCase split and the separator fold.
+    assert DeviceShapes._normalize({'label': 'AccessPoint_01'}, None) == 'access point 01'
+
+
+def test_role_glyphs_rejects_malformed_config_without_raising(role_glyphs):
+    # A bad setting must degrade to the built-in rules, never break every map render.
+    role_glyphs({'not-a-glyph-type': ['x'],      # unknown type → dropped
+                 'switch': 'commutateur',        # bare string, not a list → dropped
+                 'router': [],                   # no keywords → dropped
+                 'ups': ['---'],                 # folds away to nothing → dropped
+                 'storage': ['almacenamiento']})  # the one valid entry survives
+    assert custom_rules() == (('storage', ('almacenamiento',)),)
+    assert DeviceShapes.type_for({'kind': 'device', 'label': 'Almacenamiento'}) == 'storage'
+    assert DeviceShapes.type_for({'kind': 'device', 'label': 'Commutateur'}) == 'generic'
+    role_glyphs(['not', 'a', 'dict'])
+    assert custom_rules() == ()
+
+
+def test_role_glyphs_preserve_configured_order(role_glyphs):
+    # Two custom rules matching the same haystack resolve in insertion order, so an operator can
+    # order their own vocabulary the way the built-in list is ordered.
+    role_glyphs({'ap': ['borne'], 'switch': ['borne']})
+    assert DeviceShapes.type_for({'kind': 'device', 'label': 'Borne'}) == 'ap'
+
+
+def test_role_glyphs_never_override_a_rack(role_glyphs):
+    # `kind` still wins outright — a rack is a rack whatever the vocabulary says.
+    role_glyphs({'ap': ['armoire']})
+    assert DeviceShapes.type_for({'kind': 'rack', 'label': 'Armoire 3'}) == 'rack'
 
 
 # ---- box (stateless, no DB) ----
@@ -96,6 +226,101 @@ def test_glyph_coords_are_trimmed_strings():
     # Whole numbers render without a trailing '.0'; fractions keep up to 2 places.
     body = DeviceShapes.glyph('rack', 30, 40)[0]
     assert body['w'] == '30' and body['x'] == '-15'
+
+
+def test_glyph_lucide_type_is_body_chip_plus_transformed_icon_paths():
+    # An appliance type (server) renders the body chip + its vendored Lucide icon: every icon
+    # element is a `path` carrying the scale+centre `transform` that fits the 24×24 glyph into
+    # the box, all in `dev-line`. This is the embed side of the "pull from Lucide" work.
+    g = DeviceShapes.glyph('server', 22, 18)
+    assert g[0]['tag'] == 'rect' and g[0]['cls'] == 'dev-body'          # the chip
+    icon = g[1:]
+    assert len(icon) == len(DeviceShapes._LUCIDE['server'])
+    assert all(p['tag'] == 'path' and p['cls'] == 'dev-line' for p in icon)
+    assert all('transform' in p and p['transform'].startswith('translate(') for p in icon)
+    # Non-icon (bespoke) glyphs never carry a transform.
+    assert all('transform' not in p for p in DeviceShapes.glyph('ap', 16, 16))
+
+
+def test_glyph_outlet_is_faceplate_plus_two_slots():
+    # A wall outlet is a thin body chip with two receptacle slots (dev-port rects) — distinct
+    # from the generic box+dot and from the PDU's row of round outlets.
+    g = DeviceShapes.glyph('outlet', 12, 7)
+    assert g[0]['cls'] == 'dev-body'
+    ports = [p for p in g[1:] if p['tag'] == 'rect' and p['cls'] == 'dev-port']
+    assert len(ports) == 2
+
+
+def test_glyph_accessswitch_has_port_row_and_uplink():
+    # The access switch reads as a switch (body + several ports) but adds a separated uplink
+    # port, so it's distinguishable from the core `switch` glyph.
+    g = DeviceShapes.glyph('accessswitch', 24, 10)
+    ports = [p for p in g if p['tag'] == 'rect' and p['cls'] == 'dev-port']
+    assert len(ports) >= 3          # dense access-port row + the uplink SFP
+
+
+def test_box_new_types_are_all_narrower_than_the_rack():
+    # The cohesion invariant: the rack is the reference and the widest object; every device
+    # default (including the new accessswitch/outlet) is narrower than the rack's 30px.
+    rack_w = DeviceShapes.box('rack')['w']
+    for t in ('server', 'router', 'firewall', 'storage', 'ups', 'switch',
+              'accessswitch', 'patchpanel', 'pdu', 'outlet', 'ap', 'generic'):
+        assert DeviceShapes.box(t)['w'] < rack_w, t
+
+
+# ---- the shared JS/Python lockstep corpus ----
+
+_CORPUS = json.loads(
+    (Path(__file__).parent / 'js' / 'fixtures' / 'device-glyph-cases.json').read_text('utf-8'))
+
+
+def _args_for(case):
+    """Split a shape-neutral corpus case into this port's `(placement, item)` pair.
+
+    The corpus stores the classification *facts* flat, because the two ports take different item
+    shapes: Python reads `role_slug`/`role_name`/`name` off a flat mapping, while the JS reads a
+    nested `item.role.slug`/`item.role.name`. `tests/js/device-shapes.test.js` has the mirror of
+    this adapter. Keys the case omits stay absent on both sides."""
+    placement = {'kind': case.get('kind', 'device')}
+    if 'label' in case:
+        placement['label'] = case['label']
+    item = {k: case[k] for k in ('role_slug', 'role_name', 'name') if k in case}
+    return placement, (item or None)
+
+
+def _label(case):
+    """A readable id for a corpus case, so a failure names the input rather than an index."""
+    return json.dumps({k: v for k, v in case.items() if k not in ('note', 'want')},
+                      ensure_ascii=False, sort_keys=True)
+
+
+@pytest.mark.parametrize('case', _CORPUS['typeFor'], ids=_label)
+def test_shared_corpus_type_for_matches_the_js_tier(case):
+    """Every shared case classifies identically here and in `tests/js/device-shapes.test.js`.
+    A failure here with the JS tier green means `device_shapes.py` has drifted out of lockstep
+    (and vice-versa) — the rules are duplicated by hand, with no build step to share them."""
+    placement, item = _args_for(case)
+    assert DeviceShapes.type_for(placement, item) == case['want'], case.get('note', '')
+
+
+@pytest.mark.parametrize('case', _CORPUS['box'], ids=lambda c: c['type'])
+def test_shared_corpus_box_matches_the_js_tier(case):
+    assert DeviceShapes.box(case['type']) == {'w': case['w'], 'h': case['h']}
+
+
+@pytest.mark.parametrize('case', _CORPUS['normalize'], ids=_label)
+def test_shared_corpus_normalize_matches_the_js_tier(case):
+    placement, item = _args_for(case)
+    assert DeviceShapes._normalize(placement, item) == case['want'], case.get('note', '')
+
+
+def test_shared_corpus_is_not_silently_empty():
+    """Guard the harness itself: a renamed/moved fixture that parsed to an empty list would make
+    every parametrized test above vacuously pass, and the lockstep would quietly stop being
+    checked at all."""
+    assert len(_CORPUS['typeFor']) > 20
+    assert len(_CORPUS['box']) > 10
+    assert _CORPUS['normalize']
 
 
 # ---- placement_markers integration (DB) ----

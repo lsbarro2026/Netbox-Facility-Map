@@ -274,6 +274,27 @@ class SettingsPage {
         get: () => app.floorLabelField,
         set: (v) => this._saveFloorLabelField(v),
       },
+      {
+        category: 'Import & data',
+        label: 'NetBox organization',
+        tooltip: 'How this facility is modelled in NetBox: one Site per building, or one campus Site whose buildings are Locations. Applies to the active facility and steers future imports; nothing already imported changes. Fixed to campus mode under the Building / Location grouping, since buildings are Locations by design.',
+        type: 'select',
+        // Fixed public allowlist — lockstep with the server's facilities.ORG_MODE_CHOICES.
+        options: [['site-as-building', 'Site = building'],
+                  ['site-as-campus', 'Site = campus (buildings are Locations)']],
+        // Per-facility, unlike every other persisted row here: it reads and writes the ACTIVE
+        // facility's mode. Import-gated like the endpoint's IMPORT_PERM gate, and hidden until the
+        // facility list loads — that list is where the current mode is read from. `enabled`, not
+        // `show`, under the Location grouping (MODEL-8): a Location-subtree facility is
+        // campus-shaped by construction (the server's org_mode() override), so there is nothing
+        // to CHOOSE — but the row stays visible, disabled, with the tooltip explaining why, rather
+        // than silently vanishing (IMPORT-15). The import wizard's own note (`_orgModeNote`) no
+        // longer links here at all in this case, for the same reason.
+        show: () => app.canImport && !!app.facilities,
+        enabled: () => app.grouping !== 'location',
+        get: () => this._orgMode(),
+        set: (v) => this._saveOrgMode(v),
+      },
       // Write mode heads Add-ons ▸ Write add-ons (SET-5) — first in registry order, so first-seen
       // ordering renders it above the add-ons it gates. It is a pure gate: it says whether this
       // install may write to NetBox core at all, and each row below carries its own switch on top.
@@ -380,6 +401,16 @@ class SettingsPage {
         variant: () => 'danger',
         show: () => app.canReset,
         run: () => this._restoreArchive(),
+      },
+      {
+        category: 'Backup & restore',
+        label: 'Wipe all data',
+        tooltip: 'Delete every map, room, rack placement, rendered image and plugin setting, returning the plugin to a blank-slate install. Nothing else in NetBox is touched.',
+        type: 'action',
+        button: 'Wipe all data…',
+        variant: () => 'danger',
+        show: () => app.canReset,
+        run: () => this._confirmWipe(),
       },
     ];
   }
@@ -543,6 +574,22 @@ class SettingsPage {
     Toast.show('Default facility saved.');
   }
 
+  /** The active facility's organization mode (MODEL-6) — `App.orgMode()`, the single reader of that
+   *  per-facility fact (the import wizard steers its bind step off the same call). The row is
+   *  `!!app.facilities`-gated above, so the list is loaded by the time this renders. */
+  _orgMode() {
+    return this.app.orgMode();
+  }
+
+  /** Persist the active facility's organization mode (MODEL-6) through `App.setOrgMode()`, the
+   *  client's one write path (also used by the import wizard's inline "Switch to…" control) — this
+   *  wrapper only adds the row's own toast; a thrown error propagates to `_select`, which reverts
+   *  the dropdown. */
+  async _saveOrgMode(mode) {
+    await this.app.setOrgMode(mode);
+    Toast.show('NetBox organization saved.');
+  }
+
   /** Persist the floor-label field to the install-wide settings blob (SET-1). Updates the live
    *  `App` copy on success so a re-mount preselects it; a thrown error propagates to `_select`,
    *  which reverts the dropdown. */
@@ -634,61 +681,37 @@ class SettingsPage {
   }
 
   /** The one-time note shown when access point creation is first switched on in this browser
-   *  (SET-6), resolving `true` to open its configuration page / `false` to stay. Mirrors
-   *  `_confirmWriteMode`'s small centered dialog (reusing the `.fm-modal*` classes), but it is
+   *  (SET-6), resolving `true` to open its configuration page / `false` to stay. It is
    *  **informational, not consent**: there is no Cancel, because there is nothing to cancel — the
    *  add-on is already on and stays on however this is dismissed. It exists because the tool needs a
    *  device role before it will appear, so switching the add-on on and stopping there looks like
-   *  nothing happened. Backdrop or "Not now" resolves `false`. */
+   *  nothing happened. Backdrop, Escape, or "Not now" resolves `false`. */
   _noteApConfigure() {
-    return new Promise((resolve) => {
-      let done = false;
-      const finish = (ok) => { if (done) return; done = true; overlay.remove(); resolve(ok); };
-      const overlay = Dom.el('div', { class: 'fm-modal', onclick: (e) => { if (e.target === overlay) finish(false); } }, [
-        Dom.el('div', { class: 'fm-modal-panel' }, [
-          Dom.el('h3', {}, 'Access point creation is on'),
-          Dom.el('p', {},
-            'Before the tool appears in the floor editor, it needs a NetBox device role to create '
-            + 'access points with. You can also set how their suggested names are built.'),
-          Dom.el('p', { class: 'hint' },
-            'Everything is on the access points page, reachable any time from Configure on this row.'),
-          Dom.el('div', { class: 'fm-modal-actions' }, [
-            Dom.el('button', { onclick: () => finish(false) }, 'Not now'),
-            Dom.el('button', { class: 'primary', onclick: () => finish(true) }, 'Configure access points'),
-          ]),
-        ]),
-      ]);
-      document.body.append(overlay);
+    return Modal.confirm({
+      title: 'Access point creation is on',
+      body: 'Before the tool appears in the floor editor, it needs a NetBox device role to create '
+        + 'access points with. You can also set how their suggested names are built.',
+      hint: 'Everything is on the access points page, reachable any time from Configure on this row.',
+      cancelLabel: 'Not now',
+      confirmLabel: 'Configure access points',
     });
   }
 
   /** One-time consent modal for enabling write mode (LOC-2), resolving `true` to proceed / `false`
-   *  to cancel. Mirrors `_confirmRestore`'s small centered dialog (reusing the `.fm-modal*` classes),
-   *  but this one is informational — it spells out that write mode is the master gate on everything
-   *  the map writes into NetBox core, that each add-on behind it is switched on separately, and that
-   *  NetBox stays the source of truth. Backdrop or Cancel resolves `false`. */
+   *  to cancel. Informational rather than a warning — it spells out that write mode is the master
+   *  gate on everything the map writes into NetBox core, that each add-on behind it is switched on
+   *  separately, and that NetBox stays the source of truth. Backdrop, Escape, or Cancel resolves
+   *  `false`, and `_saveWriteMode` turns that into the rejection `_switch` reverts on. */
   _confirmWriteMode() {
-    return new Promise((resolve) => {
-      let done = false;
-      const finish = (ok) => { if (done) return; done = true; overlay.remove(); resolve(ok); };
-      const overlay = Dom.el('div', { class: 'fm-modal', onclick: (e) => { if (e.target === overlay) finish(false); } }, [
-        Dom.el('div', { class: 'fm-modal-panel' }, [
-          Dom.el('h3', {}, 'Enable write mode'),
-          Dom.el('p', {},
-            'Write mode is the master switch for everything this map writes into NetBox core — '
-            + 'creating room Locations from the bind panel, and creating access point Devices. '
-            + 'Nothing is written until you also switch on the individual add-on that does it.'),
-          Dom.el('p', { class: 'hint' },
-            'NetBox stays the source of truth. Model Locations there first where you can. This is an '
-            + 'install-wide setting; individual users still need the matching add permission '
-            + '(add-Location, add-Device) before they can create anything.'),
-          Dom.el('div', { class: 'fm-modal-actions' }, [
-            Dom.el('button', { onclick: () => finish(false) }, 'Cancel'),
-            Dom.el('button', { class: 'primary', onclick: () => finish(true) }, 'Enable write mode'),
-          ]),
-        ]),
-      ]);
-      document.body.append(overlay);
+    return Modal.confirm({
+      title: 'Enable write mode',
+      body: 'Write mode is the master switch for everything this map writes into NetBox core — '
+        + 'creating room Locations from the bind panel, and creating access point Devices. '
+        + 'Nothing is written until you also switch on the individual add-on that does it.',
+      hint: 'NetBox stays the source of truth. Model Locations there first where you can. This is an '
+        + 'install-wide setting; individual users still need the matching add permission '
+        + '(add-Location, add-Device) before they can create anything.',
+      confirmLabel: 'Enable write mode',
     });
   }
 
@@ -743,36 +766,42 @@ class SettingsPage {
     input.click();
   }
 
-  /** Destructive-restore confirmation. A single native confirm() (the reset idiom) can't carry
-   *  the pre-restore "download a backup first" safety net, so this is a small modal: it informs
-   *  that restoring replaces everything, offers a one-click current-state export, and only then
-   *  proceeds. Backdrop or Cancel dismisses it. */
-  _confirmRestore(file) {
-    const close = () => overlay.remove();
-    const backupBtn = Dom.el('button', {
-      onclick: () => { this._exportArchive(); backupBtn.textContent = '✓ Backup downloaded'; backupBtn.disabled = true; },
+  /** The pre-flight "export what you're about to lose" button both destructive dialogs carry. It
+   *  is body content, not a footer action: taking it is a detour that leaves the dialog open, and
+   *  it self-disables once used so a second click can't queue a duplicate download. */
+  _backupFirstButton() {
+    const btn = Dom.el('button', {
+      onclick: () => { this._exportArchive(); btn.textContent = '✓ Backup downloaded'; btn.disabled = true; },
     }, 'Download a backup of the current map first');
-    const overlay = Dom.el('div', { class: 'fm-modal', onclick: (e) => { if (e.target === overlay) close(); } }, [
-      Dom.el('div', { class: 'fm-modal-panel' }, [
-        Dom.el('h3', {}, 'Restore from archive'),
-        Dom.el('p', {},
-          'This permanently replaces ALL facility-map data (every building, floor, room, and '
-          + 'rack placement, plus the rendered floor images) with the contents of “' + file.name
-          + '”. This cannot be undone.'),
+    return btn;
+  }
+
+  /** Destructive-restore confirmation. A single native confirm() (the reset idiom) can't carry
+   *  the pre-restore "download a backup first" safety net, so this is a `Modal.open` shell rather
+   *  than a plain `Modal.confirm`: it informs that restoring replaces everything, offers a
+   *  one-click current-state export, and only then proceeds. Backdrop, Escape, or Cancel dismisses
+   *  it — and per the §11 convention the irreversible action wears `.danger` while Cancel takes the
+   *  `.primary` emphasis. */
+  _confirmRestore(file) {
+    const dlg = Modal.open({
+      title: 'Restore from archive',
+      body: [
+        'This permanently replaces ALL facility-map data (every building, floor, room, and '
+        + 'rack placement, plus the rendered floor images) with the contents of “' + file.name
+        + '”. This cannot be undone.',
         Dom.el('p', { class: 'hint' },
           'Rooms are re-linked to Locations by slug, so a backup can be restored to a new NetBox '
           + 'instance. If any Location can’t be matched, the restore is aborted without '
           + 'changing anything and lists what’s missing. Rendered images are rebuilt from the '
           + 'archive; if any look stale, re-run the import to regenerate them.'),
-        backupBtn,
-        Dom.el('div', { class: 'fm-modal-actions' }, [
-          Dom.el('button', { onclick: close }, 'Cancel'),
-          Dom.el('button', { class: 'danger', onclick: () => { close(); this._doRestore(file); } },
-            'Replace all data & restore'),
-        ]),
-      ]),
-    ]);
-    document.body.append(overlay);
+        this._backupFirstButton(),
+      ],
+      actions: [
+        Dom.el('button', { class: 'primary', onclick: () => dlg.close() }, 'Cancel'),
+        Dom.el('button', { class: 'danger', onclick: () => { dlg.close(); this._doRestore(file); } },
+          'Replace all data & restore'),
+      ],
+    });
   }
 
   /** Upload the archive to the restore endpoint (multipart + CSRF, mirroring ImportUploader),
@@ -803,6 +832,54 @@ class SettingsPage {
       return;
     }
     Toast.show('Facility map restored. Reloading…');
+    window.location.reload();
+  }
+
+  // ---- Full data wipe (HEALTH-12) ----
+
+  /** Blank-slate confirmation. Same modal idiom as `_confirmRestore` — and the same pre-flight
+   *  export button, since a wipe is the one action with no archive arriving to replace what it
+   *  removes. Deliberately whole-install only: the SPA has an active facility, so a per-facility
+   *  button here would read ambiguously ("all data" vs "this facility's"); the narrower scope is
+   *  the `facilitymap_wipe --facility` CLI's. */
+  _confirmWipe() {
+    const dlg = Modal.open({
+      title: 'Wipe all data',
+      body: [
+        'This permanently deletes ALL facility-map data — every facility, building, floor, room, '
+        + 'to-do and rack placement, every uploaded drawing and rendered image, and the plugin’s '
+        + 'own settings. The plugin is left as a blank-slate install. This cannot be undone.',
+        Dom.el('p', { class: 'hint' },
+          'Nothing else in NetBox is touched: your sites, locations, racks and devices are left '
+          + 'exactly as they are, and backup archives are kept — so you can restore one afterwards '
+          + 'or re-import from scratch.'),
+        this._backupFirstButton(),
+      ],
+      actions: [
+        Dom.el('button', { class: 'primary', onclick: () => dlg.close() }, 'Cancel'),
+        Dom.el('button', { class: 'danger', onclick: () => { dlg.close(); this._doWipe(); } },
+          'Delete everything'),
+      ],
+    });
+  }
+
+  /** POST the wipe, then hard-reload — after a wholesale delete every cached store document,
+   *  manifest and facility list is stale, exactly as after a restore. */
+  async _doWipe() {
+    Toast.show('Wiping… this may take a moment');
+    const base = window.MAP ? window.MAP.api : '/api/';
+    const headers = { 'Content-Type': 'application/json' };
+    if (window.MAP && window.MAP.csrf) headers['X-CSRFToken'] = window.MAP.csrf;
+    try {
+      const r = await fetch(base + 'data/wipe',
+        { method: 'POST', headers, body: JSON.stringify({ all: true }) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) throw new Error(j.error || 'HTTP ' + r.status);
+    } catch (e) {
+      Toast.show('Wipe failed: ' + e.message, true);
+      return;
+    }
+    Toast.show('All facility-map data deleted. Reloading…');
     window.location.reload();
   }
 }

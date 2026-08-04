@@ -9,6 +9,13 @@ const ORTHO_DEG = 6;   // angular tolerance (degrees from an axis) for right-ang
 const RECT_MIN_PX = 6; // min side (displayed px) for the rectangle tool, so a click-without-drag makes nothing
 const EDGE_GRAB_PX = 8; // grab band (displayed px, /scale) to drag a whole polygon edge (both endpoints)
 const ANGLE_STEP = 15; // label rotation snaps to this many degrees (Alt to free-rotate)
+// How far one W/H aspect ratio may drift from another before the app treats the two plates as
+// differently shaped. Two call sites, one threshold: "copy rooms to floor" (FloorEditor) flags a
+// plate mismatch, and the wizard's siteplan re-import decides whether the swapped drawing skews the
+// hotspots (`ImportDiff._siteplanAspectChanged`). Applied as an absolute difference for floor
+// plates — whose aspects cluster near 1, so absolute ≈ relative — and as a relative drift for the
+// siteplan swap, where the two drawings' aspects are compared as a ratio.
+const ASPECT_MISMATCH_TOLERANCE = 0.02;
 const LABEL_SIZE_MIN = 6, LABEL_SIZE_MAX = 120;   // label font-size clamp (px)
 // Below this map scale the legibility floor has blown labels up enough that they'd pile into an
 // unreadable carpet, so the editor culls them (`.labels-lod`); they return as you zoom in (READ-2).
@@ -33,13 +40,35 @@ const ARROW_COLORS = ['#066fd1', '#2fa84f', '#e0a93d', '#e0533d'];
 // fill) rather than counter-scaling — pan/zoom never re-renders, so a JS size
 // divided by the zoom scale would be stale (see ARCHITECTURE §6).
 const ARROW_HEAD_PX = 15;
+// The app's one phone-layout breakpoint (§10 Mobile layout) — the single source every JS
+// matchMedia call site reads, so the JS tier can't silently drift from itself. CSS can't read
+// this constant (no build step), so style.css's `@media (max-width: 720px)` block carries a
+// comment pointing back here; keep the two numbers equal by hand.
+const PHONE_BREAKPOINT_PX = 720;
 
 /** Small id / key helpers. */
 class Util {
   static uid() { return 'r' + Math.random().toString(36).slice(2, 9); }
   static floorKey(dir, fid) { return dir + '/' + fid; }
   static isNumbered(dir) { return /^\d\d-/.test(dir || ''); }
-  static code(dir) { return Util.isNumbered(dir) ? dir.slice(0, 2) : dir; }
+  /** The app's one phone-layout `matchMedia` query, built fresh each call — callers need their
+   *  own `MediaQueryList` instance so each can attach/detach its own change listener
+   *  independently (§10 Mobile layout: each editor's controller is torn down in its own
+   *  detach()). */
+  static phoneMq() { return window.matchMedia(`(max-width: ${PHONE_BREAKPOINT_PX}px)`); }
+  // `NN-` is one recognized building-slug convention, not the only one (MULTI-6) — a building
+  // that doesn't use it badges from its name instead, so the legend never leaks a facility's own
+  // folder naming (or a raw slug too long for the fixed-width badge) into a generic UI.
+  static code(b) {
+    if (!b) return '';
+    return Util.isNumbered(b.dir) ? b.dir.slice(0, 2) : Util.initials(b.name);
+  }
+  static initials(name) {
+    const words = (name || '').trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return '';
+    return words.length === 1 ? words[0].slice(0, 2).toUpperCase()
+                               : (words[0][0] + words[1][0]).toUpperCase();
+  }
 }
 
 /** DOM construction helpers. */
@@ -51,6 +80,10 @@ class Dom {
     const n = document.createElement(tag);
     for (const k in attrs) {
       if (k === 'class') n.className = attrs[k];
+      // `html` sets innerHTML — trusted, hardcoded markup only (an Icons.* glyph, a literal
+      // <span> wrapper). Never string-concatenate a runtime/dynamic value into it; pass that as
+      // a plain-string `children` entry (appended below via Node.append, i.e. a safe text node)
+      // or set it via `.textContent` instead.
       else if (k === 'html') n.innerHTML = attrs[k];
       else if (k.startsWith('on')) n.addEventListener(k.slice(2), attrs[k]);
       else n.setAttribute(k, attrs[k]);
@@ -112,6 +145,9 @@ class Icons {
   static get download() { return Icons._ico('<path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/>'); }
   static get print() { return Icons._ico('<path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 9V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v6"/><rect x="6" y="14" width="12" height="8" rx="1"/>'); }
   static get info() { return Icons._ico('<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>'); }
+  // circle-help: the editors' keyboard/mouse shortcuts panel toggle (UX-17). Distinct from
+  // `info`, which marks a per-control explainer tooltip rather than a whole-view reference.
+  static get help() { return Icons._ico('<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>'); }
   static get sliders() { return Icons._ico('<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/>'); }
   // chevron-right: the to-do panel's Completed-group caret; CSS rotates it when open.
   static get chevron() { return Icons._ico('<path d="m9 18 6-6-6-6"/>', 12); }
@@ -119,6 +155,12 @@ class Icons {
   static get todo() { return Icons._ico('<rect x="3" y="5" width="6" height="6" rx="1"/><path d="m3 17 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>'); }
   // wifi: Lucide's own wifi glyph — the access-point placement tool icon (DEV-1).
   static get wifi() { return Icons._ico('<path d="M12 20h.01"/><path d="M2 8.82a15 15 0 0 1 20 0"/><path d="M5 12.859a10 10 0 0 1 14 0"/><path d="M8.5 16.429a5 5 0 0 1 7 0"/>'); }
+  // building-2: a two-tower block — the topbar facility picker's glyph (NAV-21), which is what the
+  // control shows once it collapses to icon-only on a phone.
+  static get building() { return Icons._ico('<path d="M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18Z"/><path d="M6 12H4a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2"/><path d="M18 9h2a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2"/><path d="M10 6h4"/><path d="M10 10h4"/><path d="M10 14h4"/><path d="M10 18h4"/>'); }
+  // ellipsis-vertical: the toolbar's "…" overflow-menu trigger (NAV-20) — the tools that don't fit
+  // a narrow bar fold into a dropdown behind it, mirroring the measured label-collapse it extends.
+  static get more() { return Icons._ico('<circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/>'); }
 }
 
 /** Pure geometry helpers (normalized or pixel space, caller-consistent). */
@@ -447,15 +489,43 @@ class Geom {
   }
 }
 
-/** Transient bottom-screen notification. */
+/** Transient bottom-screen notification. One shared `#toast` element, so any new toast
+ *  replaces the one on screen. */
 class Toast {
   static _timer = null;
+  static DWELL_MS = 2200;        // plain notice: long enough to read, short enough to ignore
+  static ACTION_DWELL_MS = 7000; // one carrying a button: the user has to notice AND decide
+
   static show(msg, err = false) {
+    Toast._paint(msg, 'show' + (err ? ' err' : ''), Toast.DWELL_MS);
+  }
+
+  /** A toast carrying one actionable button — the post-delete Undo (UX-17). The base `#toast`
+   *  is `pointer-events: none` so it never eats a click over the map; the `.act` class re-enables
+   *  them for the lifetime of this toast (see style.css). Clicking runs `fn` and dismisses, so a
+   *  handled action doesn't linger; ignoring it just times out. */
+  static action(msg, label, fn) {
+    const t = Toast._paint(msg, 'show act', Toast.ACTION_DWELL_MS);
+    const btn = Dom.el('button', { class: 'toast-action', type: 'button' }, label);
+    btn.onclick = () => { Toast.dismiss(); fn(); };
+    t.append(btn);
+  }
+
+  static dismiss() {
+    clearTimeout(Toast._timer);
+    const t = Dom.$('#toast');
+    if (t) t.className = '';
+  }
+
+  /** Shared reset: replace the content + classes wholesale (so a previous toast's button and
+   *  `err`/`act` state can never bleed into this one) and restart the dismiss timer. */
+  static _paint(msg, cls, ms) {
     const t = Dom.$('#toast');
     t.textContent = msg;
-    t.className = 'show' + (err ? ' err' : '');
+    t.className = cls;
     clearTimeout(Toast._timer);
-    Toast._timer = setTimeout(() => { t.className = ''; }, 2200);
+    Toast._timer = setTimeout(() => { t.className = ''; }, ms);
+    return t;
   }
 }
 
@@ -506,6 +576,223 @@ class Tooltip {
     tip.style.top = Math.round(top) + 'px';
     tip.style.setProperty('--arrow-x', Math.round(cx - left) + 'px');   // arrow tracks the icon
     tip.classList.add('show');
+  }
+}
+
+/** A dropdown panel anchored under the button that opens it: the app's four "click a toolbar button,
+ *  get a menu" controls (the facility picker, the toolbar's "…" overflow, and the View menus on the
+ *  building and to-do pages) all run through this.
+ *
+ *  It owns the four things every one of them repeated by hand — anchoring the panel to the trigger's
+ *  live viewport rect, the `.open`/`.active`/`aria-expanded` tri-state, the outside-click + Escape
+ *  dismissal, and **structural teardown** — the last being the reason it exists. Those `document`
+ *  listeners must stay bound for as long as the panel is open, so they are not the self-retiring
+ *  shape (§10 *Mobile layout*), and forgetting to unbind them is this pattern's one recurring bug:
+ *  it was found twice in four hand-rolled copies (QUAL-8, QUAL-9). `App._detachCurrent` therefore
+ *  calls `Popover.closeAll()` on every route change, which closes whatever is open no matter which
+ *  view built it — a caller cannot forget teardown because a caller no longer performs it.
+ *
+ *  Construct it with an already-built trigger and panel; **it does not mount either**. Where the
+ *  panel lives is the caller's decision and a load-bearing one: `App`'s two append to `document.body`
+ *  to escape the toolbar's overflow clip and the `#toolbar button.icononly span` label-clip, while
+ *  the View menus nest theirs in a `.view-menu-wrap` that rides in the bar. Both work because the
+ *  panel is `position: fixed` in CSS and this anchors it in viewport coordinates.
+ *
+ *      this._pop = new Popover({ trigger: btn, panel: menu, align: 'right' });
+ *
+ *  `align` picks which edge tracks the trigger: `'left'` for a panel that hangs rightward from it,
+ *  `'right'` for one that must not run off a narrow screen's right edge.
+ *
+ *  Deliberately **no `role="menu"`/`"menuitem"`**: those roles promise arrow-key navigation none of
+ *  these implement, and `aria-haspopup` + `aria-expanded` + tab order already say everything true.
+ *  Add the roles only together with the keyboard pattern they advertise. */
+class Popover {
+  static GAP = 6;            // px between the trigger's bottom edge and the panel
+  static _open = new Set();  // every instance currently open, so closeAll() can reach it
+
+  /** Close every open popover, whichever view owns it. `App._detachCurrent` calls this on each
+   *  route change so a panel (and its `document` listeners) can never outlive the view it belongs
+   *  to — including via browser Back, which clears the stage without the outside-click that would
+   *  otherwise dismiss it. */
+  static closeAll() { for (const p of [...Popover._open]) p.close(); }
+
+  constructor({ trigger, panel, align = 'left' }) {
+    this.trigger = trigger;
+    this.panel = panel;
+    this.align = align;
+    this._onDoc = this._onKey = null;
+    this._isOpen = false;
+    trigger.setAttribute('aria-haspopup', 'true');
+    trigger.setAttribute('aria-expanded', 'false');
+    // stopPropagation so the just-opened panel isn't immediately closed by open()'s own
+    // document-level outside-click handler as this very click finishes bubbling.
+    trigger.addEventListener('click', (e) => { e.stopPropagation(); this.toggle(); });
+  }
+
+  get isOpen() { return this._isOpen; }
+  toggle() { this._isOpen ? this.close() : this.open(); }
+
+  open() {
+    if (this._isOpen) return;
+    // The panel is `position: fixed` (to escape the toolbar's overflow clip), so anchor it to the
+    // trigger's CURRENT viewport rect — measured per open, never cached, since the bar reflows.
+    const r = this.trigger.getBoundingClientRect();
+    this.panel.style.top = Math.round(r.bottom + Popover.GAP) + 'px';
+    // Only the aligned edge is set; the other is cleared so a re-anchor can't leave both pinned.
+    if (this.align === 'right') {
+      this.panel.style.left = '';
+      this.panel.style.right = Math.round(window.innerWidth - r.right) + 'px';
+    } else {
+      this.panel.style.right = '';
+      this.panel.style.left = Math.round(r.left) + 'px';
+    }
+    this.panel.classList.add('open');
+    this.trigger.classList.add('active');
+    this.trigger.setAttribute('aria-expanded', 'true');
+    this._onDoc = (e) => { if (!this._inside(e.target)) this.close(); };
+    this._onKey = (e) => { if (e.key === 'Escape') this.close(); };
+    document.addEventListener('click', this._onDoc);
+    document.addEventListener('keydown', this._onKey);
+    this._isOpen = true;
+    Popover._open.add(this);
+  }
+
+  /** Close and drop both `document` listeners, leaving the panel mounted for the next open.
+   *  Idempotent — safe to call when already closed, which is what lets `closeAll()` and a caller's
+   *  own teardown both run without coordinating. */
+  close() {
+    if (this._onDoc) document.removeEventListener('click', this._onDoc);
+    if (this._onKey) document.removeEventListener('keydown', this._onKey);
+    this._onDoc = this._onKey = null;
+    this.panel.classList.remove('open');
+    this.trigger.classList.remove('active');
+    this.trigger.setAttribute('aria-expanded', 'false');
+    this._isOpen = false;
+    Popover._open.delete(this);
+  }
+
+  /** Close *and* discard the panel node — for a control that is rebuilt rather than reopened (the
+   *  facility picker re-renders on every facility switch; the toolbar overflow is rebuilt by every
+   *  fit), where merely closing would orphan the old panel on `document.body`. */
+  destroy() {
+    this.close();
+    this.panel.remove();
+  }
+
+  /** A click "inside" is one on the panel or on the trigger itself (`contains` includes the node,
+   *  so a click on the trigger's own icon or label counts) — anything else dismisses. */
+  _inside(target) { return this.panel.contains(target) || this.trigger.contains(target); }
+}
+
+/** The shared `.fm-modal` centred-dialog shell. Every dialog in the app is built here, so all of
+ *  them look alike and dismiss alike: backdrop click, Escape, or a button — each exactly once.
+ *  Before this, twelve call sites hand-rolled the overlay and seven of them repeated the same
+ *  resolve-once promise wrapper verbatim, which is how the app ended up with Escape working in two
+ *  dialogs and not the other ten (QUAL-11).
+ *
+ *  Three layers, so a caller takes only as much as it needs:
+ *
+ *      Modal.confirm({title, body, hint, confirmLabel, cancelLabel, danger}) → Promise<boolean>
+ *      Modal.choose({title, body, hint, choices, dismiss, panelClass})       → Promise<value>
+ *      Modal.open({title, body, actions, panelClass, onClose})               → {overlay, panel, title, actions, close}
+ *
+ *  **Button convention** (the one place it is decided, so twelve copies can't drift again):
+ *  the negative/cancel choice sits on the **left**, the affirmative on the **right**, and exactly
+ *  one button carries visual weight. Which one depends on whether the affirmative is irreversible —
+ *  a data wipe, or discarding unsaved work:
+ *
+ *    - `danger: false` → the affirmative is `.primary` (solid blue), cancel is unstyled.
+ *    - `danger: true`  → the affirmative is `.danger` (red outline, deliberately *lighter* than
+ *      `.primary` here) and **cancel** becomes `.primary`, so the weight sits on the safe exit.
+ *
+ *  Escape is bound in the **capture** phase and torn down with the dialog: it has to dismiss the
+ *  dialog before `App`'s document handler routes the same keypress to whatever is behind it (which
+ *  would cancel a draft or drop a selection the user can't even see). A control that wants Escape
+ *  for itself stops it there — `Combo` does exactly this to close its option list without also
+ *  closing the dialog hosting it.
+ *
+ *  Deliberately no focus trap and no `role="dialog"`: those promise focus management this doesn't
+ *  implement. Add them together, or not at all. */
+class Modal {
+  /** Build and mount the overlay/panel shell, returning handles rather than a promise — for a
+   *  dialog too rich for `choose` (a form, a multi-stage flow, a reference listing).
+   *
+   *  `body` is a node, a string (which becomes the standard `<p>` prompt paragraph), or an array of
+   *  either; `actions` are the footer buttons; `panelClass` widens the panel for a listing dialog
+   *  (`fm-shortcuts`, `fm-facility-change`). `onClose` fires exactly once, on **every** dismissal
+   *  path including a caller's own `close()` — so a caller that has to unwind state (a re-entrancy
+   *  flag, an unsettled promise) has one place to do it rather than one per button.
+   *
+   *  The returned `title` and `actions` nodes are live: a multi-stage dialog retitles itself and
+   *  swaps its footer per stage rather than rebuilding the dialog around the user. */
+  static open({ title = '', body = [], actions = [], panelClass = '', onClose = null }) {
+    const titleEl = title ? Dom.el('h3', {}, title) : null;
+    const actionsEl = Dom.el('div', { class: 'fm-modal-actions' }, actions);
+    const panel = Dom.el('div', { class: 'fm-modal-panel' + (panelClass ? ' ' + panelClass : '') },
+      [titleEl, ...Modal._nodes(body), actionsEl]);
+    let done = false;
+    const close = () => {
+      if (done) return;
+      done = true;
+      document.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      if (onClose) onClose();
+    };
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+    const overlay = Dom.el('div',
+      { class: 'fm-modal', onclick: (e) => { if (e.target === overlay) close(); } }, [panel]);
+    document.addEventListener('keydown', onKey, true);
+    document.body.append(overlay);
+    return { overlay, panel, title: titleEl, actions: actionsEl, close };
+  }
+
+  /** A prompt resolving whichever `choices` entry the user picked — `{label, value, class}` each,
+   *  rendered left to right — or `dismiss` if they backed out via backdrop, Escape, or a choice
+   *  carrying that same value. The one home for the resolve-once wrapper every prompt used to
+   *  repeat: picking a choice settles the promise first, so the `onClose` fallback that follows is
+   *  a no-op on an already-settled promise. */
+  static choose({ title, body, hint, choices, dismiss = null, panelClass = '' }) {
+    return new Promise((resolve) => {
+      const dlg = Modal.open({
+        title, panelClass,
+        body: Modal._prose(body, hint),
+        actions: choices.map((c) => {
+          // Set the class only when there is one, so an unemphasized choice stays a bare <button>
+          // rather than carrying an empty class attribute.
+          const btn = Dom.el('button',
+            { onclick: () => { resolve(c.value); dlg.close(); } }, c.label);
+          if (c.class) btn.className = c.class;
+          return btn;
+        }),
+        onClose: () => resolve(dismiss),
+      });
+    });
+  }
+
+  /** The two-button prompt — `true` to proceed, `false` to back out (backdrop and Escape decline,
+   *  never proceed). `danger` marks the affirmative irreversible and flips the emphasis per the
+   *  convention above. Callers keep their own gating (a `localStorage` consent key, a revert on
+   *  decline); this only owns the chrome. */
+  static confirm({ title, body, hint, confirmLabel = 'OK', cancelLabel = 'Cancel', danger = false }) {
+    return Modal.choose({
+      title, body, hint, dismiss: false,
+      choices: [
+        { label: cancelLabel, value: false, class: danger ? 'primary' : '' },
+        { label: confirmLabel, value: true, class: danger ? 'danger' : 'primary' },
+      ],
+    });
+  }
+
+  /** Dialog copy → nodes: a string becomes the standard `<p>`, a node passes through, and `hint`
+   *  becomes the muted `.hint` second line (per §11, a hint is one short line, not narration). */
+  static _prose(body, hint) {
+    const nodes = Modal._nodes(body);
+    if (hint) nodes.push(Dom.el('p', { class: 'hint' }, hint));
+    return nodes;
+  }
+
+  static _nodes(body) {
+    return [].concat(body || []).map((b) => (typeof b === 'string' ? Dom.el('p', {}, b) : b));
   }
 }
 
@@ -599,9 +886,12 @@ class Combo {
       this.list.append(Dom.el('div', { class: 'fm-combo-empty' }, 'No matches'));
     }
     this.options.forEach((opt, i) => {
+      // `opt.cls` is an optional per-option class a host can set (e.g. a trailing "create new"
+      // action row) — Combo itself attaches no meaning to it.
       const row = Dom.el('div', {
         class: 'fm-combo-opt' + (i === this.active ? ' active' : '')
-          + (this.value && this.value.id === opt.id ? ' picked' : ''),
+          + (this.value && this.value.id === opt.id ? ' picked' : '')
+          + (opt.cls ? ' ' + opt.cls : ''),
         role: 'option', 'aria-selected': String(!!(this.value && this.value.id === opt.id)),
       }, opt.name);
       row.onclick = () => this._pick(opt);
@@ -671,14 +961,23 @@ class Combo {
   }
 
   /** Commit a pick (`null` clears). Applies optimistically, then rolls back if `onPick` rejects —
-   *  the `_select`/`_switch` revert contract. */
+   *  the `_select`/`_switch` revert contract. `onPick` may also *resolve* to a replacement option,
+   *  which is then adopted in `opt`'s place — a host that turns a placeholder pick (e.g. an
+   *  "Add building …" footer row) into a real created object can hand the real one back so the
+   *  input ends up showing it instead of the placeholder's text. Returning the same `opt` back, or
+   *  nothing, is a no-op. */
   _pick(opt) {
     const prev = this.value;
     this.value = opt;
     this._syncText();
     this._close();
     this.clear.style.display = opt ? '' : 'none';
-    Promise.resolve(this.onPick(opt)).catch((e) => {
+    Promise.resolve(this.onPick(opt)).then((replacement) => {
+      if (replacement && replacement !== opt) {
+        this.value = replacement;
+        this._syncText();
+      }
+    }).catch((e) => {
       this.value = prev;
       this._syncText();
       this.clear.style.display = prev ? '' : 'none';
@@ -732,7 +1031,9 @@ class Api {
       // guidance there; `error` is the terse machine code, e.g. 'conflict'), then `error`.
       if (t) { try { const j = JSON.parse(t); msg = j.detail || j.error || msg; } catch (_) { msg = t.slice(0, 300); } }
     } catch (_) { /* keep the status-code fallback */ }
-    return new Error(msg);
+    const e = new Error(msg);
+    e.status = r.status;   // lets a caller branch on the status code without re-parsing `msg`
+    return e;
   }
   static async get(path) {
     const r = await fetch(Api._url(path));

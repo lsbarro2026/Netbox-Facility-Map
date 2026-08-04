@@ -77,7 +77,7 @@ def read_manifest(facility=''):
     (mtime, size) within the worker process; a rebuild changes the file and busts the memo. The
     memo is keyed by the (per-facility) path string, so each facility's manifest memoizes
     independently. Best-effort per worker (plain dict under the GIL — a rare race just re-parses,
-    no lock needed; the render lockfile in ``imports.py`` is a separate concern) and per-process
+    no lock needed; the render lockfile in ``render_runner.py`` is a separate concern) and per-process
     (each worker re-reads once after a rebuild — no cross-process coherence needed).
 
     Callers MUST treat the result as **read-only** — it is shared. Never raises: any OS/JSON

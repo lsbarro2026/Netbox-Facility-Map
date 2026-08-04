@@ -85,10 +85,10 @@ def _apply_worktree_db_suffix(suffix):
 
 @pytest.fixture(scope='session')
 def django_db_modify_db_settings_worktree_suffix():
-    """Give each linked git worktree its own Postgres test database, so parallel `/plan-todo`
-    tabs never share schema — one worktree landing a migration can no longer corrupt another
-    tab's pytest run (INFRA-1). No-op for the main checkout, which keeps the plain `test_netbox`
-    name (and `--reuse-db` speed) documented in `CLAUDE.md`."""
+    """Give each linked git worktree its own Postgres test database, so parallel development
+    branches never share schema — one worktree landing a migration can no longer corrupt another
+    branch's pytest run. No-op for the main checkout, which keeps the plain `test_netbox` name
+    so `--reuse-db` stays fast there."""
     suffix = _worktree_test_db_suffix(Path(__file__).resolve().parent)
     if suffix:
         _apply_worktree_db_suffix(suffix)
@@ -164,14 +164,21 @@ def all_formats_accepted(monkeypatch):
     derived ext lists to the *installed* formats and they're frozen at import, so a test that
     asserts acceptance of an optional format must simulate its extra being present. No decoder is
     needed here — acceptance only sniffs magic and stores bytes; the decode is the render
-    subprocess's job."""
-    from netbox_facilitymap import drawing_formats as df, imports
+    subprocess's job.
+
+    The ext lists are `from`-imported into each module that gates on them, so they are that
+    module's own global and must be patched per module: `uploads` holds the upload/zip acceptance
+    gate, while `imports` keeps its own copies for `PreviewView` (DRAWING_EXTS) and `RegroupView`'s
+    companion-sibling sweep (COMPANION_EXTS). Patching only one would leave the other on the
+    installed set and silently under-test the optional formats."""
+    from netbox_facilitymap import drawing_formats as df, imports, uploads
 
     full_exts = tuple(e for f in df.FORMATS for e in f.exts)
     full_comps = tuple(e for f in df.FORMATS for e in f.companions)
-    monkeypatch.setattr(imports, 'DRAWING_EXTS', full_exts)
-    monkeypatch.setattr(imports, 'COMPANION_EXTS', full_comps)
-    monkeypatch.setattr(imports, 'UPLOAD_EXTS', full_exts + full_comps)
+    for mod in (uploads, imports):
+        monkeypatch.setattr(mod, 'DRAWING_EXTS', full_exts)
+        monkeypatch.setattr(mod, 'COMPANION_EXTS', full_comps)
+    monkeypatch.setattr(uploads, 'UPLOAD_EXTS', full_exts + full_comps)
     return None
 
 

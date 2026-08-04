@@ -492,7 +492,7 @@ class Store {
 
   /** Ensure the in-memory inventory for a Location is loaded, fetching racks +
    *  unracked devices live from NetBox via the given client. Cached after the first
-   *  fetch; pass `force` to re-pull (the Refresh racks button). Returns the entry. */
+   *  fetch; pass `force` to re-pull (the Refresh from NetBox button). Returns the entry. */
   async ensureRacks(nb, locId, force = false) {
     if (locId == null) return { racks: [], devices: [] };
     if (!force && this.rackCache.locations[locId]) return this.rackCache.locations[locId];

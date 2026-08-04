@@ -168,7 +168,7 @@ class FloorExport {
 
   _filename(ext) {
     const b = this.editor.building, f = this.editor.floor;
-    const stem = (Util.code(b.dir) + '-' + f.id).trim().replace(/\s+/g, '-');
+    const stem = (Util.code(b) + '-' + f.id).trim().replace(/\s+/g, '-');
     return `floor-${stem}.${ext}`;
   }
 

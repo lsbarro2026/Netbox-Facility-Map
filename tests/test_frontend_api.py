@@ -2,7 +2,7 @@
 
 A POST is authoritative for the whole annotations document, so rooms absent from it are deleted —
 but only ones the saving user is permitted to delete (`restrict(user, 'delete')`). A user must
-never silently wipe rooms they have no delete permission over (CLAUDE.md §Data safety)."""
+never silently wipe rooms they have no delete permission over."""
 
 import json
 
@@ -217,16 +217,18 @@ def test_nb_rooms_building_param_disambiguates_same_slug_floors(client, superuse
 
 
 # --- NbBuildingLocationsView (MODEL-4): the Site = campus sibling of NbSitesView. Returns
-# building-anchor Locations — those with child Locations (their floors) — facility-scoped like the
-# Site search (FACIL-1), so the wizard's bind step can offer a building Location as an anchor. --
+# building-anchor Locations — those with child Locations (their floors) OR at the top of the
+# Location tree (a building not yet drawn, IMPORT-14) — facility-scoped like the Site search
+# (FACIL-1), so the wizard's bind step and split picker can offer a building Location as an anchor. -
 
 BUILDING_LOCATIONS = 'plugins:netbox_facilitymap:api-nb-building-locations'
 
 
 def test_nb_building_locations_returns_only_building_like_locations(client, superuser):
-    # A building anchor is a Location that has child Locations (its floors) — the structural signal,
-    # since NetBox 4.x has no LocationType to key off. The two building wrappers are returned; the
-    # floor Locations beneath them (no children of their own) are not.
+    # A building anchor is a Location that has child Locations (its floors) or sits at the top of the
+    # tree — the structural signal, since NetBox has no LocationType to key off. Here both buildings
+    # are top-level AND have floors; the floor Locations beneath them (non-top-level, no children of
+    # their own) are not returned.
     campus, alpha, beta, a_l1, b_l1 = _campus_two_buildings_same_floor_slug()
     client.force_login(superuser)
 
@@ -235,6 +237,24 @@ def test_nb_building_locations_returns_only_building_like_locations(client, supe
     # Each hit carries its campus Site, so the frontend records siteSlug alongside buildingSlug.
     alpha_row = next(l for l in body['locations'] if l['slug'] == 'alpha-bldg')
     assert alpha_row['site_slug'] == 'campus' and alpha_row['site_name'] == 'Campus'
+
+
+def test_nb_building_locations_includes_floorless_top_level_building(client, superuser):
+    # IMPORT-14: a building modelled in NetBox but not yet drawn (a top-level Location with no floor
+    # children) is offered too, so the split-wizard picker can seed from it — the has-children signal
+    # alone would drop it. A leaf floor deeper in the tree (non-top-level, no rooms yet) has neither
+    # signal and stays excluded, keeping the picker to plausible buildings.
+    from dcim.models import Location, Site
+    campus = Site.objects.create(name='Campus', slug='campus')
+    drawn = Location.objects.create(name='Drawn Bldg', slug='drawn-bldg', site=campus)
+    Location.objects.create(name='Floor 1', slug='floor-1', site=campus, parent=drawn)
+    Location.objects.create(name='Floorless Bldg', slug='floorless-bldg', site=campus)
+    client.force_login(superuser)
+
+    slugs = {l['slug'] for l in client.get(reverse(BUILDING_LOCATIONS)).json()['locations']}
+    assert 'floorless-bldg' in slugs    # top-level, no floors yet → now offered (IMPORT-14)
+    assert 'drawn-bldg' in slugs        # top-level with a floor child → still offered
+    assert 'floor-1' not in slugs       # a leaf floor (no rooms) → still excluded
 
 
 def test_nb_building_locations_q_filters_by_name_or_slug(client, superuser):
@@ -264,9 +284,68 @@ def test_nb_building_locations_scoped_to_facility(client, superuser):
     assert {l['slug'] for l in body['locations']} == {'a-bldg'}
 
 
+def test_nb_building_locations_are_invisible_from_the_default_facility(client, superuser):
+    # IMPORT-17, the divergence this endpoint is on the wrong side of by design: the default facility
+    # '' means the UNGROUPED remainder, so on a fully-grouped install it holds no Sites and therefore
+    # no buildings — while `topology.probe`, which is deliberately facility-agnostic, still counts
+    # them all. That is how the wizard's layout step could report N buildings and its split step find
+    # none. The scoping is correct and must stay; the fix belongs in the client committing to a real
+    # facility (`ImportFlow._reconcileFacility`), so pin this rather than let anyone widen FACIL-1.
+    from dcim.models import Location
+    campus = _grouped_site('cal-poly', 'slo-campus')
+    bldg = Location.objects.create(name='Administration', slug='admin-bldg', site=campus)
+    Location.objects.create(name='Floor 1', slug='admin-l1', site=campus, parent=bldg)
+    client.force_login(superuser)
+
+    scoped = client.get(reverse(BUILDING_LOCATIONS) + '?facility=cal-poly').json()
+    assert {l['slug'] for l in scoped['locations']} == {'admin-bldg'}
+    default = client.get(reverse(BUILDING_LOCATIONS) + '?facility=').json()
+    assert default['locations'] == []
+
+
 def test_nb_building_locations_rejects_bad_facility(client, superuser):
     client.force_login(superuser)
     assert client.get(reverse(BUILDING_LOCATIONS) + '?facility=../evil').status_code == 400
+
+
+def test_nb_building_locations_site_param_narrows_to_one_campus(client, superuser):
+    # MODEL-7: a site-as-campus facility picks its campus once, then the per-building search is scoped
+    # to that Site via ?site=. Two ungrouped campuses under the default facility; ?site= selects one.
+    from dcim.models import Location, Site
+    ca = Site.objects.create(name='Campus A', slug='campus-a')
+    cb = Site.objects.create(name='Campus B', slug='campus-b')
+    a_bldg = Location.objects.create(name='A Building', slug='a-bldg', site=ca)
+    Location.objects.create(name='A L1', slug='a-l1', site=ca, parent=a_bldg)
+    b_bldg = Location.objects.create(name='B Building', slug='b-bldg', site=cb)
+    Location.objects.create(name='B L1', slug='b-l1', site=cb, parent=b_bldg)
+    client.force_login(superuser)
+
+    # No ?site= → both campuses' buildings (today's behaviour, unchanged).
+    both = client.get(reverse(BUILDING_LOCATIONS)).json()
+    assert {l['slug'] for l in both['locations']} == {'a-bldg', 'b-bldg'}
+    # ?site= narrows to that one campus.
+    scoped = client.get(reverse(BUILDING_LOCATIONS), {'site': 'campus-a'}).json()
+    assert {l['slug'] for l in scoped['locations']} == {'a-bldg'}
+
+
+def test_nb_building_locations_site_param_narrows_within_facility_scope(client, superuser):
+    # The narrowing is applied INSIDE the facility scope, never instead of it: a ?site= naming a Site
+    # in some OTHER facility selects nothing rather than widening past the facility guard (FACIL-1).
+    from dcim.models import Location
+    sa = _grouped_site('ga', 'campus-a')
+    sb = _grouped_site('gb', 'campus-b')
+    a_bldg = Location.objects.create(name='A Building', slug='a-bldg', site=sa)
+    Location.objects.create(name='A L1', slug='a-l1', site=sa, parent=a_bldg)
+    b_bldg = Location.objects.create(name='B Building', slug='b-bldg', site=sb)
+    Location.objects.create(name='B L1', slug='b-l1', site=sb, parent=b_bldg)
+    client.force_login(superuser)
+
+    # Facility ga scoped to its own campus → its building.
+    own = client.get(reverse(BUILDING_LOCATIONS), {'facility': 'ga', 'site': 'campus-a'}).json()
+    assert {l['slug'] for l in own['locations']} == {'a-bldg'}
+    # Facility ga but ?site= names facility gb's campus → empty, not gb's building.
+    cross = client.get(reverse(BUILDING_LOCATIONS), {'facility': 'ga', 'site': 'campus-b'}).json()
+    assert cross['locations'] == []
 
 
 # --- Optimistic-concurrency guard (CONC-1): the version token echoed on GET must be sent back on
@@ -401,6 +480,44 @@ def test_placements_different_floor_saves_do_not_conflict(client, editor_user):
     assert b.status_code == 200
     assert FacilityMapBlob.objects.get(kind='placements', key=FLOOR).data['placements'][0]['id'] == 9
     assert FacilityMapBlob.objects.get(kind='placements', key=FLOOR2).data['placements'][0]['id'] == 8
+
+
+# --- Query-cost regression for the composed annotations GET, the map's hottest read: it is issued
+# on every page load and composes every floor's rooms, so an N+1 there scales with the whole
+# facility. The count must stay flat as the room count grows. Mirrors the same guard on the
+# floor-rooms panel in `test_template_content.py` (PERF-2).
+
+def test_annotations_get_query_count_is_flat_across_room_count(client, editor_user):
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+    from dcim.models import Location
+
+    site, floor = _floor_location()
+
+    def _set_room_count(n):
+        Room.objects.all().delete()
+        Location.objects.filter(parent=floor).delete()
+        for i in range(n):
+            room_loc = Location.objects.create(name=f'Room {i}', slug=f'room-{i}',
+                                               site=site, parent=floor)
+            Room.objects.create(floor_key=FLOOR, room_id=f'r{i}', label=f'R{i}',
+                                floor_location=floor, location=room_loc,
+                                polygon=[[0, 0], [1, 0], [1, 1]])
+
+    def _measure():
+        # A *fresh* login each time: NetBox caches the resolved object-permission set on the user
+        # instance, so a reused session would make the second measurement artificially cheap.
+        client.logout()
+        client.force_login(type(editor_user).objects.get(pk=editor_user.pk))
+        with CaptureQueriesContext(connection) as ctx:
+            r = client.get(reverse(ANNOTATIONS))
+            assert r.status_code == 200
+        return len(ctx.captured_queries)
+
+    _set_room_count(1)
+    one_room = _measure()
+    _set_room_count(5)
+    assert _measure() == one_room
 
 
 def test_placements_emptied_floor_deletes_its_row(client, editor_user):
@@ -547,6 +664,7 @@ FLOOR_LABEL = 'plugins:netbox_facilitymap:api-settings-floor-label-field'
 DEFAULT_FACILITY = 'plugins:netbox_facilitymap:api-settings-default-facility'
 WRITE_MODE = 'plugins:netbox_facilitymap:api-settings-write-mode'
 INLINE_ROOM_CREATION = 'plugins:netbox_facilitymap:api-settings-inline-room-creation'
+ORG_MODE = 'plugins:netbox_facilitymap:api-settings-org-mode'
 
 
 def _import_manifest(workdir, slug):
@@ -728,6 +846,136 @@ def test_set_grouping_noop_allowed_when_populated(client, editor_user):
     r = client.post(reverse(FACILITIES), data=json.dumps({'grouping': 'sitegroup'}),
                     content_type='application/json')
     assert r.status_code == 200
+
+
+# --- the Site→facility assignment endpoint (FACILITY-IDENTITY Phase 1): the write surface the
+# Phase-2 wizard assignment step lands on — GET is login-only like the facilities GET beside it,
+# POST is IMPORT_PERM-gated admin config, validation lives in `facilities.assign_facilities`. ------
+
+ASSIGNMENTS = 'plugins:netbox_facilitymap:api-nb-facility-assignments'
+
+
+def test_assignments_round_trip(client, editor_user):
+    from dcim.models import Site
+    from netbox_facilitymap.facilities import facility_for_site
+    site = Site.objects.create(name='SA', slug='sa')
+    client.force_login(editor_user)
+
+    r = client.post(reverse(ASSIGNMENTS),
+                    data=json.dumps({'assignments': {'sa': 'campus-x'}}),
+                    content_type='application/json')
+    assert r.status_code == 200
+    assert r.json() == {'ok': True, 'assignments': {'sa': 'campus-x'}}
+    assert facility_for_site(site) == 'campus-x'
+    assert client.get(reverse(ASSIGNMENTS)).json() == {'assignments': {'sa': 'campus-x'}}
+    # Stored on the single install-wide facility_map row.
+    assert FacilityMapBlob.objects.get(
+        kind='facility_map', facility='', key='').data == {'sa': 'campus-x'}
+
+    # null reverts the Site to the grouping derivation.
+    r = client.post(reverse(ASSIGNMENTS),
+                    data=json.dumps({'assignments': {'sa': None}}),
+                    content_type='application/json')
+    assert r.status_code == 200
+    assert facility_for_site(site) == ''
+
+
+def test_assignments_post_rejects_invalid_payloads(client, editor_user):
+    from dcim.models import Site
+    Site.objects.create(name='SA', slug='sa')
+    client.force_login(editor_user)
+    for body in ({'assignments': {'sa': '../escape'}},   # traversal — the valid_facility gate
+                 {'assignments': {'ghost': 'x'}},        # unknown Site slug
+                 {'assignments': {}},                    # empty merge
+                 {}):                                    # missing key
+        r = client.post(reverse(ASSIGNMENTS), data=json.dumps(body),
+                        content_type='application/json')
+        assert r.status_code == 400
+    assert not FacilityMapBlob.objects.filter(kind='facility_map').exists()
+
+
+def test_assignments_post_requires_import_permission(client, plain_user):
+    # `plain_user` holds change but not import — same admin-tier gate as the grouping POST.
+    client.force_login(plain_user)
+    r = client.post(reverse(ASSIGNMENTS), data=json.dumps({'assignments': {'sa': 'x'}}),
+                    content_type='application/json')
+    assert r.status_code == 403
+    assert not FacilityMapBlob.objects.filter(kind='facility_map').exists()
+
+
+# --- the Phase-3 reassignment modal's two endpoints (MULTI-7): the read-only preview that replaced
+# the wizard's blanket `window.confirm`, and the inline re-key that recovers whatever a grouping
+# change strands. Both IMPORT_PERM — the preview fronts an admin-tier action, so it shares its
+# audience rather than the login-only facilities/assignments GETs. -------------------------------
+
+PREVIEW = 'plugins:netbox_facilitymap:api-nb-facility-grouping-preview'
+REASSIGN = 'plugins:netbox_facilitymap:api-nb-facility-reassign'
+
+
+def test_grouping_preview_reports_moves_and_orphans(client, editor_user):
+    from dcim.models import Region, Site, SiteGroup
+    from netbox_facilitymap.facilities import facility_for_site
+    site = Site.objects.create(name='SA', slug='sa',
+                               group=SiteGroup.objects.create(name='ga', slug='ga'),
+                               region=Region.objects.create(name='rn', slug='rn'))
+    FacilityMapBlob.objects.create(kind='annotations', facility='ga', key='sa/f1', data={})
+    Room.objects.create(floor_key='sa/f1', room_id='r1')
+    client.force_login(editor_user)
+
+    body = client.get(reverse(PREVIEW) + '?grouping=region').json()
+    assert body['grouping'] == {'from': 'sitegroup', 'to': 'region'}
+    assert [(m['site'], m['from'], m['to'], m['rooms']) for m in body['moves']] \
+        == [('sa', 'ga', 'rn', 1)]
+    assert [o['facility'] for o in body['orphans']] == ['ga']
+    assert {c['slug'] for c in body['choices']} == {'rn'}
+    # Read-only: previewing never writes the grouping it previews.
+    assert not FacilityMapBlob.objects.filter(kind='settings').exists()
+    assert facility_for_site(site) == 'ga'
+
+
+def test_grouping_preview_rejects_an_unknown_grouping(client, editor_user):
+    client.force_login(editor_user)
+    assert client.get(reverse(PREVIEW) + '?grouping=campus').status_code == 400
+    assert client.get(reverse(PREVIEW)).status_code == 400
+
+
+def test_grouping_preview_requires_import_permission(client, plain_user):
+    client.force_login(plain_user)
+    assert client.get(reverse(PREVIEW) + '?grouping=region').status_code == 403
+
+
+def test_reassign_endpoint_rekeys_stranded_data(client, editor_user, workdir):
+    # The inline recovery the modal offers, through the same one write path the Settings panel uses.
+    _grouped_site('gb', 'sb')
+    FacilityMapBlob.objects.create(kind='annotations', facility='gone', key='sb/f1', data={})
+    client.force_login(editor_user)
+
+    r = client.post(reverse(REASSIGN), data=json.dumps({'old': 'gone', 'new': 'gb'}),
+                    content_type='application/json')
+    assert r.status_code == 200 and r.json() == {'ok': True, 'kinds': ['annotations']}
+    assert FacilityMapBlob.objects.get(kind='annotations', key='sb/f1').facility == 'gb'
+
+
+def test_reassign_endpoint_surfaces_validation_failures(client, editor_user, workdir):
+    # An unreachable target and a source holding nothing are both 400s carrying the server's own
+    # message, so the modal can show it on the failing row and leave the others usable.
+    _grouped_site('gb', 'sb')
+    FacilityMapBlob.objects.create(kind='annotations', facility='gone', key='sb/f1', data={})
+    client.force_login(editor_user)
+    for body in ({'old': 'gone', 'new': 'nowhere'},   # target not reachable
+                 {'old': 'empty', 'new': 'gb'},       # nothing stored under the source
+                 {'old': 'gb', 'new': 'gb'}):         # same source and target
+        r = client.post(reverse(REASSIGN), data=json.dumps(body),
+                        content_type='application/json')
+        assert r.status_code == 400
+    assert FacilityMapBlob.objects.get(kind='annotations', key='sb/f1').facility == 'gone'
+
+
+def test_reassign_endpoint_requires_import_permission(client, plain_user):
+    client.force_login(plain_user)
+    r = client.post(reverse(REASSIGN), data=json.dumps({'old': 'a', 'new': 'b'}),
+                    content_type='application/json')
+    assert r.status_code == 403
 
 
 # --- floor_label_field setting (SET-1): moved off the NetBox-chrome'd SettingsView onto the in-app
@@ -1245,6 +1493,287 @@ def test_nb_sites_rejects_bad_facility(client, superuser):
     assert r.status_code == 400
 
 
+# --- `truncated` (TOPO-5): the list cap is reported, not silent. The split step pre-fetches the
+# building list ONCE and matches drawing filenames against it client-side, so a clipped list that
+# looked complete would quietly fail to match everything past the cap. -------------------------
+#
+# The caps are patched on `frontend_api.common`, the module that DEFINES them, not on the
+# `frontend_api` package that re-exports them: `_list_cap` reads its own module's globals, so a
+# patch on the facade would rebind a name nothing reads and the cap would silently stay at 200.
+
+def test_nb_sites_reports_truncation_at_the_list_cap(client, superuser, monkeypatch):
+    from dcim.models import Site
+    from netbox_facilitymap.frontend_api import common as fa_common
+    monkeypatch.setattr(fa_common, 'NB_LIST_CAP', 2)
+    for i in range(2):
+        Site.objects.create(name=f'Site {i}', slug=f'site-{i}')
+    client.force_login(superuser)
+
+    # Exactly at the cap is NOT truncated — the extra probe row simply isn't there.
+    body = client.get(reverse(SITES)).json()
+    assert len(body['sites']) == 2 and body['truncated'] is False
+
+    Site.objects.create(name='Site 2', slug='site-2')
+    body = client.get(reverse(SITES)).json()
+    assert len(body['sites']) == 2 and body['truncated'] is True   # capped, and says so
+
+
+def test_nb_building_locations_reports_truncation_at_the_list_cap(client, superuser, monkeypatch):
+    from dcim.models import Location, Site
+    from netbox_facilitymap.frontend_api import common as fa_common
+    monkeypatch.setattr(fa_common, 'NB_LIST_CAP', 2)
+    campus = Site.objects.create(name='Campus', slug='campus')
+    for i in range(2):
+        Location.objects.create(name=f'Bldg {i}', slug=f'bldg-{i}', site=campus)
+    client.force_login(superuser)
+
+    body = client.get(reverse(BUILDING_LOCATIONS)).json()
+    assert len(body['locations']) == 2 and body['truncated'] is False
+
+    Location.objects.create(name='Bldg 2', slug='bldg-2', site=campus)
+    body = client.get(reverse(BUILDING_LOCATIONS)).json()
+    assert len(body['locations']) == 2 and body['truncated'] is True
+
+
+# --- `?full=1` (IMPORT-18): the split step matches the building list as a whole rather than typing
+# into it, so it opts into the higher `NB_MATCH_CAP`. The per-keystroke default is unchanged, and
+# the `truncated` contract above holds at whichever cap applies. ---------------------------------
+
+def test_nb_building_locations_full_raises_the_cap_but_keeps_reporting_truncation(
+        client, superuser, monkeypatch):
+    from dcim.models import Location, Site
+    from netbox_facilitymap.frontend_api import common as fa_common
+    monkeypatch.setattr(fa_common, 'NB_LIST_CAP', 2)
+    monkeypatch.setattr(fa_common, 'NB_MATCH_CAP', 4)
+    campus = Site.objects.create(name='Campus', slug='campus')
+    for i in range(4):
+        Location.objects.create(name=f'Bldg {i}', slug=f'bldg-{i}', site=campus)
+    client.force_login(superuser)
+
+    # Past the per-keystroke cap, the default read clips and says so — the bug: buildings past it
+    # could never be proposed to a drawing.
+    body = client.get(reverse(BUILDING_LOCATIONS)).json()
+    assert len(body['locations']) == 2 and body['truncated'] is True
+
+    # `?full=1` reaches all four, and reports the whole list as whole.
+    body = client.get(reverse(BUILDING_LOCATIONS), {'full': '1'}).json()
+    assert len(body['locations']) == 4 and body['truncated'] is False
+
+    # Past the *higher* cap it still clips honestly — raising the ceiling moved the number, not the
+    # contract the frontend's partial-list fallback rides on.
+    Location.objects.create(name='Bldg 4', slug='bldg-4', site=campus)
+    body = client.get(reverse(BUILDING_LOCATIONS), {'full': '1'}).json()
+    assert len(body['locations']) == 4 and body['truncated'] is True
+
+
+def test_nb_sites_full_raises_the_cap(client, superuser, monkeypatch):
+    from dcim.models import Site
+    from netbox_facilitymap.frontend_api import common as fa_common
+    monkeypatch.setattr(fa_common, 'NB_LIST_CAP', 2)
+    monkeypatch.setattr(fa_common, 'NB_MATCH_CAP', 4)
+    for i in range(4):
+        Site.objects.create(name=f'Site {i}', slug=f'site-{i}')
+    client.force_login(superuser)
+
+    body = client.get(reverse(SITES)).json()
+    assert len(body['sites']) == 2 and body['truncated'] is True
+
+    body = client.get(reverse(SITES), {'full': '1'}).json()
+    assert len(body['sites']) == 4 and body['truncated'] is False
+
+
+def test_full_is_opt_in_only_for_the_match_read(client, superuser, monkeypatch):
+    """Anything other than an explicit `full=1` keeps the per-keystroke cap — a stray `full=0`/
+    `full=yes` must not silently widen a picker query."""
+    from dcim.models import Site
+    from netbox_facilitymap.frontend_api import common as fa_common
+    monkeypatch.setattr(fa_common, 'NB_LIST_CAP', 2)
+    monkeypatch.setattr(fa_common, 'NB_MATCH_CAP', 4)
+    for i in range(4):
+        Site.objects.create(name=f'Site {i}', slug=f'site-{i}')
+    client.force_login(superuser)
+
+    for value in ('0', 'yes', 'true', ''):
+        body = client.get(reverse(SITES), {'full': value}).json()
+        assert len(body['sites']) == 2 and body['truncated'] is True, value
+
+
+# --- NbLocationsView shares that cap contract (IMPORT-29). Two callers with opposite needs use it:
+# the map step's "+ Add floor" search types into the results (per-keystroke cap, the point), while
+# `ImportFlow._loadFloors` reads a site's Location list as a WHOLE — it derives the floor buttons,
+# the anchor tree, and the set stale floor assignments are swept against. Rooms are Locations too,
+# so an ordinary site exceeds 200 long before a campus does, and a silently clipped answer there
+# didn't merely hide floors: it made the client reset assignments whose Location sat past the cap.
+# So this endpoint reports `truncated` and honours `?full=1` like its siblings. ------------------
+
+def test_nb_locations_reports_truncation_at_the_list_cap(client, superuser, monkeypatch):
+    from dcim.models import Location, Site
+    from netbox_facilitymap.frontend_api import common as fa_common
+    monkeypatch.setattr(fa_common, 'NB_LIST_CAP', 2)
+    site = Site.objects.create(name='Site', slug='site')
+    for i in range(2):
+        Location.objects.create(name=f'Floor {i}', slug=f'floor-{i}', site=site)
+    client.force_login(superuser)
+
+    body = client.get(reverse(LOCATIONS), {'site': 'site'}).json()
+    assert len(body['rooms']) == 2 and body['truncated'] is False
+
+    Location.objects.create(name='Floor 2', slug='floor-2', site=site)
+    body = client.get(reverse(LOCATIONS), {'site': 'site'}).json()
+    assert len(body['rooms']) == 2 and body['truncated'] is True
+
+
+def test_nb_locations_full_raises_the_cap_for_the_whole_list_read(client, superuser, monkeypatch):
+    """`_loadFloors` passes `?full=1`; the per-keystroke "+ Add floor" search does not."""
+    from dcim.models import Location, Site
+    from netbox_facilitymap.frontend_api import common as fa_common
+    monkeypatch.setattr(fa_common, 'NB_LIST_CAP', 2)
+    monkeypatch.setattr(fa_common, 'NB_MATCH_CAP', 4)
+    site = Site.objects.create(name='Site', slug='site')
+    for i in range(4):
+        Location.objects.create(name=f'Floor {i}', slug=f'floor-{i}', site=site)
+    client.force_login(superuser)
+
+    body = client.get(reverse(LOCATIONS), {'site': 'site'}).json()
+    assert len(body['rooms']) == 2 and body['truncated'] is True
+
+    body = client.get(reverse(LOCATIONS), {'site': 'site', 'full': '1'}).json()
+    assert len(body['rooms']) == 4 and body['truncated'] is False
+
+    # Past the higher cap it still clips honestly — the client refuses to sweep assignments against
+    # a `truncated` answer, so the flag has to keep telling the truth at either ceiling.
+    Location.objects.create(name='Floor 4', slug='floor-4', site=site)
+    body = client.get(reverse(LOCATIONS), {'site': 'site', 'full': '1'}).json()
+    assert len(body['rooms']) == 4 and body['truncated'] is True
+
+
+def test_nb_locations_orders_shallowest_first_so_a_cap_never_clips_a_floor(client, superuser,
+                                                                          monkeypatch):
+    """The regression IMPORT-49 fixed: rooms crowding floors out of the answer.
+
+    `Location.objects` is MPTT-managed, so it arrives in `tree_id, lft` order — a **depth-first**
+    walk that descends into each floor's rooms before reaching the next floor. With the cap at 8 the
+    old order returned `MAIN BUILDING, Level 1, its 3 rooms, Level 2, its 3 rooms` and stopped: two
+    floors out of six, and the operator was told only that the site had "more locations than can be
+    listed at once". Breadth-first, the six floors are emitted before a single room."""
+    from dcim.models import Location, Site
+    from netbox_facilitymap.frontend_api import common as fa_common
+    monkeypatch.setattr(fa_common, 'NB_MATCH_CAP', 8)
+    site = Site.objects.create(name='Main', slug='main')
+    building = Location.objects.create(name='MAIN BUILDING', slug='main-building', site=site)
+    for f in range(6):
+        floor = Location.objects.create(name=f'Level {f}', slug=f'level-{f}', site=site,
+                                        parent=building)
+        for r in range(3):
+            Location.objects.create(name=f'Room {f}0{r}', slug=f'room-{f}0{r}', site=site,
+                                    parent=floor)
+    client.force_login(superuser)
+
+    body = client.get(reverse(LOCATIONS), {'site': 'main', 'full': '1'}).json()
+    slugs = {r['slug'] for r in body['rooms']}
+    assert 'main-building' in slugs
+    assert {f'level-{f}' for f in range(6)} <= slugs, 'a floor was clipped'
+    # Something *was* dropped — the rooms, which the floor list never reads — and the answer says
+    # so, and says at which tier, so the client can tell this from a clip that reached the floors.
+    assert body['truncated'] is True and body['truncated_depth'] == 2
+
+
+def test_nb_locations_reports_the_tier_a_clip_landed_in(client, superuser, monkeypatch):
+    """`truncated_depth` is the contract that lets a caller keep a clipped answer: everything
+    shallower than it is complete. `None` when nothing was clipped at all."""
+    from dcim.models import Location, Site
+    from netbox_facilitymap.frontend_api import common as fa_common
+    site = Site.objects.create(name='Campus', slug='campus')
+    for i in range(3):
+        Location.objects.create(name=f'Building {i}', slug=f'building-{i}', site=site)
+    client.force_login(superuser)
+
+    body = client.get(reverse(LOCATIONS), {'site': 'campus', 'full': '1'}).json()
+    assert body['truncated'] is False and body['truncated_depth'] is None
+
+    # Clipped among the roots themselves — the buildings — so a caller whose floors sit *below*
+    # them has to distrust the answer, exactly as it always did.
+    monkeypatch.setattr(fa_common, 'NB_MATCH_CAP', 2)
+    body = client.get(reverse(LOCATIONS), {'site': 'campus', 'full': '1'}).json()
+    assert body['truncated'] is True and body['truncated_depth'] == 0
+
+
+def test_nb_locations_flags_a_slug_no_site_answers_to(client, superuser):
+    """"No such Site" must not read as "this site has no floors" (IMPORT-29).
+
+    Both return an empty `rooms`, but only the first means the *binding* is broken — a Site renamed
+    or deleted in NetBox after the folder was bound. Without the flag the wizard quietly fell back
+    to its floor-**type** vocabulary and built floor ids matching nothing in NetBox."""
+    from dcim.models import Site
+    Site.objects.create(name='Real', slug='real')
+    client.force_login(superuser)
+
+    body = client.get(reverse(LOCATIONS), {'site': 'gone'}).json()
+    assert body['rooms'] == [] and body['site_not_found'] is True
+
+    # A site that exists but holds no Locations is the *other* case, and says so.
+    body = client.get(reverse(LOCATIONS), {'site': 'real'}).json()
+    assert body['rooms'] == [] and body['site_not_found'] is False
+
+
+# --- The map step's floor read across every organization shape (IMPORT-29). The client derives a
+# building's floors from the site's flat Location list (`ImportFlow._floorsFromLocations`, covered in
+# the JS tier), so what this endpoint owes it is the WHOLE tree — including rooms, which is precisely
+# what makes an ordinary site outgrow the per-keystroke cap. ---------------------------------------
+
+def test_nb_locations_returns_the_whole_tree_for_a_site_per_building_facility(client, superuser):
+    """`site-as-building`: the Site *is* the building; floors are its top-level Locations."""
+    from dcim.models import Location, Site
+    site = Site.objects.create(name='Annex', slug='annex')
+    l1 = Location.objects.create(name='Level 1', slug='level-1', site=site)
+    Location.objects.create(name='Room 101', slug='room-101', site=site, parent=l1)
+    Location.objects.create(name='Roof', slug='roof', site=site)
+    client.force_login(superuser)
+
+    rooms = client.get(reverse(LOCATIONS), {'site': 'annex', 'full': '1'}).json()['rooms']
+    by_slug = {r['slug']: r for r in rooms}
+    assert set(by_slug) == {'level-1', 'room-101', 'roof'}
+    # The `parent` edge is what the client walks (MPTT depth/level is unreliable on 4.2+), so it has
+    # to survive the trim.
+    assert by_slug['room-101']['parent'] == l1.pk and by_slug['level-1']['parent'] is None
+
+
+def test_nb_locations_returns_the_whole_tree_for_a_campus_facility(client, superuser):
+    """`site-as-campus` (MODEL-4): one Site holds every building as a Location, floors are those
+    buildings' children — and two buildings under one campus may share a floor slug."""
+    from dcim.models import Location, Site
+    campus = Site.objects.create(name='Campus', slug='campus')
+    a = Location.objects.create(name='Building A', slug='bldg-a', site=campus)
+    b = Location.objects.create(name='Building B', slug='bldg-b', site=campus)
+    Location.objects.create(name='Level 1', slug='a-level-1', site=campus, parent=a)
+    Location.objects.create(name='Level 1', slug='b-level-1', site=campus, parent=b)
+    client.force_login(superuser)
+
+    rooms = client.get(reverse(LOCATIONS), {'site': 'campus', 'full': '1'}).json()['rooms']
+    by_slug = {r['slug']: r for r in rooms}
+    assert set(by_slug) == {'bldg-a', 'bldg-b', 'a-level-1', 'b-level-1'}
+    # Each floor hangs off its own building, which is what keeps the two apart client-side.
+    assert by_slug['a-level-1']['parent'] == a.pk
+    assert by_slug['b-level-1']['parent'] == b.pk
+
+
+def test_nb_locations_returns_the_whole_tree_for_a_wing_facility(client, superuser):
+    """campus → building → wing → floor (MULTI-5): the client re-anchors onto the wing, so the
+    grandchild level has to reach it rather than being pruned server-side."""
+    from dcim.models import Location, Site
+    campus = Site.objects.create(name='Campus', slug='campus')
+    bldg = Location.objects.create(name='Main', slug='main', site=campus)
+    wing = Location.objects.create(name='North Wing', slug='north', site=campus, parent=bldg)
+    floor = Location.objects.create(name='Level 1', slug='n-level-1', site=campus, parent=wing)
+    Location.objects.create(name='Room 1', slug='n-room-1', site=campus, parent=floor)
+    client.force_login(superuser)
+
+    rooms = client.get(reverse(LOCATIONS), {'site': 'campus', 'full': '1'}).json()['rooms']
+    by_slug = {r['slug']: r for r in rooms}
+    assert set(by_slug) == {'main', 'north', 'n-level-1', 'n-room-1'}
+    assert by_slug['north']['parent'] == bldg.pk and by_slug['n-level-1']['parent'] == wing.pk
+
+
 # --- NbPlacementNearbyView (PLACE-2): diagnostic gear counts for the *empty* placement panel. When a
 # room's Location has no directly-assigned placeable gear, this read-only endpoint reports where the
 # gear actually lives — an ancestor Location or the Site — so the user can reassign it to this room.
@@ -1331,3 +1860,155 @@ def test_placement_nearby_blank_or_unknown_location(client, superuser):
     client.force_login(superuser)
     assert client.get(reverse(PLACEMENT_NEARBY)).json()['nearby'] == []
     assert client.get(reverse(PLACEMENT_NEARBY), {'location': 999999}).json()['nearby'] == []
+
+
+# ---- the floor-key anchor rule: segment -2 is the floor's DIRECT parent (MULTI-5) ----
+
+def _wing_hierarchy():
+    """Site -> building Location -> wing Location -> floor Location — the four-level tree the
+    building-anchor design left out of scope, and the shape the import wizard's anchor drill-down
+    now steers an operator through."""
+    from dcim.models import Location, Site
+    site = Site.objects.create(name='Campus', slug='campus')
+    bldg = Location.objects.create(name='Building A', slug='building-a', site=site)
+    wing = Location.objects.create(name='Wing North', slug='wing-north', site=site, parent=bldg)
+    floor = Location.objects.create(name='Level 1', slug='level-1', site=site, parent=wing)
+    return site, bldg, wing, floor
+
+
+def test_resolve_floor_location_anchors_on_the_floors_direct_parent():
+    # Anchoring the import folder on the WING resolves — the ordinary 3-segment key, no format
+    # change. This is why `_floorsFromLocations` offers the anchor's children and never its
+    # grandchildren: the middle segment is matched as the floor's `parent__slug`.
+    from netbox_facilitymap.frontend_api import resolve_floor_location
+    _, _, _, floor = _wing_hierarchy()
+    assert resolve_floor_location('campus/wing-north/level-1') == floor
+
+
+def test_resolve_floor_location_rejects_a_grandparent_anchor():
+    # Anchoring on the BUILDING while the floor is a grandchild cannot resolve, so the wizard must
+    # never emit such a key (`_dropUnanchoredTokens` downgrades any assignment that would).
+    from netbox_facilitymap.frontend_api import resolve_floor_location
+    _wing_hierarchy()
+    assert resolve_floor_location('campus/building-a/level-1') is None
+
+
+def test_resolve_floor_location_tolerates_a_deeper_key():
+    # `parse_floor_key` reads segment -2, so even a hypothetical 4-segment key resolves by the
+    # floor's direct parent rather than choking (BUILDING-ANCHOR-DESIGN §8 open-q 2).
+    from netbox_facilitymap.frontend_api import resolve_floor_location
+    _, _, _, floor = _wing_hierarchy()
+    assert resolve_floor_location('campus/building-a/wing-north/level-1') == floor
+
+
+# --- org_mode setting (MODEL-6): the one PER-FACILITY settings endpoint. Same IMPORT_PERM tier as
+# its install-wide siblings, but the facility rides the body and the value lands in a nested
+# `facility_org_modes` map, so two facilities' modes never clobber each other. -------------------
+
+def test_org_mode_post_persists_for_the_named_facility(client, editor_user):
+    client.force_login(editor_user)
+    r = client.post(reverse(ORG_MODE),
+                    data=json.dumps({'facility': 'ga', 'org_mode': 'site-as-campus'}),
+                    content_type='application/json')
+    assert r.status_code == 200 and r.json() == {'ok': True, 'org_modes': {'ga': 'site-as-campus'}}
+    assert FacilityMapBlob.objects.get(kind='settings', facility='', key='').data \
+        == {'facility_org_modes': {'ga': 'site-as-campus'}}
+
+
+def test_org_mode_post_defaults_to_the_default_facility(client, editor_user):
+    # An omitted facility is the default facility '' — not an error, matching `_facility`'s default.
+    client.force_login(editor_user)
+    r = client.post(reverse(ORG_MODE), data=json.dumps({'org_mode': 'site-as-campus'}),
+                    content_type='application/json')
+    assert r.status_code == 200 and r.json()['org_modes'] == {'': 'site-as-campus'}
+
+
+def test_org_mode_post_rejects_an_unknown_mode_and_a_bad_facility(client, editor_user):
+    client.force_login(editor_user)
+    bad_mode = client.post(reverse(ORG_MODE),
+                           data=json.dumps({'facility': 'ga', 'org_mode': 'site-as-anything'}),
+                           content_type='application/json')
+    bad_facility = client.post(reverse(ORG_MODE),
+                               data=json.dumps({'facility': '../evil',
+                                                'org_mode': 'site-as-campus'}),
+                               content_type='application/json')
+    assert bad_mode.status_code == 400 and bad_facility.status_code == 400
+    assert not FacilityMapBlob.objects.filter(kind='settings').exists()
+
+
+def test_org_mode_requires_import_permission(client, plain_user):
+    # Admin-tier config like every setting beside it (PERM-1) — the everyday map-write gate is not
+    # enough, and the refusal writes nothing.
+    client.force_login(plain_user)
+    r = client.post(reverse(ORG_MODE),
+                    data=json.dumps({'facility': 'ga', 'org_mode': 'site-as-campus'}),
+                    content_type='application/json')
+    assert r.status_code == 403
+    assert not FacilityMapBlob.objects.filter(kind='settings').exists()
+
+
+def test_org_mode_reads_back_through_the_facilities_list(client, superuser, workdir):
+    # The read-back channel: no GET of its own — the mode rides each facility record the SPA already
+    # loads, and an unset facility reports the default. Listed as a superuser because the facility
+    # list is object-permission scoped to the SiteGroups the caller may view.
+    _grouped_site('ga', 'sa')
+    _grouped_site('gb', 'sb')
+    client.force_login(superuser)
+    client.post(reverse(ORG_MODE),
+                data=json.dumps({'facility': 'ga', 'org_mode': 'site-as-campus'}),
+                content_type='application/json')
+
+    listed = {f['slug']: f for f in client.get(reverse(FACILITIES)).json()['facilities']}
+    assert listed['ga']['org_mode'] == 'site-as-campus'
+    assert listed['gb']['org_mode'] == 'site-as-building'
+
+
+# --- the `location` grouping (MODEL-8): sweep isolation + subtree-scoped anchor search -----------
+
+def _location_grouping():
+    FacilityMapBlob.objects.update_or_create(
+        kind='settings', facility='', key='', defaults={'data': {'facility_grouping': 'location'}})
+
+
+def _campus_two_facilities():
+    """One campus Site hosting two location-grouping facilities: bldg-a (floors a-l1, a-l2) and
+    bldg-b (floor b-l1). Returns (site, bldg_a, bldg_b)."""
+    from dcim.models import Location, Site
+    _location_grouping()
+    site = Site.objects.create(name='Campus', slug='campus')
+    a = Location.objects.create(name='Building A', slug='bldg-a', site=site)
+    b = Location.objects.create(name='Building B', slug='bldg-b', site=site)
+    Location.objects.create(name='A L1', slug='a-l1', site=site, parent=a)
+    Location.objects.create(name='A L2', slug='a-l2', site=site, parent=a)
+    Location.objects.create(name='B L1', slug='b-l1', site=site, parent=b)
+    return site, a, b
+
+
+def test_sync_rooms_sweep_never_crosses_a_location_facility():
+    # THE MODEL-8 data-safety property: two facilities share one campus Site, so facility A's
+    # authoritative whole-facility save (sweep_absent=True) must sweep only A's own floors — a
+    # Site-slug scope would hand it B's rooms too, and this save would silently delete them.
+    _campus_two_facilities()
+    Room.objects.create(floor_key='campus/bldg-a/a-l1', room_id='keep-a')
+    Room.objects.create(floor_key='campus/bldg-a/a-l2', room_id='sweep-a')
+    Room.objects.create(floor_key='campus/bldg-b/b-l1', room_id='keep-b')
+
+    # A's save posts only floor a-l1: a-l2's room is absent from the whole-facility document and is
+    # swept; B's room is outside facility A entirely and must survive.
+    sync_rooms({'campus/bldg-a/a-l1': [
+        {'id': 'keep-a', 'label': '', 'polygon': [], 'location': None},
+    ]}, user=None, facility='bldg-a', sweep_absent=True)
+
+    keys = set(Room.objects.values_list('room_id', flat=True))
+    assert keys == {'keep-a', 'keep-b'}
+
+
+def test_nb_building_locations_scoped_to_the_location_facility_subtree(client, superuser):
+    # Both facilities live under the one campus Site, so the Site scope alone can't split them —
+    # the anchor search must offer only the requested facility's own subtree (FACIL-1 one level
+    # down), or an operator could bind a drawing into a sibling facility.
+    _campus_two_facilities()
+    client.force_login(superuser)
+
+    body = client.get(reverse(BUILDING_LOCATIONS) + '?facility=bldg-a').json()
+    assert {l['slug'] for l in body['locations']} == {'bldg-a'}

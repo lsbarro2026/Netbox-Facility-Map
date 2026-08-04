@@ -7,6 +7,37 @@
    (breadcrumbs, toolbar, side panel, keyboard). Loaded LAST. */
 
 class App {
+  // One representative global per eager <script> in index.html's dependency-order block
+  // (INSTALL-1) — a stale collectstatic/CDN copy of any of these throws a bare ReferenceError
+  // somewhere downstream instead of failing legibly at boot. Not every class each file defines
+  // (lib.js alone has 8) — just enough to catch a whole file failing to update.
+  //
+  // Each entry is [name, presence check] rather than a bare name: these classes are top-level
+  // `class` declarations in classic (non-module) scripts, which bind in the global *lexical*
+  // environment, not as properties of `window`/`globalThis` (unlike `var`/`function`) — so a
+  // `window[name]` lookup always reads as missing regardless of whether the script actually
+  // loaded. `typeof <Identifier>` is the correct (and eval-free, CSP-safe) way to test a lexical
+  // binding without throwing on an absent one. Kept as one array so a new required global is a
+  // single-line addition here, nothing to keep in sync elsewhere.
+  static REQUIRED_GLOBALS = [
+    ['Dom', () => typeof Dom !== 'undefined'],
+    ['TodoModel', () => typeof TodoModel !== 'undefined'],
+    ['TodoChips', () => typeof TodoChips !== 'undefined'],
+    ['TodoComposer', () => typeof TodoComposer !== 'undefined'],
+    ['TodoPage', () => typeof TodoPage !== 'undefined'],
+    ['MobileTodoPage', () => typeof MobileTodoPage !== 'undefined'],
+    ['NetBoxClient', () => typeof NetBoxClient !== 'undefined'],
+    ['Store', () => typeof Store !== 'undefined'],
+    ['GridController', () => typeof GridController !== 'undefined'],
+    ['PanZoom', () => typeof PanZoom !== 'undefined'],
+    ['UndoStack', () => typeof UndoStack !== 'undefined'],
+    ['Editor', () => typeof Editor !== 'undefined'],
+    ['SiteplanEditor', () => typeof SiteplanEditor !== 'undefined'],
+    ['SettingsPage', () => typeof SettingsPage !== 'undefined'],
+    ['ApSettingsPage', () => typeof ApSettingsPage !== 'undefined'],
+    ['FloorViewMenu', () => typeof FloorViewMenu !== 'undefined'],
+  ];
+
   constructor() {
     this.store = new Store();
     this.netbox = new NetBoxClient();
@@ -16,6 +47,15 @@ class App {
     this.siteLabels = false;            // siteplan: show building name labels (hidden by default)
     this.highlight = 'all';             // floor view-mode highlight: 'all' rooms (default) | 'placements' (rooms with devices) | 'none'
     this.current = null;                // active Editor (or null on building view)
+    this._stagePage = null;             // active non-Editor page mounted into #stage (SettingsPage/
+                                         // ApSettingsPage/TodoPage/MobileTodoPage/ImportFlow) —
+                                         // cleared, and given its optional detach(), by
+                                         // `_detachCurrent`; also where `_navRefusal` asks whether
+                                         // the page refuses to be navigated away from right now
+    // The app's single phone breakpoint (Util.phoneMq, lib.js). Created here, not in _bindGlobal,
+    // so _fitToolbar can read it unguarded no matter which of them runs first; _bindGlobal
+    // attaches its change listener.
+    this._phoneMq = Util.phoneMq();
     // Embedded in a dashboard-widget iframe (?embed=1): chrome hidden + no in-card navigation.
     // A building click opens the full map in the top window instead (SiteplanEditor.openBuilding),
     // since the chrome-free card has no breadcrumbs to return through. Interactivity (pan/zoom +
@@ -100,6 +140,12 @@ class App {
     // a referrer. UI-only, exactly like lastFloor: it decorates a crumb trail and nothing else —
     // never persisted, never in the hash, never load-bearing for routing.
     this.navOrigin = null;
+    // The facility-relative route the settings gear was opened FROM, so closing settings returns
+    // there instead of always dumping you on the siteplan (MOBILE-3). Recorded at open time (so it
+    // can never go stale) and cleared on close; null means "nothing remembered", which falls back
+    // to the siteplan — the old unconditional behaviour. UI-only, like navOrigin: never persisted,
+    // never in the hash, never load-bearing for routing.
+    this._settingsReturn = null;
     // Active facility ('' = the default facility), threaded onto every per-facility API call via
     // Api.facility. A leading `#/y/<slug>` hash segment selects it; the picker switches it (MULTI-2).
     this.facility = '';
@@ -109,8 +155,14 @@ class App {
     // it's always '' or a reachable, content-having slug. init() reads it once to resolve the boot
     // facility; the Settings select reads/persists it, held live so a re-mount preselects the choice.
     this.defaultFacility = (window.MAP && window.MAP.defaultFacility) || '';
-    this.facilities = null;             // [{slug,name,has_content}] for the picker; loaded once in init()
-    this.grouping = 'sitegroup';        // which dcim grouping identifies a facility (SiteGroup|Region)
+    this.facilities = null;             // [{slug,name,has_content,org_mode}] for the picker; loaded once in init()
+    this._facilitiesLoad = null;        // the in-flight init() fetch, awaited by ensureFacilities()
+    this.grouping = 'sitegroup';        // which dcim grouping identifies a facility (SiteGroup|Region|top-level Location)
+    // facility slug -> the organization mode THIS SESSION wrote for it (MODEL-6). `setOrgMode`
+    // fills it; `orgMode()` prefers it over `facilities`, which is a boot-time snapshot that omits
+    // an empty facility entirely — so without this a mode written mid-first-import would read back
+    // as the default (TOPO-3).
+    this._orgModes = new Map();
     // The signed-in viewer, {id,username,display,initials} — the shape a to-do's assignees arrive in
     // (TASK-3), so `TodoModel.assignedTo` compares ids straight across. Null only when window.MAP is
     // absent (standalone), which every reader must tolerate: an unknown viewer just means "no to-do
@@ -126,7 +178,68 @@ class App {
     return this.capabilities.includes(key);
   }
 
+  /** Await the facility list, fetching it if `init()`'s boot load never ran or failed. `init()`
+   *  fires that load fire-and-forget (the picker degrades to hidden), which is fine for a
+   *  decoration — but a reader that *steers behaviour* off a per-facility fact (`orgMode()`) must
+   *  not silently read the default just because the list hadn't landed yet. Resolves to
+   *  `this.facilities` (`[]` when unreadable, matching the boot fallback). */
+  async ensureFacilities() {
+    if (!this._facilitiesLoad)
+      this._facilitiesLoad = this.netbox.facilities()
+        .then(f => { this.facilities = f.facilities; this.grouping = f.grouping; })
+        .catch(() => { this.facilities = []; });
+    await this._facilitiesLoad;
+    return this.facilities;
+  }
+
+  /** The active facility's declared **NetBox organization mode** (MODEL-6):
+   *  `'site-as-building'` (a Site *is* a building — the default) or `'site-as-campus'` (a Site is a
+   *  campus whose buildings are Locations). Under the `location` grouping (MODEL-8) the server
+   *  forces every facility to `'site-as-campus'` (a Location-subtree facility is campus-shaped by
+   *  construction) — mirrored here **before** the facility-list lookup, since a brand-new facility
+   *  being imported for the first time (no content yet) can be absent from that list, and reading
+   *  only the list would silently fall back to the wrong default (IMPORT-15). Then a mode **this
+   *  session wrote** (`_orgModes`, below) wins over the list, which was fetched at boot and may not
+   *  enumerate this facility at all. Otherwise read from that list, the one place the SPA learns
+   *  per-facility facts; a facility absent from it reports the default, matching what the server
+   *  reports for an unset facility.
+   *  Callers that must not read a premature default should `await ensureFacilities()` first. */
+  orgMode() {
+    if (this.grouping === 'location') return 'site-as-campus';
+    if (this._orgModes.has(this.facility)) return this._orgModes.get(this.facility);
+    const rec = (this.facilities || []).find(f => f.slug === this.facility);
+    return (rec && rec.org_mode) || 'site-as-building';
+  }
+
+  /** Persist the active facility's organization mode (MODEL-6) — the client's one write path,
+   *  mirroring the server's single writer (`facilities.set_org_mode`). Records the new value so the
+   *  next `orgMode()` read (and anything driven by it — the Settings row, the import wizard's bind
+   *  step) reflects the change without a reload. Shared by `SettingsPage._saveOrgMode` and the
+   *  import wizard's topology step / inline "Switch to…" control so none of them duplicates the
+   *  POST/cache-update; each caller owns its own toast/error handling.
+   *
+   *  It records into **both** the cached facility record and `_orgModes`, because the record may not
+   *  exist: `list_facilities` omits an empty facility, which is exactly the state a brand-new
+   *  facility is in while the wizard is configuring it (TOPO-3 — the topology step writes this mode
+   *  *before* the first import, so a write with nowhere to land would read straight back as the
+   *  default and send the bind step hunting for the wrong object type). */
+  async setOrgMode(mode) {
+    await Api.post('/api/settings/org-mode', { facility: this.facility, org_mode: mode });
+    const rec = (this.facilities || []).find(f => f.slug === this.facility);
+    if (rec) rec.org_mode = mode;
+    this._orgModes.set(this.facility, mode);
+  }
+
   async init() {
+    // Boot-time asset sanity check (INSTALL-1): a stale collectstatic/CDN copy of an eager
+    // script served alongside a fresh index.html fails here with an actionable message instead
+    // of an unhandled ReferenceError deep in some later call.
+    const missing = App.REQUIRED_GLOBALS.filter(([, present]) => !present()).map(([name]) => name);
+    if (missing.length) {
+      document.body.innerHTML = '<div class="empty">Plugin assets are out of date (missing: '
+        + missing.join(', ') + '). Re-run collectstatic and hard-refresh.</div>';
+      return;
+    }
     // Resolve the boot facility BEFORE the first load so loadCore hydrates the right one
     // (Api.facility is what the manifest/blob GETs carry). An explicit `#/y/<slug>` in the hash
     // wins; a bare hash uses the operator-pinned default facility (SET-2), falling back to '' when
@@ -154,7 +267,9 @@ class App {
       return;
     }
     // The facility list backs the picker; a failure is non-fatal (the picker just doesn't show).
-    this.netbox.facilities()
+    // The promise is kept so a later reader that genuinely *needs* the list (`ensureFacilities`)
+    // can await this same in-flight fetch instead of racing it or issuing a second one.
+    this._facilitiesLoad = this.netbox.facilities()
       .then(f => { this.facilities = f.facilities; this.grouping = f.grouping; this._renderFacilityPicker(); })
       .catch(() => { this.facilities = []; });
     this._bindGlobal();
@@ -180,25 +295,82 @@ class App {
     this.store.applyDraft(draft);
   }
 
-  /** Restore-draft prompt (mirrors Editor._confirmLeaveEdit's `.fm-modal` pattern): resolves `true`
-   *  to restore, `false` to discard. Backdrop click or Discard dismisses as discard. */
+  /** Restore-draft prompt: resolves `true` to restore, `false` to discard. Not `danger` — the
+   *  affirmative here *recovers* work rather than destroying it, so Restore takes the emphasis
+   *  (`Modal`, §11). Backdrop, Escape, or Discard dismisses as discard. */
   _confirmRestore() {
-    return new Promise((resolve) => {
-      let done = false;
-      const finish = (v) => { if (done) return; done = true; overlay.remove(); resolve(v); };
-      const overlay = Dom.el('div', { class: 'fm-modal', onclick: (e) => { if (e.target === overlay) finish(false); } }, [
-        Dom.el('div', { class: 'fm-modal-panel' }, [
-          Dom.el('h3', {}, 'Restore unsaved changes?'),
-          Dom.el('p', {}, 'This browser has map edits from a previous session that were never saved. '
-            + 'Restore them, or discard and start from the last saved version.'),
-          Dom.el('div', { class: 'fm-modal-actions' }, [
-            Dom.el('button', { onclick: () => finish(false) }, 'Discard'),
-            Dom.el('button', { class: 'primary', onclick: () => finish(true) }, 'Restore'),
-          ]),
-        ]),
-      ]);
-      document.body.append(overlay);
+    return Modal.confirm({
+      title: 'Restore unsaved changes?',
+      body: 'This browser has map edits from a previous session that were never saved. '
+        + 'Restore them, or discard and start from the last saved version.',
+      cancelLabel: 'Discard',
+      confirmLabel: 'Restore',
     });
+  }
+
+  /** Unsaved-work navigation-away prompt, shown by `_navigate` in place of a blocking native
+   *  `confirm()` (UX-15). Resolves `true` to leave (the pending edits are then discarded by the
+   *  caller), `false` to stay; backdrop and Escape stay. `danger` because leaving discards work
+   *  that cannot be recovered — the same reading `Editor._confirmLeaveEdit` gives its own
+   *  leave-without-saving choice. */
+  _confirmLeavePage() {
+    return Modal.confirm({
+      title: 'Unsaved changes',
+      body: 'You have unsaved changes that will be lost. Leave this page?',
+      confirmLabel: 'Leave without saving',
+      danger: true,
+    });
+  }
+
+  /** Disconnect the outgoing editor's container `ResizeObserver` before `this.current` is
+   *  replaced or cleared, so navigating away can't leave it observing a detached container and
+   *  keeping the torn-down editor reachable (BUG-2).
+   *
+   *  `Popover.closeAll()` is the same discipline for every trigger-anchored menu, and the reason
+   *  no view has to remember it (QUAL-9). A popover's `document` listeners must stay bound for as
+   *  long as it is open, so browser Back — which clears the stage without the outside-click that
+   *  would otherwise dismiss it — used to strand them; that leak was found in `TodoPage` (QUAL-8)
+   *  and again in `FloorViewMenu`, which had no teardown hook of any kind. Closing centrally here
+   *  covers both, and every popover added later, whether or not its owner is a stage page.
+   *
+   *  The outgoing non-`Editor` stage page (`SettingsPage`/`ApSettingsPage`/`TodoPage`/
+   *  `MobileTodoPage`) is also given a `detach()` if it defines one — a general hook rather than an
+   *  `instanceof` special case, for page-level teardown that isn't a popover. No page needs it
+   *  today; it stays as the seam for one that does. */
+  _detachCurrent() {
+    if (this.current instanceof Editor) this.current.detach();
+    Popover.closeAll();
+    if (this._stagePage && typeof this._stagePage.detach === 'function') this._stagePage.detach();
+    this._stagePage = null;
+  }
+
+  /** The active stage page's refusal to be navigated away from *right now*, as the message to show,
+   *  or null when it doesn't refuse (or has no say). The first of the two guards `_navigate`
+   *  consults, ahead of the unsaved-work prompt — and, like `detach()` above, a general hook rather
+   *  than a page-type special case, so no view's state leaks into `App`.
+   *
+   *  It exists for the import wizard (IMPORT-61): a nav-away taken while an upload run or a scan is
+   *  in flight strands the runner narrating into a `#stage` this would wipe, and the scan then
+   *  navigates the operator forward out of wherever they went. `ImportFlow` had gated the ways off a
+   *  *step* (`_goToStep`), but the crumb trail, browser Back, the settings gear and the facility
+   *  picker leave the wizard entirely — and every one of those routes through `_navigate`, so this
+   *  is the one place that covers them all, including whatever nav-away is added next.
+   *
+   *  A refusal must be bounded, or it is a trap: the page owns that (the wizard's phases always
+   *  return to idle, and its scan is time-budgeted), which is the other reason the decision stays
+   *  with the page rather than being reimplemented here. */
+  _navRefusal() {
+    const page = this._stagePage;
+    return (page && typeof page.navRefusal === 'function' && page.navRefusal()) || null;
+  }
+
+  /** Toggle the corner loading indicator (`#nav-loading`) shown while `showFloor`/`renderBuilding`
+   *  await their data (UX-15) — the previous view stays on screen underneath, so without this a
+   *  slow load reads as a dead click. Mirrors `FloorEditor.openRackPanel`'s inline "Loading…"
+   *  placeholder for the same shape of wait. */
+  _setBusy(on) {
+    const el = Dom.$('#nav-loading');
+    if (el) el.hidden = !on;
   }
 
   // ---- routing ----
@@ -301,27 +473,55 @@ class App {
     return this._floorData;
   }
 
+  /** Make `slug` the active facility **in place**, reloading its documents — the switch itself,
+   *  with no routing of its own. Resolves `true` once that facility's core documents are loaded,
+   *  `false` when the load failed (the stage already carries the message, so the caller just stops).
+   *
+   *  Two callers, one implementation: `router()` applies a switch the hash already declares (the
+   *  picker's `switchFacility`, a cross-facility deep-link), and the import wizard's layout step
+   *  commits to the facility its accepted topology implies (IMPORT-17) — a *programmatic* switch,
+   *  whose hash still says the old facility. So the hash is rebuilt from the current route here:
+   *  `router` re-reads it and treats a mismatch as a switch, and would otherwise bounce straight
+   *  back. `replaceState` (the `init()` idiom) fires no `hashchange`, so this never triggers a
+   *  second routing pass, and for `router`'s own call it rebuilds the identical string — a no-op.
+   *  The unsaved-work guard is **not** run here; it belongs to the navigation chokepoint upstream
+   *  (`_navigate`), and the wizard's own caller is pre-upload by construction. */
+  async setFacility(slug) {
+    this.facility = slug;
+    Api.facility = slug;
+    this._renderFacilityPicker();
+    this.store.reset();
+    this._floorData = null;   // drop the deferred floor-load cache for the previous facility
+    const { parts } = this._parseHash();
+    history.replaceState(null, '', '#' + this._hash(parts.length ? '/' + parts.join('/') : '/'));
+    this._navHash = location.hash;   // keep the guard's baseline on the hash we just wrote
+    // An empty facility still yields the EMPTY_MANIFEST stub (a 200), so this only throws on a
+    // genuine load failure — degrade like boot rather than routing on a null manifest.
+    try { await this.store.loadCore(); }
+    catch (e) {
+      Dom.$('#stage').innerHTML = '<div class="empty">Could not load facility: '
+        + e.message + '</div>';
+      return false;
+    }
+    await this._maybeRestoreDraft();   // this facility may carry a draft from a prior session (SAVE-5)
+    return true;
+  }
+
+  /** The display label for a facility slug — its name from the boot-loaded list, falling back to
+   *  'Default facility' for `''` and to the slug itself for a facility the list doesn't enumerate
+   *  (an empty one mid-import). The picker renders from this, and so does any copy that has to name
+   *  a facility to the operator (the import wizard's facility-scope diagnostics). */
+  facilityName(slug = this.facility) {
+    const rec = (this.facilities || []).find(f => f.slug === slug);
+    return (rec && rec.name) || slug || 'Default facility';
+  }
+
   async router() {
     const { facility, parts } = this._parseHash();
     // A facility switch (via the picker or a cross-facility deep-link) reloads that facility's
     // documents before routing. The unsaved-work guard already ran upstream in `_navigate`, so any
     // pending edits to the previous facility were handled there.
-    if (facility !== this.facility) {
-      this.facility = facility;
-      Api.facility = facility;
-      this._renderFacilityPicker();
-      this.store.reset();
-      this._floorData = null;   // drop the deferred floor-load cache for the previous facility
-      // An empty facility still yields the EMPTY_MANIFEST stub (a 200), so this only throws on a
-      // genuine load failure — degrade like boot rather than routing on a null manifest.
-      try { await this.store.loadCore(); }
-      catch (e) {
-        Dom.$('#stage').innerHTML = '<div class="empty">Could not load facility: '
-          + e.message + '</div>';
-        return;
-      }
-      await this._maybeRestoreDraft();   // this facility may carry a draft from a prior session (SAVE-5)
-    }
+    if (facility !== this.facility && !await this.setFacility(facility)) return;
     this.closePanel();
     // The persistent settings gear lives in #topbar, outside the per-view toolbar that
     // setToolbar() rebuilds — sync its active tint here so every route (incl. navigating
@@ -330,6 +530,17 @@ class App {
     // The buildings-panel toggle (NAV-8) is siteplan-only chrome. Default it hidden on every
     // route; SiteplanEditor.show re-reveals it, so it never leaks onto a floor/settings/import view.
     Dom.$('#panel-toggle').hidden = true;
+    // The facility picker is siteplan chrome too — on a PHONE (MOBILE-4). Switching facility is a
+    // "where am I working" decision that belongs on the app's home screen; carried onto a floor or
+    // the floor-select page it is one more fixed-width control competing for a bar that has none to
+    // spare, which is what put the toolbar into a sideways scroll. The route knowledge lives here
+    // (the same shape as the gear tint and panel toggle above); the *width* gate is the one CSS
+    // breakpoint, so no JS reads a media query for it. A bare hash (no parts) is the siteplan.
+    Dom.$('#facility-picker').classList.toggle('non-siteplan', parts.length > 0);
+    // A route change must never leave the picker's body-mounted popover open — least of all above a
+    // trigger the rule above just hid (BUG-2 discipline). Close only: unlike a re-render, hiding
+    // keeps the trigger and its menu paired, so `_teardownFacilityMenu` would be too much.
+    this._closeFacilityMenu();
     // A pending wayfinding focus only applies to the floor it names. If we're routing
     // anywhere but a floor (e.g. the unsaved-work guard reverted us to the siteplan),
     // drop it so it can't leak onto a later, unrelated floor entry.
@@ -367,13 +578,20 @@ class App {
    *  empty state instead of a flow that would 403 on every call — the server still enforces the
    *  gate; this is only the graceful frontend. */
   showImport() {
-    this.current = null;
+    this._detachCurrent(); this.current = null;
     if (!this.canImport) return this.showNoImport();
-    this.ensureScripts(['import-preview.js', 'import-uploader.js', 'import-flow.js',
-      'fresh-import-flow.js', 'edit-import-flow.js'])
+    this.ensureScripts(['import-preview.js', 'import-uploader.js', 'facility-change-modal.js',
+      'import-build-review.js', 'import-regions.js', 'import-align.js', 'import-bulk.js',
+      'import-diff.js', 'import-match.js', 'import-organize.js', 'import-topology.js',
+      'import-bind.js', 'import-cards.js', 'import-ocr-sweep.js', 'import-overview.js',
+      'import-flow.js', 'fresh-import-flow.js', 'edit-import-flow.js'])
       .then(() => {
         const Flow = this.store.hasContent() ? EditImportFlow : FreshImportFlow;
-        new Flow(this).show();
+        // Held as the stage page like every other non-Editor view, so `_navRefusal` can ask it
+        // whether a run in flight forbids leaving (IMPORT-61) and `_detachCurrent` drops it on the
+        // way out — the wizard's own state stays in the wizard.
+        this._stagePage = new Flow(this);
+        this._stagePage.show();
       })
       .catch(e => Toast.show('Could not load the import wizard: ' + e.message, true));
   }
@@ -406,29 +624,32 @@ class App {
    *  inventory now syncs per room from the floor's Place-racks panel, so there is nothing
    *  rack-related to configure here. */
   showSettings() {
-    this.current = null;
+    this._detachCurrent(); this.current = null;
     this.crumbs([{ label: this.homeCrumbLabel(), hash: '/' }, { label: 'Settings' }]);
     this.setToolbar([]);
     const stage = Dom.$('#stage'); stage.innerHTML = '';
-    new SettingsPage(this).mount(stage);
+    this._stagePage = new SettingsPage(this);
+    this._stagePage.mount(stage);
   }
 
   /** The access point add-on's configuration sub-page (SET-6) — same shape as `showSettings()`,
    *  delegating to `ApSettingsPage`, which subclasses `SettingsPage` (see ap-settings-page.js). The
    *  linked `Settings` crumb is the way back, so the page carries no back control of its own; the
-   *  `#settings-gear` stays lit here and still returns to the siteplan, since both it and `router()`
-   *  key their settings-ness off `parts[0]` alone.
+   *  `#settings-gear` stays lit here and closes out to wherever settings was opened from
+   *  (`_settingsReturn`, MOBILE-3), since both it and `router()` key their settings-ness off
+   *  `parts[0]` alone.
    *
    *  Unreachable in practice without import permission — the row carrying the `Configure` button
    *  that leads here is `canImport`-gated — but a typed URL lands on a page whose every row is
    *  likewise gated, so it renders empty rather than offering controls that would 403. */
   showApSettings() {
-    this.current = null;
+    this._detachCurrent(); this.current = null;
     this.crumbs([{ label: this.homeCrumbLabel(), hash: '/' }, { label: 'Settings', hash: '/settings' },
       { label: 'Access points' }]);
     this.setToolbar([]);
     const stage = Dom.$('#stage'); stage.innerHTML = '';
-    new ApSettingsPage(this).mount(stage);
+    this._stagePage = new ApSettingsPage(this);
+    this._stagePage.mount(stage);
   }
 
   /** The facility-wide to-do page (no editor active) — every building's and floor's work rolled up
@@ -444,11 +665,22 @@ class App {
     // item (a cached NetBox menu that can't hide live) and TodoTabView redirect here likewise, and
     // the endpoints refuse; this is the client mirror.
     if (!this.todos) return this.go('/');
-    this.current = null;
+    this._detachCurrent(); this.current = null;
     this.crumbs([{ label: this.homeCrumbLabel(), hash: '/' }, { label: 'To-do' }]);
     this.setToolbar([]);
     const stage = Dom.$('#stage'); stage.innerHTML = '';
-    new TodoPage(this).mount(stage);
+    // A phone gets a purpose-built surface, not the desktop page retuned (MOBILE-9): `MobileTodoPage`
+    // is a sibling class with its own `.mtodo-*` styling, chosen here and nowhere else. It re-mounts
+    // itself through this same method when the viewport crosses the breakpoint
+    // (MobileTodoPage._installBreakpointWatch), so this stays the single decision point.
+    //
+    // `!this.embed` is load-bearing, not defensive: `FacilityTodoWidget` (DASH-1) iframes this route
+    // into a NetBox dashboard card that is routinely narrower than the phone breakpoint ON A DESKTOP,
+    // so keying off width alone would flip that card to the phone page. The chrome-free card keeps
+    // the desktop rollup.
+    const Page = (!this.embed && this._phoneMq.matches) ? MobileTodoPage : TodoPage;
+    this._stagePage = new Page(this);
+    this._stagePage.mount(stage);
   }
 
   showSiteplan() {
@@ -460,7 +692,7 @@ class App {
       const bs = this.store.manifest.buildings;
       if (bs.length === 1) return this.renderBuilding(bs[0].dir);
     }
-    this.current = new SiteplanEditor(this); this.current.show();
+    this._detachCurrent(); this.current = new SiteplanEditor(this); this.current.show();
     // Warm the deferred floor data in the background so a drill-in is instant. Skipped in the
     // embed (which only ever shows the siteplan); errors are swallowed here and resurface on an
     // actual navigation, which awaits ensureFloorData and toasts.
@@ -487,19 +719,24 @@ class App {
     // FloorEditor.show reads floorLayout/floorData/placementData — ensure the deferred load
     // landed first (usually already warm). A data failure degrades (the accessors fall back
     // to empty/default) and toasts inline; a script failure is fatal for this view, so it
-    // rejects the Promise.all and we stay put.
+    // rejects the Promise.all and we stay put. The previous floor/building stays on screen for
+    // this whole await, so `_setBusy` (UX-15) flags that a navigation is in flight.
+    this._setBusy(true);
     try {
       await Promise.all([
-        this.ensureScripts(['device-shapes.js', 'floor-export.js', 'floor-todo.js', 'floor-editor.js']),
+        this.ensureScripts(['device-shapes.js', 'label-nudge.js', 'floor-arrange.js',
+          'floor-todo-add.js', 'floor-ap-tool.js', 'floor-annotations.js', 'floor-placements.js',
+          'floor-export.js', 'floor-todo.js', 'floor-editor.js']),
         this.ensureFloorData().catch(e => Toast.show('Could not load floor data: ' + e.message, true)),
       ]);
     } catch (e) { Toast.show('Could not load the floor view: ' + e.message, true); return; }
+    finally { this._setBusy(false); }
     this.mode = 'view';   // every floor entry lands in view; reset so a prior floor's edit doesn't carry over
     // Recorded only once the floor is certain to render (past the guards and the bundle load), so a
     // navigation that bailed can't leave a floor the user never saw marked "Current" on the to-do
     // page. Set here rather than in the router because `#/f/` and `#/r/` both land here.
     this.lastFloor = { dir, fid };
-    this.current = new FloorEditor(this, b, f);
+    this._detachCurrent(); this.current = new FloorEditor(this, b, f);
     // Frame + pulse a target on mount from either entry point (both feed the editor's setFocus
     // before show()): a `#/r/` deep-link resolves its segment against this floor (a room by
     // Location slug/uid → padded polygon bbox, or a `rack-<id>`/`device-<id>` placement → point
@@ -520,7 +757,7 @@ class App {
 
   /** Building view: a grid of floor cards (no editor active). */
   async renderBuilding(dir) {
-    this.current = null;
+    this._detachCurrent(); this.current = null;
     const b = this.store.building(dir);
     if (!b) return this.showSiteplan();
     // A single-floor building has no meaningful picker — go straight to its one floor. Rewrite the
@@ -536,12 +773,15 @@ class App {
     }
     // The per-floor room counts below read store.annotations, part of the deferred load; await
     // it up front so the whole view renders in one burst (a failed load leaves floors "unmapped").
+    // The previous view stays on screen for this await, so `_setBusy` (UX-15) flags it in flight.
+    this._setBusy(true);
     try { await this.ensureFloorData(); }
     catch (e) { Toast.show('Could not load room data: ' + e.message, true); }
+    finally { this._setBusy(false); }
     this.crumbs([...this.rootCrumbs(), { label: b.name }]);
     const stage = Dom.$('#stage'); stage.innerHTML = '';
     if (!b.floors.length) {
-      this.setToolbar([Dom.el('span', { class: 'hint' }, b.siteSlug)]);
+      this.setToolbar([Dom.el('span', { class: 'hint tb-phone-hide' }, b.siteSlug)]);
       stage.append(Dom.el('div', { class: 'empty' }, 'No floor maps for ' + b.name));
       return;
     }
@@ -550,33 +790,89 @@ class App {
     // shared edit-menu; its View button rides in the toolbar and its render() draws the grid,
     // repainting just the grid (not the toolbar) when a preference changes (NAV-9).
     const view = new FloorViewMenu(this, dir, b);
-    this.setToolbar([Dom.el('span', { class: 'hint' }, b.siteSlug), view.button()]);
+    // The site-slug hint is `tb-phone-hide`: it is unshrinkable AND unfoldable (`_overflowToolbar`
+    // only moves `button, select`), so on a narrow bar it holds width no fit can reclaim and pushes
+    // the View button into the "…" menu — or past the bar's own scroll. The crumb trail already
+    // names the building; the slug is desktop detail (MOBILE-8).
+    this.setToolbar([Dom.el('span', { class: 'hint tb-phone-hide' }, b.siteSlug), view.button()]);
     view.render(stage);
   }
 
   /** (Re)draw the facility picker in the topbar from `this.facilities` (loaded once in init).
    *  Shown only when there's a real choice (≥2 facilities) and not in the chrome-free embed. The
-   *  active facility is selected; empty facilities (no imported map) are flagged so picking one
-   *  drops into the import wizard for it. Called on boot and on every facility switch. */
+   *  active facility is marked; empty facilities (no imported map) are flagged so picking one
+   *  drops into the import wizard for it. Called on boot and on every facility switch.
+   *
+   *  A button + popover rather than the native `<select>` this replaced (NAV-21): a select is an
+   *  un-shrinkable fixed-width block in the bar (it was up to 220px), and with `#crumbs` beside it
+   *  that pushed the topbar past a phone's viewport and spilled the whole page into a horizontal
+   *  scroll. A button collapses to icon-only at that width while its menu, being body-mounted, can
+   *  still be wider than the control that opened it. */
   _renderFacilityPicker() {
     const host = Dom.$('#facility-picker');
     if (!host) return;
+    // Re-render replaces the trigger, so drop the previous body-mounted menu and its document
+    // listeners first — otherwise a facility switch orphans a menu on `document.body` whose
+    // outside-click handler still fires (BUG-2). `destroy()`, not `close()`: the old panel is
+    // discarded here, not reopened.
+    this._teardownFacilityMenu();
     host.innerHTML = '';
     if (this.embed || !this.facilities || this.facilities.length < 2) return;
     // If the active facility isn't in the list (e.g. a still-empty facility mid-import), prepend it
     // so the control reflects where the user actually is.
     const known = this.facilities.some(f => f.slug === this.facility);
     const opts = known ? this.facilities
-      : [{ slug: this.facility, name: this.facility || 'Default facility', has_content: false },
+      : [{ slug: this.facility, name: this.facilityName(), has_content: false },
          ...this.facilities];
-    const sel = Dom.el('select', { class: 'facility-select', title: 'Facility' });
+    const label = this.facilityName();
+    const trigger = Dom.el('button', { class: 'facility-btn', title: 'Facility: ' + label,
+      html: Icons.building + '<span class="facility-name"></span>' });
+    trigger.querySelector('.facility-name').textContent = label;
+    const menu = this._buildFacilityMenu(opts);
+    host.append(trigger);
+    document.body.append(menu);
+    // Right-aligned: the trigger sits near the bar's right edge, where a left-anchored menu would
+    // run off a narrow screen. The Popover wires the trigger's click and owns the open/close state.
+    this._facilityPop = new Popover({ trigger, panel: menu, align: 'right' });
+  }
+
+  /** The picker's popover: one row per facility, the active one carrying the shared `button.active`
+   *  tint. Mounted on `document.body` and reusing `.tb-overflow-menu` (plus a `.facility-menu`
+   *  width modifier) so it inherits that menu's panel styling and full-width left-aligned rows.
+   *  Anchoring, dismissal and teardown come from the shared `Popover` (lib.js), as they do for
+   *  `FloorViewMenu` and `_buildToolbarOverflow`. */
+  _buildFacilityMenu(opts) {
+    const menu = Dom.el('div', { class: 'tb-overflow-menu facility-menu' });
     for (const f of opts) {
-      sel.append(Dom.el('option', { value: f.slug },
-        f.name + (f.has_content ? '' : ' (empty, import…)')));
+      const on = f.slug === this.facility;
+      // Plain buttons, no `role="menu"/"menuitem"`: those roles promise arrow-key navigation no
+      // `Popover` implements (and neither does the `.tb-overflow-menu` this borrows). Tab order
+      // + `aria-current` say everything that's actually true.
+      const row = Dom.el('button', { class: on ? 'active' : '',
+        'aria-current': on ? 'true' : 'false' }, [Dom.el('span', {}, f.name)]);
+      // An empty facility is still offered — choosing it drops into the import wizard for it —
+      // but says so, so the choice isn't a surprise.
+      if (!f.has_content) row.append(Dom.el('span', { class: 'facility-empty' }, '(empty)'));
+      row.addEventListener('click', () => {
+        this._closeFacilityMenu();
+        if (!on) this.switchFacility(f.slug);
+      });
+      menu.append(row);
     }
-    sel.value = this.facility;
-    sel.addEventListener('change', () => this.switchFacility(sel.value));
-    host.append(sel);
+    return menu;
+  }
+
+  /** Close the popover, leaving it mounted for the next open. Safe to call when it is already
+   *  closed, or before the picker has been rendered at all. */
+  _closeFacilityMenu() {
+    if (this._facilityPop) this._facilityPop.close();
+  }
+
+  /** Close *and* discard the body-mounted menu, so a re-render of the picker can't leave an
+   *  orphaned node (or a live document listener) behind. */
+  _teardownFacilityMenu() {
+    if (this._facilityPop) this._facilityPop.destroy();
+    this._facilityPop = null;
   }
 
   // ---- shared chrome ----
@@ -598,20 +894,122 @@ class App {
     });
   }
   setToolbar(nodes) {
-    const tb = Dom.$('#toolbar'); tb.innerHTML = '';
-    [].concat(nodes).forEach(n => n && tb.append(n));
+    // Keep the node list so _fitToolbar can partition it (labels ↔ overflow menu) on every resize
+    // without the editors changing their EditorToolbar.build() contract — the fit rebuilds #toolbar from this.
+    this._toolbarNodes = [].concat(nodes).filter(Boolean);
     this._fitToolbar();
   }
-  /** Reveal the toolbar's tool labels only when the fully-labeled bar actually fits; otherwise
-   *  collapse the `tb-labeled` buttons to icon+tooltip. Measures the expanded width against the
-   *  room in the bar, so it's correct for any editor/mode's button count — not a fixed breakpoint
-   *  (ARCHITECTURE §10 Responsive tool labels). Expand→measure→set runs synchronously (no paint
-   *  between), so there is no label flash. Re-run on every setToolbar and on region resize. */
+  /** Fit the per-view toolbar to the room in the bar, in two measured stages (ARCHITECTURE §10
+   *  Responsive tool labels) — never a fixed breakpoint, so it's correct for any editor/mode's
+   *  button count. Each stage's expand→measure→set runs synchronously (no paint between), so there
+   *  is no flash. Re-run on every setToolbar and on region resize.
+   *   1. Reveal the `tb-labeled` tool labels only if the fully-labeled bar fits; else `.compact`
+   *      collapses them to icon+tooltip (the original behaviour).
+   *   2. If even the compact bar overflows a narrow (phone-width) bar, fold the leading tools into
+   *      a "…" overflow menu, keeping the trailing essentials (Save + badge, mode toggle) in the
+   *      bar. This replaces the old horizontal scroll on small screens (NAV-20).
+   *
+   *  The one place the app's 720px breakpoint legitimately enters this measured fit is the node
+   *  FILTER below, which drops two kinds of node — kept as two classes because they answer two
+   *  different questions, and only the first is about hardware:
+   *    · `.tb-desktop-only` — meaningless on TOUCH. Shortcuts (a keyboard/mouse reference) and the
+   *      mode toggle's `Edit` face (editing is desktop-only by design, MOBILE-1) say nothing to a
+   *      finger, and no width measurement can discover that (NAV-23).
+   *    · `.tb-phone-hide` — redundant at phone WIDTH. The building view's site-slug hint duplicates
+   *      the crumb trail, and being a `<span>` it can neither shrink nor fold into the "…" menu, so
+   *      it holds width the real tools need (MOBILE-8).
+   *  Either way the fit itself stays measured, never breakpoint-driven, and the node stays in
+   *  `_toolbarNodes`, so crossing back to a wide window re-inserts it with no state to keep in
+   *  sync. Don't extend this into a "phone ⇒ always overflow" rule. */
   _fitToolbar() {
     const region = Dom.$('#toolbar-region'), tb = Dom.$('#toolbar');
     if (!region || !tb) return;
-    region.classList.remove('compact');                       // measure fully expanded
-    if (tb.scrollWidth > tb.clientWidth + 1) region.classList.add('compact');
+    this._closeToolbarOverflow();
+    // Rebuild the bar from the stored node list so a prior fit's overflow partition is undone
+    // before this one re-measures (the moved buttons are reclaimed from the discarded menu here).
+    region.classList.remove('compact');
+    tb.innerHTML = '';
+    const phone = this._phoneMq.matches;
+    for (const n of (this._toolbarNodes || [])) {
+      if (phone && n.matches && n.matches('.tb-desktop-only, .tb-phone-hide')) continue;
+      tb.append(n);
+    }
+    // Prune BEFORE measuring, not only after a fold: a tool dropped by the filter above strands the
+    // divider beside it, which would otherwise be measured as width the bar still needs (and reads
+    // as an odd gap between the survivors). Both stages below must measure an already-tidy bar.
+    this._pruneToolbarDividers(tb);
+    if (tb.scrollWidth > tb.clientWidth + 1) region.classList.add('compact');   // stage 1
+    if (tb.scrollWidth > tb.clientWidth + 1) this._overflowToolbar(tb);         // stage 2
+  }
+  /** Stage 2 of the fit: move the leading, non-essential tools into a "…" dropdown until the bar
+   *  fits. The trailing essentials — Save (`.primary`) + its `.badge`, and the always-anchored mode
+   *  toggle (`.mode`, NAV-1) — never move. Buttons are RE-PARENTED into the menu (their click
+   *  handlers ride along), never rebuilt. No resize loop: `#toolbar-region` stays `flex:1`, so
+   *  moving nodes never resizes the observed region (§10).
+   *
+   *  The trigger is only ever built when a fold is genuinely required, and only as many tools are
+   *  folded as the fit actually needs (NAV-23): the divider prune runs after EVERY move, so the
+   *  width a fold frees by stranding a divider is credited to the next fit check instead of being
+   *  paid for a second time with another button. An overflow menu holding tools the bar had room
+   *  for is as much a bug as a bar that overflows. */
+  _overflowToolbar(tb) {
+    const essential = (n) => n.matches && n.matches('.mode, .primary, .badge');
+    const fits = () => tb.scrollWidth <= tb.clientWidth + 1;
+    // Fold the interactive tools (buttons + the grid-size select) — not the essentials, not the
+    // dividers (pruned as we go). A `.view-menu-wrap` (building view) is a div, so it stays put.
+    const candidates = [...tb.children].filter(n => n.matches && n.matches('button, select') && !essential(n));
+    if (candidates.length <= 1) return;   // nothing worth folding
+    let pop = null;
+    for (const btn of candidates) {
+      if (fits()) break;
+      // The trigger materializes on the FIRST genuine fold, never before it — so a bar that turns
+      // out to fit simply never grows a "…", instead of growing one and tearing it back down. It
+      // is prepended in the same step as that fold, so it is part of every width check after it.
+      if (!pop) {
+        pop = this._buildToolbarOverflow();
+        tb.prepend(pop.trigger);
+        document.body.append(pop.panel);
+      }
+      pop.panel.append(btn);
+      // Re-tidy before the next measurement: this move may have stranded the divider that sat
+      // beside the tool, and that reclaimed width can be enough to fit without folding another.
+      this._pruneToolbarDividers(tb);
+    }
+    if (!pop) return;   // nothing folded after all — no trigger in the bar
+    this._overflowPop = pop;
+  }
+  /** Build the overflow trigger + its (body-mounted, `position:fixed`) menu. The menu lives on
+   *  `document.body`, not in `#toolbar`, so the `#toolbar button.icononly span` label-clip never
+   *  reaches its buttons (they read as full labeled rows) and it escapes the bar's overflow clip.
+   *  Returns the `Popover` (lib.js) that owns the pair — left-aligned, since the "…" sits at the
+   *  bar's leading edge with the whole bar's width to hang into. */
+  _buildToolbarOverflow() {
+    const menu = Dom.el('div', { class: 'tb-overflow-menu' });
+    const trigger = Dom.el('button', { class: 'icononly tb-overflow', title: 'More tools',
+      html: Icons.more + '<span>More tools</span>' });
+    const pop = new Popover({ trigger, panel: menu, align: 'left' });
+    // A tool click runs its own handler (still on the node) as the event bubbles, then closes.
+    menu.addEventListener('click', (e) => { if (e.target.closest('button')) pop.close(); });
+    return pop;
+  }
+  /** Tear down any overflow menu from a prior fit: `destroy()` drops its outside-click/Escape
+   *  listeners and the body-mounted menu (its buttons are reclaimed when `_fitToolbar` rebuilds
+   *  the bar from `_toolbarNodes`). */
+  _closeToolbarOverflow() {
+    if (this._overflowPop) this._overflowPop.destroy();
+    this._overflowPop = null;
+  }
+  /** Drop `.tb-div` separators left dangling once tools moved into the overflow menu: any divider
+   *  that is now leading, trailing, doubled, or immediately after the "…" trigger. */
+  _pruneToolbarDividers(tb) {
+    const kids = [...tb.children];
+    kids.forEach((n, i) => {
+      if (!(n.classList && n.classList.contains('tb-div'))) return;
+      const prev = kids[i - 1], next = kids[i + 1];
+      const drop = !prev || !next
+        || (prev.classList && (prev.classList.contains('tb-div') || prev.classList.contains('tb-overflow')));
+      if (drop) n.remove();
+    });
   }
   closePanel() {
     Dom.$('#panel').classList.add('hidden');
@@ -625,12 +1023,27 @@ class App {
     // icon once here; SiteplanEditor.show reveals + wires it (and router() re-hides it on
     // every other route), so no click handler lives here.
     Dom.$('#panel-toggle').innerHTML = Icons.panelRight;
-    // Toggle: on the settings route the gear returns to the siteplan; elsewhere it opens
-    // settings. Mirrors the floor editor's "inspect state, go to the opposite" mode buttons.
-    // The .active tint is kept in sync per-route by router(), not here.
+    // Toggle: on the settings route the gear closes settings; elsewhere it opens them. Mirrors
+    // the floor editor's "inspect state, go to the opposite" mode buttons. The .active tint is
+    // kept in sync per-route by router(), not here.
+    //
+    // Closing returns to the route the gear was opened FROM (MOBILE-3) rather than the siteplan:
+    // settings is a detour, and being thrown back to the app's home screen from a floor you were
+    // reading is a navigation loss, not a reset. The route is captured on open, so it is
+    // self-refreshing and can never point at a stale place; `parts` from `_parseHash()` are
+    // already facility-stripped (and still encoded), so `go()` re-prefixes the active facility.
+    // Both the settings page and its `access-points` sub-page (SET-6) key settings-ness off
+    // `parts[0]` alone, exactly as router() does, so the sub-page returns through the same door.
     gear.addEventListener('click', () => {
-      const onSettings = this._parseHash().parts[0] === 'settings';
-      this.go(onSettings ? '/' : '/settings');
+      const parts = this._parseHash().parts;
+      if (parts[0] === 'settings') {
+        const back = this._settingsReturn || '/';
+        this._settingsReturn = null;
+        this.go(back);
+        return;
+      }
+      this._settingsReturn = parts.length ? '/' + parts.join('/') : '/';
+      this.go('/settings');
     });
     Dom.$('#panel-close').addEventListener('click', () => this.closePanel());
     window.addEventListener('beforeunload', (e) => {
@@ -652,22 +1065,49 @@ class App {
     // `.compact` doesn't resize the region, so the observer can't loop.
     const region = Dom.$('#toolbar-region');
     if (region && window.ResizeObserver) new ResizeObserver(() => this._fitToolbar()).observe(region);
+    // The app's single 720px breakpoint, owned here rather than per-editor (NAV-23): _fitToolbar
+    // reads `.matches` to drop the touch-meaningless `.tb-desktop-only` tools and the
+    // width-redundant `.tb-phone-hide` ones, so a crossing has to re-run the fit. The observer above would very likely catch it anyway — the region is flex:1,
+    // and the mobile block reshapes the topbar around it — but "very likely" is a silent-failure
+    // mode for a bar that would then be missing a button until the next resize. This listener is
+    // app-lifetime, so unlike the editors' own mobile controllers it needs no detach() teardown.
+    this._phoneMq.addEventListener('change', () => this._fitToolbar());
   }
 
   /** The single in-app navigation chokepoint, run on every `hashchange` (and by `go()` when
-   *  the target equals the current hash, which fires no event). Guards unsaved work: on a
-   *  real change it shows a native confirm before routing; Cancel reverts `location.hash` to
-   *  the last-committed value (`_navHash`), OK discards the pending edits first so the dirty
-   *  flags don't re-arm the guard on a later, unrelated navigation. `_revertingHash` swallows
-   *  the synthetic `hashchange` the revert itself fires. */
-  _navigate() {
+   *  the target equals the current hash, which fires no event). Two guards live here, in order:
+   *  the active stage page's own hard refusal (`_navRefusal` — a live import run, IMPORT-61), then
+   *  the unsaved-work prompt below. Guards unsaved work: on a
+   *  real change it shows the shared `.fm-modal` unsaved-work prompt (`_confirmLeavePage`,
+   *  UX-15) before routing; Cancel reverts `location.hash` to the last-committed value
+   *  (`_navHash`), Leave discards the pending edits first so the dirty flags don't re-arm the
+   *  guard on a later, unrelated navigation. `_revertingHash` swallows the synthetic
+   *  `hashchange` the revert itself fires. `_confirmingNav` guards against a second `hashchange`
+   *  (e.g. rapid Back presses) opening a second overlay while the first prompt's promise is
+   *  still pending — unlike the blocking `confirm()` this replaced, an async modal doesn't stop
+   *  other JS from running. */
+  async _navigate() {
     if (this._revertingHash) { this._revertingHash = false; this._navHash = location.hash; return; }
-    if (this.store.hasUnsaved() &&
-        !confirm('You have unsaved changes that will be lost. Leave this page?')) {
-      // The revert re-fires hashchange (swallowed via _revertingHash). Skip it when the hash
-      // never actually moved (same-hash go), which would otherwise leave the flag stuck true.
+    if (this._confirmingNav) return;
+    // A page that refuses to be left right now (a live import run, IMPORT-61) is a flat refusal, not
+    // a choice — so it is answered before the unsaved-work prompt, with a toast rather than a modal,
+    // and the hash is put back exactly as Cancel does below.
+    const refusal = this._navRefusal();
+    if (refusal) {
+      Toast.show(refusal, true);
       if (location.hash !== this._navHash) { this._revertingHash = true; location.hash = this._navHash; }
       return;
+    }
+    if (this.store.hasUnsaved()) {
+      this._confirmingNav = true;
+      const leave = await this._confirmLeavePage();
+      this._confirmingNav = false;
+      if (!leave) {
+        // The revert re-fires hashchange (swallowed via _revertingHash). Skip it when the hash
+        // never actually moved (same-hash go), which would otherwise leave the flag stuck true.
+        if (location.hash !== this._navHash) { this._revertingHash = true; location.hash = this._navHash; }
+        return;
+      }
     }
     this._navHash = location.hash;
     if (this.store.hasUnsaved()) {

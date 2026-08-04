@@ -1,8 +1,18 @@
-{% load static %}<!DOCTYPE html>
+{% load static %}{% load facilitymap_extras %}<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+{% comment %}
+   `interactive-widget=resizes-content` (NAV-21) makes the soft keyboard shrink the LAYOUT viewport
+   rather than just scrolling over it, so the `100dvh` app shell reflows above the keyboard and a
+   focused search keeps its results on screen. Ignored by browsers that don't support it.
+   Deliberately NOT `viewport-fit=cover`: this page is a normal browser tab (there is no web-app
+   manifest), so the browser already lays content out inside the device's safe area — opting into
+   edge-to-edge would only create notch/home-indicator bugs we don't otherwise have. The few
+   `env(safe-area-inset-*)` guards in style.css are inert here and exist so a future edge-to-edge
+   host degrades correctly.
+{% endcomment %}
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content"/>
 <title>Facility Map</title>
 <link rel="icon" type="image/png" sizes="16x16" href="{% static 'netbox_facilitymap/icon-16.png' %}"/>
 <link rel="icon" type="image/png" sizes="32x32" href="{% static 'netbox_facilitymap/icon-32.png' %}"/>
@@ -10,13 +20,22 @@
 <link rel="apple-touch-icon" href="{% static 'netbox_facilitymap/icon-180.png' %}"/>
 <link rel="preload" href="{% static 'netbox_facilitymap/fonts/public-sans.woff2' %}" as="font" type="font/woff2" crossorigin/>
 <link rel="preload" href="{% static 'netbox_facilitymap/fonts/ibm-plex-mono-400.woff2' %}" as="font" type="font/woff2" crossorigin/>
-<link rel="stylesheet" href="{% static 'netbox_facilitymap/style.css' %}"/>
+<link rel="stylesheet" href="{% static_versioned 'netbox_facilitymap/style.css' %}"/>
+{% comment %}
+   Theme, ahead of the body: this page is standalone (it does not extend NetBox's
+   base/layout.html), so NetBox's own colorMode.ts never runs here and there is no
+   `data-bs-theme` to inherit. Theme reads NetBox's setting and stamps the attribute itself.
+   It loads synchronously here rather than with the deferred class bundle at the end of <body>
+   because the attribute has to land before first paint, or a dark install flashes light.
+   Placed after the stylesheet link so the CSS request still goes out first.
+{% endcomment %}
+<script src="{% static_versioned 'netbox_facilitymap/theme.js' %}"></script>
 {% if embed %}{% comment %}
    Embedded in a dashboard-widget iframe: a chrome-free map that fills the card.
    Hide the chrome and let the stage fill. Pan/zoom is JS-gated (window.MAP.interactive) — not
    CSS, since the .catcher sets inline pointer-events:all — and the legend is hidden unless the
    widget opts in.
-{% endcomment %}<style>#topbar,#panel,#toast{display:none!important}#stage{position:absolute;inset:0}{% if not legend %}.legend{display:none!important}{% endif %}</style>{% endif %}
+{% endcomment %}<style>#topbar,#panel,#toast,#nav-loading{display:none!important}#stage{position:absolute;inset:0}{% if not legend %}.legend{display:none!important}{% endif %}</style>{% endif %}
 </head>
 <body>
 
@@ -81,6 +100,7 @@
     companionExts: {{ companion_exts|safe }},   {# sibling files (shapefile set) accepted with a drawing #}
     overlayExts: {{ overlay_exts|safe }},   {# OVERLAY-role subset of drawingExts — gates the align-overlay affordance #}
     capabilities: {{ capabilities|safe }},   {# enabled optional capabilities (keys), from the server's capability registry #}
+    roleGlyphs: {{ role_glyphs|safe }},   {# operator's extra device-role → glyph keywords (INTL-1), validated server-side by device_shapes.custom_rules #}
     canCreateDevice: {% if can_create_device %}true{% else %}false{% endif %},   {# holds dcim.add_device — may create an access point inline (DEV-3); the install-wide gates are the AP tool + write mode #}
     apTool: {% if ap_tool %}true{% else %}false{% endif %},   {# install-wide access-point tool on (DEV-3) — independent of write mode; both must be on to place an AP #}
     renderHq: {% if render_hq %}true{% else %}false{% endif %},   {# install-wide high-quality floor-plan rendering on (READ-1) — read by the import build, not the browser; this is the Settings toggle's initial state #}
@@ -106,7 +126,9 @@
 </script>
 
 <header id="topbar">
-  <a id="home-link" href="{% url 'home' %}" title="Back to NetBox">&larr; NetBox</a>
+  <!-- The word is wrapped so the phone layout can drop it and keep the arrow alone (NAV-21); the
+       link's title= carries the full accessible name either way. -->
+  <a id="home-link" href="{% url 'home' %}" title="Back to NetBox">&larr; <span class="home-label">NetBox</span></a>
   <nav id="crumbs"></nav>
   <!-- The flexible zone between the breadcrumb and the settings gear. It is an inline-size
        container-query context, so the toolbar's tool labels reveal/collapse on the room actually
@@ -115,7 +137,8 @@
     <div id="toolbar"></div>
   </div>
   <!-- Facility picker (multi-facility installs): App populates it from /api/netbox/facilities and
-       switches the active facility on change. Empty on single-facility installs. -->
+       switches the active facility on choose. A button + popover, not a <select> (NAV-21), so it
+       can go icon-only on a phone. Empty on single-facility installs. -->
   <div id="facility-picker"></div>
   <button id="settings-gear" title="Settings"></button>
   <!-- Siteplan-only toggle for the buildings index (NAV-8): a CAD-style toolbar button that
@@ -134,7 +157,7 @@ EVERY map viewer so the blank map is legible, not only to importers (HEALTH-6). 
 is the IMPORT_PERM-gated Settings action, so only importers get the actionable link; other
 viewers are told the data is intact and an administrator must reassign it. Suppressed in embed.
 {% endcomment %}
-<div id="orphan-banner" style="padding:.6rem 1rem;background:#fff3cd;color:#664d03;border-bottom:1px solid #ffe69c;font-size:.9rem">
+<div id="orphan-banner">
   {% if can_import %}
   Some map data isn&rsquo;t assigned to a facility, so the map may look empty until you reassign it.
   This usually follows a facility-grouping change; the data is intact.
@@ -151,6 +174,14 @@ viewers are told the data is intact and an administrator must reassign it. Suppr
   <!-- Siteplan / building / floor views render here -->
 </main>
 
+<!-- Corner loading indicator (UX-15): App._setBusy toggles this while showFloor/renderBuilding
+     await their data, so a slow load over the still-visible stale view doesn't read as a dead
+     click (mirrors FloorEditor.openRackPanel's inline "Loading…" placeholder). A sibling of
+     #stage, not nested inside it — showFloor/renderBuilding/SiteplanEditor.show all replace
+     #stage's innerHTML wholesale, which would otherwise delete this element from the DOM on
+     the very first view render. -->
+<div id="nav-loading" class="hint" hidden>Loading&hellip;</div>
+
 <aside id="panel" class="hidden">
   <div id="panel-head">
     <span id="panel-title">Rooms</span>
@@ -165,33 +196,52 @@ viewers are told the data is intact and an administrator must reassign it. Suppr
      first-paint classes ship eagerly (settings-page.js + floor-view-menu.js ride along — both
      are tiny and their routes (#/settings, #/b/<dir>) are directly deep-linkable); the floor
      editor (device-shapes.js, floor-export.js,
-     floor-todo.js, floor-editor.js) and the import flows (import-preview.js, import-uploader.js, import-flow.js,
-     fresh-import-flow.js, edit-import-flow.js) are fetched on first navigation by
-     App.ensureScripts.
-     todo-model.js + todo-composer.js ship eagerly for the same reason lib.js does: they are shared
-     to-do primitives with two independent consumers — the lazily-bundled floor panel and the
-     facility-wide to-do page — and a lazy bundle may only depend on an eagerly-loaded class (§10).
-     todo-composer.js follows todo-model.js (it reads TodoModel's vocabularies) and lib.js (Combo).
+     floor-todo.js, floor-editor.js) and the import flows (import-preview.js, import-uploader.js,
+     facility-change-modal.js, import-build-review.js, import-regions.js, import-align.js,
+     import-bulk.js, import-diff.js, import-match.js, import-organize.js, import-topology.js,
+     import-bind.js, import-cards.js, import-ocr-sweep.js, import-overview.js, import-flow.js,
+     fresh-import-flow.js, edit-import-flow.js)
+     are fetched on
+     first navigation by App.ensureScripts. The import-* collaborators precede import-flow.js
+     because ImportFlow's constructor instantiates each of them (import-match.js is pure static and
+     merely has to be loaded before the split step runs; import-build-review.js likewise, before the
+     build step opens its review dialog); the editor-* collaborators precede
+     editor.js for the same reason (Editor's constructor instantiates each of them, QUAL-4).
+     todo-model.js + todo-chips.js + todo-composer.js ship eagerly for the same reason lib.js does:
+     they are shared to-do primitives with two independent consumers — the lazily-bundled floor panel
+     and the facility-wide to-do page — and a lazy bundle may only depend on an eagerly-loaded class
+     (§10). todo-chips.js follows todo-model.js (its chips read TodoModel's vocabularies) and lib.js
+     (Dom); todo-composer.js likewise follows todo-model.js and lib.js (Combo).
      todo-page.js rides along on the settings-page.js rationale (a directly deep-linkable route), and
      more so: #/todo is a top-level nav destination, so a lazy fetch would sit on its main entry
-     path. It follows the two primitives it hosts.
+     path. It follows the three primitives it hosts.
+     mobile-todo-page.js is the phone build of that same route (MOBILE-9) — a sibling class, not a
+     subclass, so it depends only on the primitives above and not on todo-page.js; it is listed
+     after it because App.showTodo picks between the pair and both must be resolvable by then. Eager
+     for todo-page.js's own reason, and one more: the choice is made at mount time from a matchMedia
+     read, so a lazy fetch here would put a network round-trip in front of the phone entry path only.
      ap-settings-page.js follows settings-page.js on both counts: it SUBCLASSES SettingsPage (so
      dependency order is not optional here), and #/settings/access-points is deep-linkable like its
      parent route, so showApSettings() stays synchronous too. -->
-<script src="{% static 'netbox_facilitymap/lib.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/todo-model.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/todo-composer.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/todo-page.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/netbox.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/store.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/grid.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/panzoom.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/undo-stack.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/editor.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/siteplan-editor.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/settings-page.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/ap-settings-page.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/floor-view-menu.js' %}"></script>
-<script src="{% static 'netbox_facilitymap/app.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/lib.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/todo-model.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/todo-chips.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/todo-composer.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/todo-page.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/mobile-todo-page.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/netbox.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/store.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/grid.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/panzoom.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/undo-stack.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/editor-pointer.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/editor-shapes.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/editor-toolbar.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/editor.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/siteplan-editor.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/settings-page.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/ap-settings-page.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/floor-view-menu.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/app.js' %}"></script>
 </body>
 </html>

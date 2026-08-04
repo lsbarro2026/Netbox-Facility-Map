@@ -68,7 +68,8 @@ def test_default_facility_keeps_bare_link():
 
 # --- FloorRooms resolves a floor Location's rooms by the rename-proof `floor_location` FK (BIND-1),
 # not by reconstructing `"<site.slug>/<floor.slug>"` — so a renamed floor Location keeps its rooms.
-# `_panel` (which needs the manifest to render) is stubbed to capture what right_page resolves. ----
+# `_floor_panel` (which needs the manifest to render) is stubbed to capture what right_page
+# resolves. ----
 
 import pytest  # noqa: E402
 
@@ -98,7 +99,7 @@ def test_floor_rooms_found_by_fk_after_floor_rename(editor_user, monkeypatch):
         captured['rooms'] = list(rooms)
         return 'PANEL'
 
-    monkeypatch.setattr(FloorRooms, '_panel', fake_panel)
+    monkeypatch.setattr(FloorRooms, '_floor_panel', fake_panel)
 
     request = RequestFactory().get('/')
     request.user = editor_user
@@ -113,7 +114,7 @@ def test_floor_rooms_found_by_fk_after_floor_rename(editor_user, monkeypatch):
 # --- End-to-end rename behaviour of the Location-page plan panel (HEALTH-4). A normal `save()`
 # rename of a Site/floor auto-remaps the manifest, so BOTH a populated *and* an empty floor keep
 # rendering their plan afterward. Only a `bulk_update` rename (which bypasses the signal) still leaves
-# an empty floor blank — the residue. These drive the real `_panel` (not the stub above), so a
+# an empty floor blank — the residue. These drive the real `_floor_panel` (not the stub above), so a
 # manifest under the frozen slug is written; the renames fire `on_commit` so the remap actually runs.
 
 import json  # noqa: E402
@@ -264,6 +265,56 @@ def test_empty_floor_stays_blank_after_bulk_floor_rename(editor_user, workdir):
     assert _floor_rooms_html(floor, editor_user) == ''
 
 
+# --- Query-cost regression (PERF-2). `_shared_context`'s per-room `.location` dereference (building
+# each room's cross-link URL) only ever runs against the `rooms` list it draws, which the
+# whole-floor caller has already `.select_related('location')`'d — never against the unoptimized
+# `all_rooms` pool it also takes (that one is only used for the contained-room polygon math, no
+# `.location` access). So the query count for the whole-floor view must stay flat as the room count
+# grows; this pins that down against a future regression (e.g. someone re-pointing the URL-building
+# loop at `all_rooms`).
+
+from django.db import connection  # noqa: E402
+from django.test.utils import CaptureQueriesContext  # noqa: E402
+
+_QUERY_COST_RING = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+
+
+@pytest.mark.django_db
+def test_floor_rooms_panel_query_count_is_flat_across_room_count(editor_user, workdir):
+    from dcim.models import Location, Site
+    from netbox_facilitymap.models import Room
+
+    _write_floor_manifest(workdir, 'bldg-a', 'floor-1')
+    site = Site.objects.create(name='Bldg A', slug='bldg-a')
+    floor = Location.objects.create(name='Floor 1', slug='floor-1', site=site)
+
+    def _set_room_count(n):
+        Room.objects.all().delete()
+        Location.objects.filter(parent=floor).delete()
+        for i in range(n):
+            room_loc = Location.objects.create(name=f'Room {i}', slug=f'room-{i}',
+                                               site=site, parent=floor)
+            Room.objects.create(floor_key='bldg-a/floor-1', room_id=f'r{i}', floor_location=floor,
+                                location=room_loc, polygon=_QUERY_COST_RING)
+
+    def _measure():
+        # A *fresh* user instance each time: NetBox's `.restrict(user, ...)` caches the resolved
+        # object-permission set on the user instance, so reusing one `User` object across
+        # measurements would make the second call artificially cheap regardless of room count.
+        fresh_user = type(editor_user).objects.get(pk=editor_user.pk)
+        with CaptureQueriesContext(connection) as ctx:
+            assert 'x.png' in _floor_rooms_html(floor, fresh_user)
+        return len(ctx.captured_queries)
+
+    _set_room_count(1)
+    one_room = _measure()
+
+    _set_room_count(5)
+    five_rooms = _measure()
+
+    assert five_rooms == one_room
+
+
 # --- Contained-room subtraction in the embed highlight (ROOM-1). A smaller room drawn fully inside
 # a larger one is punched out of the larger room's highlight (whole-floor view) and its spotlight
 # hole (single-room embed) via an evenodd `<path>`, so the larger room's fill no longer covers it.
@@ -388,3 +439,66 @@ def test_building_floors_blank_for_a_non_anchor_location(editor_user, workdir):
     floor = Location.objects.create(name='Floor 1', slug='floor-1', site=campus, parent=building)
 
     assert _building_floors_html(floor, editor_user) == ''
+
+
+# --- the `location` grouping (MODEL-8): the panels resolve their facility below the Site ---------
+
+def _location_grouping():
+    from netbox_facilitymap.models import FacilityMapBlob
+    FacilityMapBlob.objects.update_or_create(
+        kind='settings', facility='', key='', defaults={'data': {'facility_grouping': 'location'}})
+
+
+def _write_facility_manifest(workdir, facility, site_slug, building_slug, floor_id, image):
+    """A one-floor Location-anchored manifest nested under `facility`'s own working dir, the
+    MULTI-2 layout a location-grouping facility renders into."""
+    d = workdir / facility
+    d.mkdir(exist_ok=True)
+    (d / 'manifest.json').write_text(json.dumps({
+        'siteplan': None,
+        'buildings': [{'code': 'B', 'dir': f'{site_slug}/{building_slug}', 'name': building_slug,
+                       'siteSlug': site_slug, 'buildingSlug': building_slug,
+                       'floors': [{'id': floor_id, 'label': 'F', 'floorSlug': floor_id,
+                                   'image': image, 'w': 100, 'h': 100, 'pages': []}]}],
+    }))
+
+
+@pytest.mark.django_db
+def test_building_floors_reads_the_location_facility_manifest(editor_user, workdir):
+    # Under the location grouping the building Location IS the facility, so its floor picker must
+    # read the manifest nested under that facility's own working dir — the site-level resolution
+    # (facility '') holds no manifest at all here.
+    from dcim.models import Location, Site
+
+    _location_grouping()
+    _write_facility_manifest(workdir, 'building-a', 'campus', 'building-a', 'floor-1', 'a.png')
+    campus = Site.objects.create(name='Campus', slug='campus')
+    building = Location.objects.create(name='Building A', slug='building-a', site=campus)
+    Location.objects.create(name='Floor 1', slug='floor-1', site=campus, parent=building)
+
+    html = _building_floors_html(building, editor_user)
+    assert html and 'a.png' in html
+
+
+@pytest.mark.django_db
+def test_site_floors_unions_the_hosted_location_facilities(superuser, workdir):
+    # The campus Site page stays the whole-Site floor overview: one campus hosts several
+    # location-grouping facilities, and its floor grid concatenates the cards of every hosted
+    # facility's manifest rather than reading a single site-resolved one.
+    from django.test import RequestFactory
+    from dcim.models import Location, Site
+    from netbox_facilitymap.template_content import SiteFloors
+
+    _location_grouping()
+    _write_facility_manifest(workdir, 'bldg-a', 'campus', 'bldg-a', 'a-l1', 'a.png')
+    _write_facility_manifest(workdir, 'bldg-b', 'campus', 'bldg-b', 'b-l1', 'b.png')
+    campus = Site.objects.create(name='Campus', slug='campus')
+    a = Location.objects.create(name='Building A', slug='bldg-a', site=campus)
+    b = Location.objects.create(name='Building B', slug='bldg-b', site=campus)
+    Location.objects.create(name='A L1', slug='a-l1', site=campus, parent=a)
+    Location.objects.create(name='B L1', slug='b-l1', site=campus, parent=b)
+
+    request = RequestFactory().get('/')
+    request.user = superuser
+    html = SiteFloors(context={'object': campus, 'request': request}).full_width_page()
+    assert 'a.png' in html and 'b.png' in html

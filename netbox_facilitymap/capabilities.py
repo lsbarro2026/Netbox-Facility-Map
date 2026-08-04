@@ -9,8 +9,8 @@ and lights up their functionality" **is** this registry's `available()` probe, e
 Everything ships in the one wheel, from the one repo, at one version — a capability can never be
 "a version behind" the core because it *is* the core wheel. Adding an add-on is a new `Capability`
 subclass plus one `CAPABILITIES` entry; the surfaces below aggregate it automatically, so a
-capability never edits a consumer directly (the "gate at the registry, never in each consumer"
-rule PKG-1 established). See DESIGN.md §4 and `architecture/09-extending.md`.
+capability never edits a consumer directly — add-ons are gated once, at this registry, never in
+each consumer.
 
 **Two gate kinds** (`Capability.available()`), either or both:
 
@@ -172,6 +172,39 @@ class GisCapability(FormatCapability):
     format_names = ("shp", "geojson", "kml", "kmz")
 
 
+class OcrCapability(Capability):
+    """Reading a drawing's floor code off the marked crop region (IMPORT-31) — the wizard's
+    "Populate with OCR".
+
+    Unlike the format capabilities below it, this is a *feature* capability: it gates a tool, not a
+    filetype. Its dependencies ship in the **base** install, so on a normal deployment it is simply
+    always on — but it is still declared here rather than assumed, for two reasons. It degrades
+    gracefully on a platform with no `onnxruntime` wheel (the button is never offered, instead of
+    being offered and failing), and being in the registry is what carries it to
+    `window.MAP.capabilities`, where `App.hasCapability('ocr')` gates the button with no bespoke
+    plumbing.
+
+    The vendored model is part of the gate, not just the modules: a wheel built without its
+    package-data would import cleanly and then fail at read time, which is exactly the sort of
+    late, confusing failure a capability probe exists to convert into "the tool isn't offered"."""
+
+    key = "ocr"
+    verbose_name = "Floor-code OCR (Populate)"
+    requires_module = ("onnxruntime", "numpy")
+
+    # Mirrors `ocr.py`'s MODEL_PATH. Duplicated rather than imported on purpose: `ocr.py` is the
+    # render-tier subprocess script (it imports onnxruntime at module scope), and this registry
+    # must stay importable in the worker without loading any of that.
+    MODEL_REL = ("models", "rec.onnx")
+
+    def available(self):
+        if not super().available():
+            return False
+        import os
+        return os.path.isfile(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), *self.MODEL_REL))
+
+
 class VisioCapability(FormatCapability):
     # No pip extra — the `.vsdx/.vsd` formats gate on the external `soffice` binary in
     # `drawing_formats`; this capability delegates to that, so it reports Visio as enabled exactly
@@ -184,12 +217,13 @@ class VisioCapability(FormatCapability):
 # The registry: one entry per KNOWN capability (installed/enabled or not). Adding an add-on is a new
 # Capability subclass plus one entry here — the aggregators below wire its contributions into every
 # surface, so nothing else in the package changes. The shipped set is the optional-format extras
-# (the filetype axis, delegating to drawing_formats). The feature-flag gate (`setting_flag`) remains
-# available for a future pure first-party *feature* add-on (e.g. notetaking); inline Location creation
-# was the first such feature but moved to the runtime `write_mode` setting in LOC-2, so no shipped
-# capability currently uses the flag gate.
+# (the filetype axis, delegating to drawing_formats) plus `ocr`, the first *feature* capability —
+# it gates a tool rather than a filetype, on a dependency gate rather than the format registry. The
+# feature-flag gate (`setting_flag`) remains available for a capability an operator must opt into;
+# inline Location creation was the first such feature but moved to the runtime `write_mode` setting
+# in LOC-2, so no shipped capability currently uses the flag gate.
 CAPABILITIES = (
-    SvgCapability(), CadCapability(), GisCapability(), VisioCapability(),
+    SvgCapability(), CadCapability(), GisCapability(), VisioCapability(), OcrCapability(),
 )
 
 

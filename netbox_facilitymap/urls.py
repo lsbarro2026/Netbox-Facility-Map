@@ -1,15 +1,16 @@
 """URL map for the plugin, rooted at `/plugins/facilitymap/`.
 
 Routes the full-page map (`MapView`) and settings page (`SettingsView`), plus the browser
-JSON endpoints the frontend calls: blob persistence (`frontend_api`) and the PDF-import
-pipeline + authenticated media/manifest serving (`imports`). These `api/` paths mirror the
-standalone tool's logical layout and are exposed to the frontend via `window.MAP.api` in
-index.html; they are distinct from the DRF REST package under `api/`.
+JSON endpoints the frontend calls: blob persistence (`frontend_api`), the PDF-import pipeline
+(`uploads` for ingestion, `imports` for the scan/build workflow) and authenticated
+media/manifest serving (`serving`). These `api/` paths mirror the standalone tool's logical
+layout and are exposed to the frontend via `window.MAP.api` in index.html; they are distinct
+from the DRF REST package under `api/`.
 """
 
 from django.urls import path
 
-from . import capabilities, frontend_api, imports, views
+from . import capabilities, frontend_api, imports, serving, uploads, views
 
 urlpatterns = [
     path('', views.MapView.as_view(), name='map'),
@@ -51,6 +52,26 @@ urlpatterns = [
     path('api/netbox/building-locations', frontend_api.NbBuildingLocationsView.as_view(),
          name='api-nb-building-locations'),
     path('api/netbox/facilities', frontend_api.NbFacilitiesView.as_view(), name='api-nb-facilities'),
+    # The explicit Site→facility assignment map (FACILITY-IDENTITY Phase 1) — the write surface
+    # the Phase-2 wizard assignment step uses.
+    path('api/netbox/facility-assignments', frontend_api.NbFacilityAssignmentsView.as_view(),
+         name='api-nb-facility-assignments'),
+    # The Phase-3 reassignment modal's two halves (MULTI-7): the read-only before/after a pending
+    # grouping change would produce, and the inline re-key of whatever it strands. Both IMPORT_PERM
+    # (they front/are an admin-tier action), unlike the login-only reads above.
+    path('api/netbox/facility-grouping-preview', frontend_api.NbFacilityGroupingPreviewView.as_view(),
+         name='api-nb-facility-grouping-preview'),
+    path('api/netbox/facility-reassign', frontend_api.NbFacilityReassignView.as_view(),
+         name='api-nb-facility-reassign'),
+    # The read-only DCIM topology probe (TOPO-2): what shape is this NetBox, and which
+    # grouping/org-mode/campus triple expresses it. IMPORT_PERM like the preview above (it fronts the
+    # same admin-tier decision), but object-permission scoped like the ordinary reads.
+    path('api/netbox/topology', frontend_api.NbTopologyView.as_view(), name='api-nb-topology'),
+    # The probe's search sibling (TOPO-3): name the real Sites/Locations the wizard's guided
+    # questions point at, so they can be fed back as exemplar pks above. Install-wide scope like the
+    # probe (the facility axis is what's being decided), object-scoped and IMPORT_PERM the same way.
+    path('api/netbox/topology-objects', frontend_api.NbTopologyObjectsView.as_view(),
+         name='api-nb-topology-objects'),
     path('api/netbox/racks', frontend_api.NbRacksView.as_view(), name='api-nb-racks'),
     path('api/netbox/devices', frontend_api.NbDevicesView.as_view(), name='api-nb-devices'),
     # Read-only diagnostic for the empty placement panel (PLACE-2): counts gear on the room's
@@ -103,6 +124,10 @@ urlpatterns = [
          name='api-settings-default-facility'),
     path('api/settings/write-mode', frontend_api.WriteModeSettingView.as_view(),
          name='api-settings-write-mode'),
+    # The facility's DCIM organization mode (MODEL-6) — the one *per-facility* settings endpoint, so
+    # it takes its facility in the body (the `/api/settings` prefix is install-wide to Api).
+    path('api/settings/org-mode', frontend_api.OrgModeSettingView.as_view(),
+         name='api-settings-org-mode'),
     # The inline-room-creation write add-on's own switch (SET-5), sitting on top of write mode's
     # master gate — the Location-create endpoint above checks both.
     path('api/settings/inline-room-creation', frontend_api.InlineRoomCreationSettingView.as_view(),
@@ -126,10 +151,11 @@ urlpatterns = [
          name='api-settings-ap-naming'),
 
     # PDF import (permission-gated) + authenticated serving of the rendered result.
-    path('api/import/upload', imports.UploadView.as_view(), name='api-import-upload'),
-    path('api/import/upload-zip', imports.UploadZipView.as_view(), name='api-import-upload-zip'),
+    path('api/import/upload', uploads.UploadView.as_view(), name='api-import-upload'),
+    path('api/import/upload-zip', uploads.UploadZipView.as_view(), name='api-import-upload-zip'),
     path('api/import/scan', imports.ScanView.as_view(), name='api-import-scan'),
     path('api/import/preview', imports.PreviewView.as_view(), name='api-import-preview'),
+    path('api/import/ocr-read', imports.OcrReadView.as_view(), name='api-import-ocr-read'),
     path('api/import/build', imports.BuildView.as_view(), name='api-import-build'),
     path('api/import/reset', imports.ResetView.as_view(), name='api-import-reset'),
     path('api/import/regroup', imports.RegroupView.as_view(), name='api-import-regroup'),
@@ -140,8 +166,13 @@ urlpatterns = [
     path('api/backup/export', imports.ExportArchiveView.as_view(), name='api-backup-export'),
     path('api/backup/restore', imports.RestoreArchiveView.as_view(), name='api-backup-restore'),
 
-    path('api/manifest', imports.ManifestView.as_view(), name='api-manifest'),
-    path('api/media/<path:path>', imports.MediaView.as_view(), name='api-media'),
+    # Full plugin data wipe — DB rows *and* working-dir files (import + superuser, HEALTH-12). Its
+    # own `api/data/` prefix on purpose: it is neither the import wizard's workflow (`api/import/`,
+    # where the lesser working-dir-only `reset` lives) nor archive I/O (`api/backup/`).
+    path('api/data/wipe', imports.WipeView.as_view(), name='api-data-wipe'),
+
+    path('api/manifest', serving.ManifestView.as_view(), name='api-manifest'),
+    path('api/media/<path:path>', serving.MediaView.as_view(), name='api-media'),
 ]
 
 # Routes contributed by enabled optional capabilities (the add-on framework, ADDON-2): a capability

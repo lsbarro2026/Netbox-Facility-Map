@@ -69,10 +69,10 @@ def test_upload_names_the_extra_for_uninstalled_format(client, editor_user, work
     # PKG-1: a recognized-but-uninstalled format (SVG without the [svg] extra) is rejected with an
     # actionable "install the extra" message, not a bare "unsupported type". Simulate the extra
     # being absent by gating the SVG handler off and dropping `.svg` from the accepted upload set.
-    from netbox_facilitymap import drawing_formats, imports
+    from netbox_facilitymap import drawing_formats, uploads
     monkeypatch.setattr(drawing_formats.format_for('x.svg'), 'available', lambda: False)
-    monkeypatch.setattr(imports, 'UPLOAD_EXTS',
-                        tuple(e for e in imports.UPLOAD_EXTS if e != '.svg'))
+    monkeypatch.setattr(uploads, 'UPLOAD_EXTS',
+                        tuple(e for e in uploads.UPLOAD_EXTS if e != '.svg'))
     client.force_login(editor_user)
     r = client.post(reverse(UPLOAD) + '?path=floor.svg',
                     {'file': _upload(b'<svg xmlns="x">', name='floor.svg')})
@@ -212,6 +212,87 @@ def test_regroup_denied_without_import_permission(client, plain_user, workdir):
     assert _regroup(client, {'Alpha': ['Building/1.pdf']}).status_code == 403
 
 
+def test_regroup_rejects_the_thumbnail_cache_as_a_destination(client, editor_user, workdir):
+    # IMPORT-24: `.thumbs` is reserved — `building_folders()` skips it — so a drawing moved there
+    # would vanish from the wizard with no way back. Nothing legitimate targets the render cache,
+    # so it is refused outright, before any file is touched.
+    client.force_login(editor_user)
+    _seed(workdir, 'Building/1.pdf')
+    r = _regroup(client, {'.thumbs': ['Building/1.pdf']})
+    assert r.status_code == 400
+    assert (workdir / 'uploads' / 'Building' / '1.pdf').is_file()
+    assert not (workdir / 'uploads' / '.thumbs' / '1.pdf').exists()
+
+
+def test_regroup_accepts_the_excluded_folder_as_a_destination(client, editor_user, workdir):
+    # IMPORT-24: the other reserved name is the organize step's exclude control — moving a drawing
+    # into it is exactly how a title sheet or legend leaves the import. So unlike `.thumbs` it is
+    # deliberately allowed, and the drawing is moved rather than deleted.
+    client.force_login(editor_user)
+    _seed(workdir, 'Building/1.pdf')
+    _seed(workdir, 'Building/2.pdf')
+    r = _regroup(client, {'Alpha': ['Building/1.pdf'], '_excluded': ['Building/2.pdf']})
+    assert r.status_code == 200 and r.json()['moved'] == 2
+    assert (workdir / 'uploads' / 'Alpha' / '1.pdf').is_file()
+    assert (workdir / 'uploads' / '_excluded' / '2.pdf').is_file()
+
+
+def test_regroup_excluding_every_drawing_still_validates_as_a_whole(client, editor_user, workdir):
+    # The all-or-nothing property holds across a mixed exclude/assign payload: one bad entry rejects
+    # the request before any file moves, so a refused exclusion can't half-empty the pile.
+    client.force_login(editor_user)
+    _seed(workdir, 'Building/1.pdf')
+    _seed(workdir, 'Building/2.pdf')
+    r = _regroup(client, {'_excluded': ['Building/1.pdf'], '.thumbs': ['Building/2.pdf']})
+    assert r.status_code == 400
+    assert (workdir / 'uploads' / 'Building' / '1.pdf').is_file()
+    assert (workdir / 'uploads' / 'Building' / '2.pdf').is_file()
+    assert not (workdir / 'uploads' / '_excluded').exists()
+
+
+def test_regroup_excluded_drawings_disappear_from_the_next_scan(client, editor_user, workdir,
+                                                                make_pdf):
+    # End-to-end for IMPORT-24: an excluded drawing leaves the import entirely — the re-scan reports
+    # neither an `_excluded` building nor the drawing under any other folder — while the file itself
+    # is still on disk (nothing is deleted; data-safety standard #5).
+    client.force_login(editor_user)
+    for name in ('1.pdf', '2.pdf'):
+        client.post(reverse(UPLOAD) + '?path=Building/' + name,
+                    {'file': _upload(make_pdf(), name=name)})
+    assert _regroup(client, {'Alpha': ['Building/1.pdf'],
+                             '_excluded': ['Building/2.pdf']}).status_code == 200
+    r = client.post(reverse(SCAN), {})
+    assert r.status_code == 200
+    folders = r.json()['folders']
+    assert {f['folder'] for f in folders} == {'Alpha'}
+    assert {p['file'] for f in folders for p in f['pdfs']} == {'1.pdf'}
+    assert (workdir / 'uploads' / '_excluded' / '2.pdf').is_file()
+
+
+def test_regroup_restores_a_drawing_out_of_the_excluded_folder(client, editor_user, workdir,
+                                                               make_pdf):
+    # End-to-end for IMPORT-26 (the reverse of the test above): the reserved park is a legitimate
+    # regroup **source**, so the edit hub can move an excluded drawing back into a building. It
+    # needs no special case in the view — a source is validated only by `safe_path` + is-a-file —
+    # and the emptied park is pruned by the same prune that handles an emptied building folder.
+    client.force_login(editor_user)
+    for name in ('1.pdf', '2.pdf'):
+        client.post(reverse(UPLOAD) + '?path=Building/' + name,
+                    {'file': _upload(make_pdf(), name=name)})
+    assert _regroup(client, {'Alpha': ['Building/1.pdf'],
+                             '_excluded': ['Building/2.pdf']}).status_code == 200
+    assert client.post(reverse(SCAN), {}).json()['excluded'][0]['file'] == '2.pdf'
+
+    r = _regroup(client, {'Alpha': ['_excluded/2.pdf']})
+    assert r.status_code == 200 and r.json()['moved'] == 1
+
+    assert (workdir / 'uploads' / 'Alpha' / '2.pdf').is_file()
+    assert not (workdir / 'uploads' / '_excluded').exists()
+    inv = client.post(reverse(SCAN), {}).json()
+    assert {p['file'] for f in inv['folders'] for p in f['pdfs']} == {'1.pdf', '2.pdf'}
+    assert inv['excluded'] == []
+
+
 def test_regroup_then_scan_yields_per_building_folders(client, editor_user, workdir, make_pdf):
     # End-to-end: a flat pile uploaded into one folder, regrouped, then re-scanned surfaces the new
     # per-building folders — proving the move keeps the folder-keyed scan pipeline intact (the whole
@@ -261,6 +342,38 @@ def test_zip_rejects_too_many_pdfs(client, editor_user, workdir, make_pdf, monke
     assert r.status_code == 400
 
 
+def test_zip_rejects_member_over_the_per_file_cap(client, editor_user, workdir, make_pdf,
+                                                  monkeypatch):
+    """A single oversize member is refused mid-stream (413), and its `.part` scratch file is
+    cleaned up rather than left behind as a phantom drawing."""
+    _cfg(monkeypatch, 'max_pdf_mb', 0)  # any non-empty member now exceeds the per-file cap
+    data = _zip_bytes([('AlphaWing/g.pdf', make_pdf())])
+    client.force_login(editor_user)
+    r = client.post(reverse(UPLOAD_ZIP), {'file': _upload(data, name='a.zip')})
+    assert r.status_code == 413
+    assert 'exceeds the size limit' in r.json()['error']
+    assert not list((workdir / 'uploads').rglob('*.part'))
+
+
+def test_zip_rejects_bomb_on_the_cumulative_cap(client, editor_user, workdir, monkeypatch):
+    """The zip-bomb guard is **archive-wide**, not per member: two drawings that each clear the
+    per-file cap can still blow the decompressed budget together, and the extraction has to stop on
+    the one that crosses it. This is the cap that a per-member-only accounting would miss — each
+    member here is 0.6 MB against a 1 MB per-file cap, so neither trips on its own; only their
+    running total (1.2 MB against the 1 MB archive cap) does."""
+    _cfg(monkeypatch, 'max_pdf_mb', 1)
+    _cfg(monkeypatch, 'max_zip_uncompressed_mb', 1)
+    # Zeros compress to almost nothing, so the *uploaded* archive stays tiny — the whole point of
+    # a decompression bomb, and why the cap has to be enforced on the bytes written out.
+    big = b'%PDF-1.4\n' + b'\0' * (600 * 1024)
+    data = _zip_bytes([('AlphaWing/g.pdf', big), ('AlphaWing/l1.pdf', big)])
+    client.force_login(editor_user)
+    r = client.post(reverse(UPLOAD_ZIP), {'file': _upload(data, name='a.zip')})
+    assert r.status_code == 413
+    assert 'decompresses too large' in r.json()['error']
+    assert not list((workdir / 'uploads').rglob('*.part'))
+
+
 def test_zip_stores_valid_members(client, editor_user, workdir, make_pdf):
     data = _zip_bytes([('AlphaWing/g.pdf', make_pdf()), ('AlphaWing/l1.pdf', make_pdf())])
     client.force_login(editor_user)
@@ -307,6 +420,8 @@ def test_zip_keeps_shapefile_set_together(client, editor_user, workdir, all_form
 # ---- permission gate ----
 
 RESET = 'plugins:netbox_facilitymap:api-import-reset'
+RESTORE = 'plugins:netbox_facilitymap:api-backup-restore'
+WIPE = 'plugins:netbox_facilitymap:api-data-wipe'
 
 
 def test_upload_denied_without_any_permission(client, workdir):
@@ -335,6 +450,118 @@ def test_reset_requires_superuser(client, editor_user, superuser, workdir):
     client.force_login(superuser)
     r = client.post(reverse(RESET), {})
     assert r.status_code == 200 and r.json()['ok'] is True
+
+
+# ---- the render lock covers every working-dir mutation, not just renders (PERF-1) ----
+
+def _hold_lock(workdir):
+    """Plant a fresh render lockfile, as an in-flight scan/build subprocess would."""
+    from netbox_facilitymap.render_runner import RenderRunner
+    workdir.mkdir(parents=True, exist_ok=True)
+    lock = workdir / RenderRunner.LOCK_NAME
+    lock.write_text('')
+    return lock
+
+
+def test_reset_409s_while_a_render_holds_the_lock(client, superuser, workdir):
+    """Reset wipes uploads/ + images/, which would strand a live render mid-write — so it takes the
+    same lockfile and 409s instead, leaving the working dir untouched."""
+    _hold_lock(workdir)
+    (workdir / 'uploads').mkdir()
+    (workdir / 'uploads' / 'a.pdf').write_bytes(b'%PDF-1.4')
+    (workdir / 'manifest.json').write_text('{"siteplan": null, "buildings": []}')
+    client.force_login(superuser)
+    r = client.post(reverse(RESET), {})
+    assert r.status_code == 409
+    assert (workdir / 'uploads' / 'a.pdf').is_file()
+    assert (workdir / 'manifest.json').is_file()
+
+
+def test_reset_keeps_the_lockfile_it_holds(client, superuser, workdir):
+    """Reset no longer deletes the lockfile: it *holds* it for the wipe and releases it on the way
+    out, so the file is gone afterwards but was never yanked out from under a running render (a
+    lock stranded by a crashed render is reclaimed by `_acquire_lock`'s staleness check instead)."""
+    from netbox_facilitymap.render_runner import RenderRunner
+    (workdir / 'uploads').mkdir(parents=True)
+    (workdir / 'uploads' / 'a.pdf').write_bytes(b'%PDF-1.4')
+    client.force_login(superuser)
+    r = client.post(reverse(RESET), {})
+    assert r.status_code == 200 and r.json()['ok'] is True
+    assert not (workdir / 'uploads').exists()
+    assert not (workdir / RenderRunner.LOCK_NAME).exists()
+
+
+# ---- the full data wipe (HEALTH-12) ----
+
+def test_wipe_requires_superuser(client, editor_user, superuser, workdir):
+    """The wipe is `reset`'s complete counterpart (DB rows *and* files), so it sits on the same
+    reset tier: import permission alone is not enough (PERM-1)."""
+    client.force_login(editor_user)
+    assert client.post(reverse(WIPE), '{"all": true}',
+                       content_type='application/json').status_code == 403
+    client.force_login(superuser)
+    r = client.post(reverse(WIPE), '{"all": true}', content_type='application/json')
+    assert r.status_code == 200 and r.json()['ok'] is True
+
+
+def test_wipe_all_removes_rows_the_reset_endpoint_leaves_behind(client, superuser, workdir):
+    """The reason the endpoint exists: `reset` clears the working dir but leaves every row, so a
+    "start over" resurrects the old rooms. The wipe takes both."""
+    from netbox_facilitymap.models import FacilityMapBlob, Room
+    FacilityMapBlob.objects.create(kind='siteplan', data={'hotspots': []})
+    Room.objects.create(floor_key='s/f', room_id='r1', label='R1',
+                        polygon=[[0, 0], [1, 0], [1, 1]])
+    (workdir / 'images').mkdir(parents=True)
+    (workdir / 'images' / 'f.png').write_bytes(b'PNG')
+
+    client.force_login(superuser)
+    r = client.post(reverse(WIPE), '{"all": true}', content_type='application/json')
+
+    assert r.status_code == 200 and r.json()['rooms'] == 1
+    assert not FacilityMapBlob.objects.exists() and not Room.objects.exists()
+    assert not (workdir / 'images').exists()
+
+
+def test_wipe_409s_while_a_render_holds_the_lock(client, superuser, workdir):
+    """Same working-dir-lock rule as reset and the archive restore: a wipe under a live render
+    would strand a half-rendered facility, so it 409s with nothing changed."""
+    _hold_lock(workdir)
+    (workdir / 'manifest.json').write_text('{"siteplan": null, "buildings": []}')
+    client.force_login(superuser)
+    r = client.post(reverse(WIPE), '{"all": true}', content_type='application/json')
+    assert r.status_code == 409
+    assert (workdir / 'manifest.json').is_file()
+
+
+def test_wipe_rejects_an_invalid_facility(client, superuser, workdir):
+    """A hostile facility would become a directory name; `valid_facility` refuses it at the
+    boundary rather than letting a wipe escape the working dir."""
+    client.force_login(superuser)
+    r = client.post(reverse(WIPE), '{"facility": "../etc"}', content_type='application/json')
+    assert r.status_code == 400
+
+
+def test_build_writes_the_import_map_only_under_the_lock(client, editor_user, workdir):
+    """The posted import map is persisted *inside* the lock: a build that can't take the lock must
+    not leave its map behind, or the render already in flight would pick it up."""
+    _hold_lock(workdir)
+    client.force_login(editor_user)
+    r = client.post(reverse(BUILD), data=json.dumps({'buildings': []}),
+                    content_type='application/json')
+    assert r.status_code == 409
+    assert not (workdir / 'import-map.json').exists()
+
+
+def test_restore_409s_while_a_render_holds_the_lock(client, superuser, workdir):
+    """Restore swaps the whole working-dir tree, so it is serialized against renders too — and
+    refuses before the archive is ever opened, leaving the current facility intact."""
+    _hold_lock(workdir)
+    (workdir / 'manifest.json').write_text('{"siteplan": null, "buildings": ["keep"]}')
+    client.force_login(superuser)
+    archive = SimpleUploadedFile('b.tar.gz', b'\x1f\x8b\x08\x00padding', content_type='application/gzip')
+    r = client.post(reverse(RESTORE), {'file': archive})
+    assert r.status_code == 409
+    assert json.loads((workdir / 'manifest.json').read_text())['buildings'] == ['keep']
 
 
 # ---- manifest / media caching ----
@@ -452,6 +679,66 @@ def test_manifest_fallback_is_uncached(client, plain_user, workdir):
     assert r['Cache-Control'] == 'no-store'
 
 
+def test_manifest_304_does_not_read_the_file(client, plain_user, workdir, monkeypatch):
+    """PERF-1: the validators come from a bare stat(), so a revalidating client never pays the
+    read + JSON parse — the manifest is only read for a 200 body, and then through
+    `storage.read_manifest`'s memo rather than an inline `json.loads`."""
+    from netbox_facilitymap import serving
+    (workdir / 'manifest.json').write_text('{"siteplan": null, "buildings": [], "built": 7}')
+    reads = []
+    real = serving.read_manifest
+    monkeypatch.setattr(serving, 'read_manifest',
+                        lambda facility='': (reads.append(facility), real(facility))[1])
+    client.force_login(plain_user)
+    url = reverse(MANIFEST)
+    first = client.get(url)
+    assert first.status_code == 200 and first.json()['built'] == 7
+    assert len(reads) == 1
+    r = client.get(url, HTTP_IF_NONE_MATCH=first['ETag'])
+    assert r.status_code == 304
+    assert len(reads) == 1  # the 304 read nothing
+
+
+def _rewrite_newer(path, text):
+    """Rewrite a file and push its mtime forward, the way a rebuild does. The bump is explicit
+    because a same-length rewrite within the filesystem's timestamp resolution would otherwise be
+    indistinguishable from the original to a `stat()`-derived validator."""
+    import os
+    stamp = path.stat().st_mtime + 2
+    path.write_text(text)
+    os.utime(path, (stamp, stamp))
+
+
+def test_manifest_etag_changes_when_the_manifest_is_rebuilt(client, plain_user, workdir):
+    """The flip side of the cheap 304: because the validators come from a `stat()` rather than the
+    body, they must still move when a rebuild rewrites the file — otherwise a client holding the old
+    ETag would keep revalidating into a 304 and never see the new campus."""
+    (workdir / 'manifest.json').write_text('{"siteplan": null, "buildings": [], "built": 1}')
+    client.force_login(plain_user)
+    url = reverse(MANIFEST)
+    first = client.get(url)
+    assert first.status_code == 200
+
+    _rewrite_newer(workdir / 'manifest.json',
+                   '{"siteplan": null, "buildings": [], "built": 2}')
+
+    revalidated = client.get(url, HTTP_IF_NONE_MATCH=first['ETag'])
+    assert revalidated.status_code == 200            # not a 304 — the validator moved
+    assert revalidated.json()['built'] == 2
+    assert revalidated['ETag'] != first['ETag']
+
+
+def test_manifest_unreadable_falls_back_to_the_stub(client, plain_user, workdir):
+    """A manifest that stats but won't parse is indistinguishable from a fresh install (§10) — it
+    still collapses to the `no-store` empty stub now that the read happens after the conditional."""
+    (workdir / 'manifest.json').write_text('{"buildings": [truncated')
+    client.force_login(plain_user)
+    r = client.get(reverse(MANIFEST))
+    assert r.status_code == 200
+    assert r.json() == {'siteplan': None, 'buildings': []}
+    assert r['Cache-Control'] == 'no-store'
+
+
 # ---- per-facility import + serving (MULTI-2) ----
 
 def test_upload_lands_under_facility_subdir(client, editor_user, workdir, make_pdf):
@@ -549,7 +836,6 @@ def test_build_cap_counts_region_split_floors(client, editor_user, workdir, monk
 # ---- backup archive export / restore (BACKUP-1) ----
 
 EXPORT = 'plugins:netbox_facilitymap:api-backup-export'
-RESTORE = 'plugins:netbox_facilitymap:api-backup-restore'
 
 
 def test_export_streams_archive_with_data(client, editor_user, workdir, backupdir):

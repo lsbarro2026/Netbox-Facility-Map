@@ -88,6 +88,25 @@ def test_map_view_stamps_default_floor_label_field(client, editor_user):
     assert 'floorLabelField: "name"' in r.content.decode()
 
 
+def test_map_view_stamps_empty_role_glyphs_by_default(client, editor_user):
+    # Nothing configured → an empty vocabulary, so DeviceShapes falls straight to its built-in
+    # English rules exactly as before (INTL-1).
+    client.force_login(editor_user)
+    assert 'roleGlyphs: []' in client.get(reverse(MAP)).content.decode()
+
+
+def test_map_view_stamps_configured_role_glyphs(client, editor_user, monkeypatch):
+    # The operator's vocabulary is validated server-side and injected as ordered [type, [kw]] pairs,
+    # so the JS half of the lockstep pair classifies against the identical table (INTL-1). The
+    # unknown glyph type is dropped here, not in the browser.
+    from django.conf import settings
+    monkeypatch.setitem(
+        settings.PLUGINS_CONFIG['netbox_facilitymap'], 'role_glyphs',
+        {'switch': ['Commutateur'], 'bogus': ['x']})
+    client.force_login(editor_user)
+    assert 'roleGlyphs: [["switch", ["commutateur"]]]' in client.get(reverse(MAP)).content.decode()
+
+
 def test_map_view_result_target_defaults_to_map(client, editor_user):
     # No `?target=` → window.MAP.resultTarget is 'map' (the finder deep-links the map, NAV-16).
     client.force_login(editor_user)
@@ -264,6 +283,51 @@ def test_settings_save_records_audit_entry(client, editor_user):
     assert upd.prechange_data['data']['room_embed_zoom'] == 2
     assert upd.postchange_data['data']['room_embed_zoom'] == 3.5
 
+
+
+def test_settings_save_preserves_sibling_keys(client, editor_user):
+    """SettingsView.post merges onto the existing document rather than replacing it, so keys owned
+    by the in-app Settings page (write_mode, todos, …) survive a room-embed save. It now shares the
+    one locked upsert (`frontend_api.merge_settings`) with those endpoints instead of hand-rolling
+    an unlocked read-modify-write, which is what made a concurrent save able to drop one side."""
+    from netbox_facilitymap.models import FacilityMapBlob
+
+    FacilityMapBlob.objects.create(kind='settings', facility='', key='',
+                                   data={'write_mode': True, 'todos': True})
+    client.force_login(editor_user)
+    client.post(reverse(SETTINGS), {'room_embed_zoom': '2', 'room_embed_size': '80',
+                                    'room_embed_orientation': 'vertical'})
+
+    row = FacilityMapBlob.objects.get(kind='settings', facility='', key='')
+    assert row.data['write_mode'] is True
+    assert row.data['todos'] is True
+    assert row.data['room_embed_zoom'] == 2
+    # Written on the install-wide row, never a second one.
+    assert FacilityMapBlob.objects.filter(kind='settings').count() == 1
+
+
+def test_map_view_reads_the_settings_row_once(client, editor_user):
+    """Every settings-derived `window.MAP` flag (write_mode, inline_room_creation, render_hq, todos,
+    the ap_* trio, floor_label_field) comes off **one** `PluginSettings` instance, so a map render
+    queries the settings row once however many flags it stamps. Counting instantiations rather than
+    raw queries keeps this pinned to the invariant and not to MapView's unrelated query volume;
+    before the consolidation this render issued six separate settings reads."""
+    from netbox_facilitymap import previews
+
+    loads = []
+    original = previews.PluginSettings.__init__
+
+    def counting_init(self):
+        loads.append(1)
+        original(self)
+
+    previews.PluginSettings.__init__ = counting_init
+    try:
+        client.force_login(editor_user)
+        assert client.get(reverse(MAP)).status_code == 200
+    finally:
+        previews.PluginSettings.__init__ = original
+    assert loads == [1], f'MapView built {len(loads)} PluginSettings instances, expected 1'
 
 # --- orphaned-data reassignment (HEALTH-1) -------------------------------------------------------
 

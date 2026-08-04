@@ -4,7 +4,7 @@ preprocess.py — render a facility's floor-plan drawings into the assets the ma
 (images/ + manifest.json). It is the rendering engine behind the in-app import wizard.
 
 IMPORTANT — isolation: this module is **invoked as a standalone subprocess** by
-`imports.py` (run by file path, never imported as `netbox_facilitymap.preprocess`), so it
+`render_runner.py` (run by file path, never imported as `netbox_facilitymap.preprocess`), so it
 must stay **stdlib + pypdfium2/Pillow/cairosvg only** and never import Django/NetBox. Keeping
 the drawing parser (untrusted input) out of the long-lived NetBox worker is the whole point: a
 PDFium/Pillow/CairoSVG exploit is contained in a short-lived, resource-limited child process.
@@ -25,7 +25,8 @@ drawing number).
 
 Three modes:
   scan     walk uploads/, render a thumbnail per PDF, and print a JSON inventory of
-           folders + drawings to stdout (the wizard's mapping step reads this).
+           folders + drawings to stdout (the wizard's mapping step reads this), plus the
+           drawings parked in the reserved _excluded/ folder under a separate key.
   build    read import-map.json, render every mapped PDF to images/<slug>/<id>[-N].webp
            (lossless, plus a card-sized <id>.thumb.webp per floor), and write manifest.json
            (the default mode). `--scale` raises how finely vector sources rasterize.
@@ -46,6 +47,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 
 # This script is run standalone by file path (never `-m`), so `sys.path[0]` is its own
 # directory. Add it explicitly (a no-op for the CLI, needed when a test loads this file via
@@ -67,6 +69,10 @@ class Preprocessor:
     *identify* a plan, and `preview` is an interactive request that shouldn't spike memory."""
 
     THUMBS_DIRNAME = ".thumbs"
+    # Where the wizard parks a drawing the operator excluded from the import (IMPORT-24). Reserved:
+    # `building_folders()` skips it by name, so neither `scan` nor `build` ever sees it and no
+    # phantom building appears — while the uploaded bytes stay on disk, undeleted.
+    EXCLUDED_DIRNAME = "_excluded"
     IMAGE_EXT = ".webp"  # build output format: lossless WebP is pixel-identical to PNG at
                          # 40-75% fewer bytes for plan renders (images are the map's heaviest
                          # first-paint asset). Pre-existing .png renders keep serving — the
@@ -185,6 +191,22 @@ class Preprocessor:
         return handler.page_count(path) if handler else 1
 
     @staticmethod
+    def page_geometry(path):
+        """The physical size of each mappable page of a drawing, as ``(sizes, unit)`` — e.g.
+        ``([[2448.0, 1584.0]], "pt")`` for a single D-size PDF sheet. ``(None, "")`` for a format
+        with no true page size (every raster, and the overlay tier) or an unreadable source.
+
+        Emitted into the scan inventory so the wizard can tell a sheet's *shape* apart from its
+        render size: the floor-code region is marked on one sample sheet and applied to all the
+        others, and a box that is right on a 34x22 landscape sheet lands somewhere else entirely on
+        an 8.5x11 portrait one (IMPORT-51). Sizes are only comparable within one `unit`."""
+        handler = drawing_formats.format_for(path)
+        if handler is None:
+            return None, ""
+        sizes = handler.page_sizes(path)
+        return (sizes, handler.size_unit) if sizes else (None, "")
+
+    @staticmethod
     def _is_overlay(path):
         """True when `path`'s extension is an OVERLAY-role format (data drawn atop a base plan)
         rather than a base raster — used by the build to route a floor's files."""
@@ -229,13 +251,15 @@ class Preprocessor:
     @staticmethod
     def _render_hint(path):
         """A "could not read" reason for a drawing the build couldn't turn into map content. A
-        format with an optional decoder names that dep (so a missing extra is diagnosable from the
-        log); a dependency-free format (stdlib parser, e.g. GeoJSON) has no phantom decoder to
-        name, so its failure is reported as a malformed/empty source instead."""
+        format with an optional decoder names that dep only when the decoder is actually missing
+        (so a missing extra is diagnosable from the log); a dependency-free format (stdlib parser,
+        e.g. GeoJSON) or one whose decoder IS installed has no phantom missing-dep to blame, so its
+        failure is reported as a malformed/empty source instead — naming an installed dependency as
+        the cause would misdirect the operator away from the real corrupt/malformed source."""
         handler = drawing_formats.format_for(path)
         if handler is None:
             return "could not render (need pypdfium2 + Pillow)"
-        if not handler.requires:
+        if not handler.requires or handler.available():
             return "could not read (malformed or empty source)"
         return "could not render (need %s)" % handler.requires
 
@@ -244,7 +268,7 @@ class Preprocessor:
         raster first frame) at full scale to ``out_rel`` — the wizard's on-demand high-res preview
         (popup + enlarged/zoomed cards, including the per-page cards of an exploded multi-page PDF).
         `angle` (clockwise degrees, 0 = as-is) reorients it so a rotated card previews the way it
-        will build. Both paths are working-dir-relative; the caller (imports.py) has already
+        will build. Both paths are working-dir-relative; the caller (render_runner.py) has already
         traversal-guarded them. Writes atomically via a ``.part`` temp so concurrent identical
         renders are safe. Returns True on success. Encoded as PNG — the caller's cache path
         and Content-Type are ``.full.png``, and the wizard-only preview isn't worth the
@@ -293,7 +317,7 @@ class Preprocessor:
 
     # ---- floor labels ----
     @staticmethod
-    def floor_label(token):
+    def floor_label(token, from_location=False):
         """Floor token -> human label. A compact floor code from the wizard's
         floor-type mode is expanded segment-by-segment: 'b3' -> 'Basement 3',
         'gl1' -> 'Ground / Level 1', 'g' -> 'Ground', 'r' -> 'Roof'. Any other token
@@ -301,10 +325,14 @@ class Preprocessor:
         title-cased as-is ('basement-2' -> 'Basement 2'). The compact parse is
         anchored to the WHOLE token; it is no longer scanned for loose 'g'/'r'
         letters, which used to emit phantom 'Ground'/'Roof' segments (a slug like
-        'storage-b2' wrongly became 'Roof / Ground / Basement 2')."""
+        'storage-b2' wrongly became 'Roof / Ground / Basement 2'). `from_location`
+        (set from the import map's `locationTokens` marker, INTL-2) skips the compact
+        grammar outright for a token the wizard's Location mode actually produced —
+        otherwise a Location slug that happens to full-match the grammar (a Spanish
+        "Bloque 1" slugged 'b1') would be silently mistranslated as 'Basement 1'."""
         seg = r"gl\d+|b\d+|l\d+|g|r"
         t = token.lower()
-        if not re.fullmatch(r"(?:%s)+" % seg, t):
+        if from_location or not re.fullmatch(r"(?:%s)+" % seg, t):
             return token.replace("-", " ").replace("_", " ").title() or token.upper()
         names = []
         for m in re.findall(seg, t):
@@ -339,11 +367,14 @@ class Preprocessor:
         return sorted(items, key=lambda it: self.dwg_sort_key(it[0]))
 
     def building_folders(self):
-        """Top-level building folders under uploads/ (skips the thumbnail cache)."""
+        """Top-level building folders under uploads/ — skips the two reserved names, the thumbnail
+        cache and the excluded-drawings park (IMPORT-24). Both are skipped by exact name, so this
+        one filter is what keeps them out of every downstream stage (`scan`, `build`)."""
         if not os.path.isdir(self.source):
             return []
+        reserved = (self.THUMBS_DIRNAME, self.EXCLUDED_DIRNAME)
         return sorted(d for d in os.listdir(self.source)
-                      if d != self.THUMBS_DIRNAME
+                      if d not in reserved
                       and os.path.isdir(os.path.join(self.source, d)))
 
     # ---- import map ----
@@ -402,6 +433,165 @@ class Preprocessor:
         return out
 
     # ---- building / siteplan assembly ----
+    def _group_sheets_by_floor(self, folder, entry, abbr):
+        """Phase 1 of the building build: resolve the import-map entry's config sub-maps and group
+        the folder's drawings into floors. Returns ``(groups, unmapped_stems)`` where each group is
+        a ``(fid, label, sheets)`` tuple and ``sheets`` is the floor's list of
+        ``(filename, page_index, angle, region)`` renders, in drawing order. Reads no image and
+        touches no disk beyond listing the folder — the rendering is `_render_floor`'s job."""
+        fmap = entry.get("floors", {})
+        # Straightening rotation per drawing, keyed by *page* (bare `stem`, or `stem#pN` for an
+        # exploded page). Absent/0 = render as-is, so an old import map (no `angles`) is unchanged.
+        # A page is straightened once, so every region floor split from it shares the page's angle
+        # (crop-after-rotate); the key is recoverable from (stem, page) here.
+        amap = entry.get("angles", {})
+        # Friendly floor labels the wizard resolved from a chosen NetBox Location field (name/
+        # slug/description). Keyed by the page key, or the compound `<page key>@rN` for a region
+        # floor (`_page_entries` returns that `label_key`). Absent = no override, so `preprocess`
+        # falls back to `floor_label(token)` as before — an old import map (no `labels`) or a
+        # floor-type token (no bound Location) is unaffected.
+        lmap = entry.get("labels", {})
+        # Which page/region keys' token is a direct NetBox Location slug (Location mode), keyed
+        # identically to `lmap` (INTL-2). Absent/false = a floor-type-vocabulary token, so
+        # `floor_label` keeps expanding it; an old import map (no `locationTokens`) is unaffected.
+        # This is independent of whether `lmap` actually resolved a label text for the same key —
+        # a bound Location whose chosen label field is empty still marks its token as Location-
+        # derived here, so `floor_label` never runs its compact-code grammar on that slug.
+        omap = entry.get("locationTokens", {})
+        groups, index, unmapped, flabel, forigin = [], {}, [], {}, {}
+        for stem, fname in self.drawing_files(folder):
+            entries = self._page_entries(stem, fmap)
+            if not entries:
+                unmapped.append(stem)
+                continue
+            for page, token, region, label_key in entries:
+                fid = abbr + token
+                page_key = stem if page == 0 else "%s#p%d" % (stem, page + 1)
+                angle = amap.get(page_key, 0)
+                if fid not in index:
+                    index[fid] = len(groups)
+                    groups.append([fid, token, []])
+                if fid not in flabel and lmap.get(label_key):
+                    flabel[fid] = lmap[label_key]
+                if fid not in forigin and omap.get(label_key):
+                    forigin[fid] = True
+                # `region` (a normalized 0..1 crop box, or None for a whole-page floor) rides in the
+                # sheet tuple to the render call, where a non-None box is cropped out (FLOOR-3).
+                groups[index[fid]][2].append((fname, page, angle, region))
+        # The token has no use past this point: it only ever fed the label guess, so resolve the
+        # label here (wizard-resolved `labels` entry first, then the token guess) and hand the
+        # render phase a floor that already knows its own name.
+        return [(fid, flabel.get(fid) or self.floor_label(token, forigin.get(fid, False)) or fid,
+                 sheets)
+                for fid, token, sheets in groups], unmapped
+
+    def _render_floor(self, folder, rel_dir, fid, label, sheets, align_map, page_cache, page_refs):
+        """Phase 2 of the building build: render one grouped floor's sheets into its manifest floor
+        dict (images + card thumbnail + any overlays). Returns None — the floor is dropped — when no
+        base page rendered. `page_cache` is owned by the caller and shared across **all** floors of
+        the building: a region-split page lives in one group per region, so only a build-wide cache
+        lets its siblings reuse the single render (see the caller's `page_cache` comment). `page_refs`
+        is the caller's precomputed remaining-consumer count per cached key — decremented every time a
+        region-split sheet is consumed here, evicting the entry once its last region has cropped it,
+        so the cache never outlives the floors that still need it (QUAL-13)."""
+        # A floor's drawings split by handler role: BASE_RASTER files render to page images,
+        # OVERLAY files (FMT-9) extract data features drawn atop them. Unknown extensions fall
+        # to the base path so they still surface the existing "could not render" warning. Each
+        # base sheet is a (filename, page) pair, so a multi-page PDF's exploded pages render
+        # here just like separate sheets.
+        base_sheets, overlay_fnames = [], []
+        for fname, page, angle, region in sheets:
+            if self._is_overlay(fname):
+                overlay_fnames.append(fname)
+            else:
+                base_sheets.append((fname, page, angle, region))
+        pages, p0_raw = [], None
+        for n, (fname, page, angle, region) in enumerate(base_sheets, start=1):
+            # Render (or reuse) the whole straightened page, then crop to this floor's `region`.
+            # A region-split page is cached so its sibling region floors reuse one render; a
+            # whole-page floor (region None) renders once and is never cached (see `page_cache`).
+            key = (fname, page, angle)
+            full = page_cache.get(key)
+            if full is None:
+                src = os.path.join(self.source, folder, fname)
+                full = self.render_full(src, page=page, angle=angle, quality=self.quality)
+                if full is None:
+                    self._unrendered += 1
+                    print("  WARN %s %s: %s" % (folder, fname, self._render_hint(fname)),
+                          file=sys.stderr)
+                    continue
+                # Tally, once per physical render (never a region-split cache reuse), a
+                # high-quality sheet the pixel cap clamped below the requested quality — the
+                # deterministic "HQ couldn't be delivered here" signal build() reports upward.
+                handler = drawing_formats.format_for(src)
+                if self._hq_constrained(handler, self.quality, full[1], full[2]):
+                    self._hq_clamped += 1
+                    print("  WARN %s %s: high-quality render clamped to the %dpx size cap "
+                          "(rendered below the requested quality)"
+                          % (folder, fname, handler.MAX_IMAGE_PX), file=sys.stderr)
+                if region is not None:  # only a region-split page is re-used; cache it once
+                    page_cache[key] = full
+            if region is not None:
+                # This region floor has now taken its crop of the page (successfully or not,
+                # below) — once every region referencing `key` has done the same, the raster is
+                # never needed again, so drop it rather than holding it for the rest of the build.
+                page_refs[key] -= 1
+                if page_refs[key] <= 0:
+                    del page_cache[key]
+            if region is None:
+                res = full
+            else:
+                res = self._crop_encoded(full[0], region, "WEBP")
+                if res is None:
+                    print("  WARN %s %s: could not crop region %r" % (folder, fname, region),
+                          file=sys.stderr)
+                    continue
+            raw, w, h = res
+            if not pages:
+                p0_raw = raw   # first *rendered* page backs the floor's card thumbnail
+            pid = fid if n == 1 else "%s-%d" % (fid, n)
+            sheet = {"image": self.write_image(rel_dir, pid, raw),
+                     "w": w, "h": h, "caption": None}
+            # Record a non-zero straightening angle so re-opening the wizard can tell a floor
+            # was reoriented (the room-desync guard compares against it); omitted when 0 so
+            # older manifests/readers are unaffected.
+            if angle % 360:
+                sheet["angle"] = angle
+            pages.append(sheet)
+        # An overlay layers onto a base plan (fit-to-bounds needs the floor's canvas), so a
+        # floor with only overlay files and no rendered base page is dropped like any pageless
+        # floor — its overlays have nothing to sit on.
+        if not pages:
+            return None
+        p0 = pages[0]
+        floor = {
+            "id": fid, "label": label,
+            "floorSlug": fid, "image": p0["image"], "w": p0["w"], "h": p0["h"],
+            "pages": pages,
+        }
+        thumb = self.write_floor_thumb(rel_dir, fid, p0_raw)
+        if thumb:
+            floor["thumb"] = thumb
+        overlays = []
+        for fname in overlay_fnames:
+            stem = os.path.splitext(fname)[0]
+            # The extract returns the whole manifest overlay payload: `features` plus
+            # `georeferenced`/`crs`/`srcTransform` (see OverlayProjector). `georeferenced`
+            # is True only when the operator's `overlayAlign` control points (FMT-6) drove
+            # the placement — fit-to-bounds stays False, keeping the frontend's
+            # approximate-alignment warnings; `srcTransform` is what the wizard's align
+            # editor inverts to place those control points.
+            res = self.extract_overlay(os.path.join(self.source, folder, fname),
+                                       align=align_map.get(stem))
+            if res is None:
+                print("  WARN %s %s: %s" % (folder, fname, self._render_hint(fname)),
+                      file=sys.stderr)
+                continue
+            overlays.append({"name": stem, **res})
+        if overlays:
+            floor["overlays"] = overlays
+        return floor
+
     def build_building_from_pdfs(self, folder, entry):
         """Build one manifest building from its drawing folder + import-map entry. Drawings sharing
         a floor token group into one multi-sheet floor (ordered by drawing number); a multi-page
@@ -410,7 +600,9 @@ class Preprocessor:
         several floors, each with its own token → own ``fid``/``floorSlug`` (FLOOR-2). Each sheet is
         a ``(filename, page_index, angle, region)`` tuple, so separate-file sheets, exploded pages,
         and region crops all flow through the same render path. A floor's ``label`` prefers the
-        wizard-resolved ``labels`` entry (see `lmap`) over the ``floor_label(token)`` guess.
+        wizard-resolved ``labels`` entry over the ``floor_label(token)`` guess.
+        Runs as two phases — `_group_sheets_by_floor` (config → floor groups, no I/O) then
+        `_render_floor` per group (the renders/crops/writes) — and assembles the result here.
         Returns (building, unmapped_stems)."""
         slug, abbr = entry["slug"], entry.get("abbr", "")
         # Building anchor (MODEL-3): an optional building **Location** slug when this building is a
@@ -428,18 +620,6 @@ class Preprocessor:
                   % (folder, building_slug), file=sys.stderr)
             building_slug = None
         rel_dir = "%s/%s" % (slug, building_slug) if building_slug else slug
-        fmap = entry.get("floors", {})
-        # Straightening rotation per drawing, keyed by *page* (bare `stem`, or `stem#pN` for an
-        # exploded page). Absent/0 = render as-is, so an old import map (no `angles`) is unchanged.
-        # A page is straightened once, so every region floor split from it shares the page's angle
-        # (crop-after-rotate); the key is recoverable from (stem, page) here.
-        amap = entry.get("angles", {})
-        # Friendly floor labels the wizard resolved from a chosen NetBox Location field (name/
-        # slug/description). Keyed by the page key, or the compound `<page key>@rN` for a region
-        # floor (`_page_entries` returns that `label_key`). Absent = no override, so `preprocess`
-        # falls back to `floor_label(token)` as before — an old import map (no `labels`) or a
-        # floor-type token (no bound Location) is unaffected.
-        lmap = entry.get("labels", {})
         # Control-point georeference pairs per overlay drawing (FMT-6), keyed by drawing stem.
         # Absent/empty = every overlay stays fit-to-bounds, so an old import map is unchanged;
         # a malformed (non-dict) value is ignored the same way (the pairs themselves are
@@ -447,122 +627,35 @@ class Preprocessor:
         align_map = entry.get("overlayAlign", {})
         if not isinstance(align_map, dict):
             align_map = {}
-        groups, index, unmapped, flabel = [], {}, [], {}
-        for stem, fname in self.drawing_files(folder):
-            entries = self._page_entries(stem, fmap)
-            if not entries:
-                unmapped.append(stem)
-                continue
-            for page, token, region, label_key in entries:
-                fid = abbr + token
-                page_key = stem if page == 0 else "%s#p%d" % (stem, page + 1)
-                angle = amap.get(page_key, 0)
-                if fid not in index:
-                    index[fid] = len(groups)
-                    groups.append([fid, token, []])
-                if fid not in flabel and lmap.get(label_key):
-                    flabel[fid] = lmap[label_key]
-                # `region` (a normalized 0..1 crop box, or None for a whole-page floor) rides in the
-                # sheet tuple to the render call, where a non-None box is cropped out (FLOOR-3).
-                groups[index[fid]][2].append((fname, page, angle, region))
+        groups, unmapped = self._group_sheets_by_floor(folder, entry, abbr)
         # Whole-page renders shared across the region floors split from one page: keyed by the page's
         # (fname, page, angle), a page fanned into N region floors is rendered once and cropped N
-        # times (each region floor lives in its own group, so this spans the groups loop). Only
-        # region-split pages populate it — a whole-page floor's key is unique, so caching it would
-        # only pin its raster in memory against the child's rlimits for no reuse (see the render loop).
+        # times. Each region floor lives in its own group, so the cache has to outlive any one
+        # floor — it is owned here and threaded into every `_render_floor` call, never rebuilt per
+        # floor (that would silently re-render each region-split page). Only region-split pages
+        # populate it — a whole-page floor's key is unique, so caching it would only pin its raster
+        # in memory against the child's rlimits for no reuse (see `_render_floor`).
+        #
+        # A building whose sheets are *all* region-split would otherwise hold every decoded
+        # full-page raster at once for the rest of the build — inside a child whose RLIMIT_AS is
+        # capped at half of detected host memory (render_runner.py MEM_HEADROOM_FRACTION). `groups`
+        # already has every floor's full sheet list, so the number of region-consumers per key is
+        # knowable up front: `page_refs` counts them, and `_render_floor` evicts a key from
+        # `page_cache` once its last consumer has cropped it (QUAL-13), bounding the cache to the
+        # keys actively in flight rather than the whole building.
+        page_refs = Counter(
+            (fname, page, angle)
+            for _, _, sheets in groups
+            for fname, page, angle, region in sheets
+            if region is not None and not self._is_overlay(fname)
+        )
         page_cache = {}
         floors = []
-        for fid, token, sheets in groups:
-            # A floor's drawings split by handler role: BASE_RASTER files render to page images,
-            # OVERLAY files (FMT-9) extract data features drawn atop them. Unknown extensions fall
-            # to the base path so they still surface the existing "could not render" warning. Each
-            # base sheet is a (filename, page) pair, so a multi-page PDF's exploded pages render
-            # here just like separate sheets.
-            base_sheets, overlay_fnames = [], []
-            for fname, page, angle, region in sheets:
-                if self._is_overlay(fname):
-                    overlay_fnames.append(fname)
-                else:
-                    base_sheets.append((fname, page, angle, region))
-            pages, p0_raw = [], None
-            for n, (fname, page, angle, region) in enumerate(base_sheets, start=1):
-                # Render (or reuse) the whole straightened page, then crop to this floor's `region`.
-                # A region-split page is cached so its sibling region floors reuse one render; a
-                # whole-page floor (region None) renders once and is never cached (see `page_cache`).
-                key = (fname, page, angle)
-                full = page_cache.get(key)
-                if full is None:
-                    src = os.path.join(self.source, folder, fname)
-                    full = self.render_full(src, page=page, angle=angle, quality=self.quality)
-                    if full is None:
-                        self._unrendered += 1
-                        print("  WARN %s %s: %s" % (folder, fname, self._render_hint(fname)),
-                              file=sys.stderr)
-                        continue
-                    # Tally, once per physical render (never a region-split cache reuse), a
-                    # high-quality sheet the pixel cap clamped below the requested quality — the
-                    # deterministic "HQ couldn't be delivered here" signal build() reports upward.
-                    handler = drawing_formats.format_for(src)
-                    if self._hq_constrained(handler, self.quality, full[1], full[2]):
-                        self._hq_clamped += 1
-                        print("  WARN %s %s: high-quality render clamped to the %dpx size cap "
-                              "(rendered below the requested quality)"
-                              % (folder, fname, handler.MAX_IMAGE_PX), file=sys.stderr)
-                    if region is not None:  # only a region-split page is re-used; cache it once
-                        page_cache[key] = full
-                if region is None:
-                    res = full
-                else:
-                    res = self._crop_encoded(full[0], region, "WEBP")
-                    if res is None:
-                        print("  WARN %s %s: could not crop region %r" % (folder, fname, region),
-                              file=sys.stderr)
-                        continue
-                raw, w, h = res
-                if not pages:
-                    p0_raw = raw   # first *rendered* page backs the floor's card thumbnail
-                pid = fid if n == 1 else "%s-%d" % (fid, n)
-                sheet = {"image": self.write_image(rel_dir, pid, raw),
-                         "w": w, "h": h, "caption": None}
-                # Record a non-zero straightening angle so re-opening the wizard can tell a floor
-                # was reoriented (the room-desync guard compares against it); omitted when 0 so
-                # older manifests/readers are unaffected.
-                if angle % 360:
-                    sheet["angle"] = angle
-                pages.append(sheet)
-            # An overlay layers onto a base plan (fit-to-bounds needs the floor's canvas), so a
-            # floor with only overlay files and no rendered base page is dropped like any pageless
-            # floor — its overlays have nothing to sit on.
-            if not pages:
-                continue
-            p0 = pages[0]
-            floor = {
-                "id": fid, "label": flabel.get(fid) or self.floor_label(token) or fid,
-                "floorSlug": fid, "image": p0["image"], "w": p0["w"], "h": p0["h"],
-                "pages": pages,
-            }
-            thumb = self.write_floor_thumb(rel_dir, fid, p0_raw)
-            if thumb:
-                floor["thumb"] = thumb
-            overlays = []
-            for fname in overlay_fnames:
-                stem = os.path.splitext(fname)[0]
-                # The extract returns the whole manifest overlay payload: `features` plus
-                # `georeferenced`/`crs`/`srcTransform` (see OverlayProjector). `georeferenced`
-                # is True only when the operator's `overlayAlign` control points (FMT-6) drove
-                # the placement — fit-to-bounds stays False, keeping the frontend's
-                # approximate-alignment warnings; `srcTransform` is what the wizard's align
-                # editor inverts to place those control points.
-                res = self.extract_overlay(os.path.join(self.source, folder, fname),
-                                           align=align_map.get(stem))
-                if res is None:
-                    print("  WARN %s %s: %s" % (folder, fname, self._render_hint(fname)),
-                          file=sys.stderr)
-                    continue
-                overlays.append({"name": stem, **res})
-            if overlays:
-                floor["overlays"] = overlays
-            floors.append(floor)
+        for fid, label, sheets in groups:
+            floor = self._render_floor(folder, rel_dir, fid, label, sheets, align_map, page_cache,
+                                        page_refs)
+            if floor:   # None = no base page rendered, so the floor is dropped
+                floors.append(floor)
         code = slug[:2] if re.match(r"\d\d", slug) else None
         print("%-26s slug=%-12s floors=%s%s" % (
             folder, slug, ",".join(f["id"] for f in floors) or "(none)",
@@ -621,29 +714,56 @@ class Preprocessor:
               % os.path.relpath(self.stub_path, self.base_dir), file=sys.stderr)
 
     # ---- modes ----
+    def _scan_drawings(self, folder):
+        """Inventory one `uploads/` folder: a page-1 thumbnail plus the wizard's per-drawing
+        record for each drawing in it. The folder name is taken as given — the caller decides
+        which folders are in scope, so this serves both the building walk and the reserved
+        excluded park (which is emphatically *not* a building)."""
+        pdfs = []
+        for stem, fname in self.drawing_files(folder):
+            # Thumbnail key includes the source extension so `1.pdf` and `1.png` in one
+            # folder don't overwrite each other's thumbnail.
+            thumb_rel = os.path.join("uploads", self.THUMBS_DIRNAME, folder,
+                                     fname + ".png")
+            full = os.path.join(self.source, folder, fname)
+            ok = self.render_thumb(full, os.path.join(self.base_dir, thumb_rel))
+            # `pages` is >1 only for a multi-page PDF (the wizard explodes each into a per-page
+            # floor card); every other format reports 1. The thumbnail above is always page 1.
+            # `sizes`/`unit` are the per-page *physical* geometry, present only for a format that
+            # has one (a PDF's points) — null for every raster, whose pixels are a resolution
+            # rather than a sheet size (see `page_geometry`).
+            sizes, unit = self.page_geometry(full)
+            pdfs.append({"file": fname, "stem": stem,
+                         "thumb": thumb_rel.replace(os.sep, "/") if ok else None,
+                         "pdf": ("uploads/%s/%s" % (folder, fname)),
+                         "pages": self.page_count(full),
+                         "sizes": sizes, "unit": unit})
+        return pdfs
+
     def scan(self):
         """Render a thumbnail per PDF and print a JSON inventory of folders/drawings
-        to stdout (consumed by the wizard's mapping step)."""
+        to stdout (consumed by the wizard's mapping step).
+
+        Emits `{"folders": [...], "excluded": [...]}`. `excluded` lists the drawings parked in
+        the reserved `_excluded/` folder (IMPORT-24) so the edit hub can offer to restore one
+        (IMPORT-26) — without it, exclusion is one-way and the undeleted bytes are unreachable.
+        It is deliberately a **separate key fed by a second listing pass**, never a `folders`
+        entry: `building_folders()` still skips the park by name, which is the single filter that
+        keeps it out of `build` and stops it surfacing as a phantom building."""
         folders = []
         for folder in self.building_folders():
-            pdfs = []
-            for stem, fname in self.drawing_files(folder):
-                # Thumbnail key includes the source extension so `1.pdf` and `1.png` in one
-                # folder don't overwrite each other's thumbnail.
-                thumb_rel = os.path.join("uploads", self.THUMBS_DIRNAME, folder,
-                                         fname + ".png")
-                full = os.path.join(self.source, folder, fname)
-                ok = self.render_thumb(full, os.path.join(self.base_dir, thumb_rel))
-                # `pages` is >1 only for a multi-page PDF (the wizard explodes each into a per-page
-                # floor card); every other format reports 1. The thumbnail above is always page 1.
-                pdfs.append({"file": fname, "stem": stem,
-                             "thumb": thumb_rel.replace(os.sep, "/") if ok else None,
-                             "pdf": ("uploads/%s/%s" % (folder, fname)),
-                             "pages": self.page_count(full)})
+            pdfs = self._scan_drawings(folder)
             if pdfs:
                 folders.append({"folder": folder, "pdfs": pdfs})
             print("scanned %s (%d)" % (folder, len(pdfs)), file=sys.stderr)
-        json.dump({"folders": folders}, sys.stdout)
+        # `drawing_files` lists the directory, so guard the common case of a facility that has
+        # never excluded anything (no park on disk) rather than letting it raise.
+        excluded = []
+        if os.path.isdir(os.path.join(self.source, self.EXCLUDED_DIRNAME)):
+            excluded = self._scan_drawings(self.EXCLUDED_DIRNAME)
+            print("scanned %s (%d, excluded from the map)"
+                  % (self.EXCLUDED_DIRNAME, len(excluded)), file=sys.stderr)
+        json.dump({"folders": folders, "excluded": excluded}, sys.stdout)
 
     def build(self):
         """Render every mapped PDF and write manifest.json from import-map.json."""
@@ -666,8 +786,16 @@ class Preprocessor:
             self.write_stub(unmapped)
         # `built` is the media cache-buster: MediaView serves `?v=<built>` URLs as
         # immutable, and a rebuild minting a new token is what invalidates them.
-        self.write_manifest({"siteplan": siteplan, "buildings": buildings,
-                             "built": int(time.time())})
+        manifest = {"siteplan": siteplan, "buildings": buildings, "built": int(time.time())}
+        # The facility's declared organization mode (MODEL-6), stamped into the import map by the
+        # BuildView so a built facility records how it was organized. Copied through as an opaque
+        # string against a literal allowlist — this subprocess stays Django-free (design §5
+        # guardrail 4), so it never reads the setting itself. Recorded **only** for the
+        # non-default mode, so a Site-anchored manifest stays byte-identical to older builds
+        # (readers treat it as optional, exactly like a building's `buildingSlug`).
+        if imap.get("orgMode") == "site-as-campus":
+            manifest["orgMode"] = "site-as-campus"
+        self.write_manifest(manifest)
         print("Wrote %s — buildings: %d, floors: %d"
               % (self.manifest_path, len(buildings),
                  sum(len(b["floors"]) for b in buildings)), file=sys.stderr)

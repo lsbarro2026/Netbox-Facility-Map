@@ -21,7 +21,7 @@ import pytest
 from django.urls import reverse
 
 from netbox_facilitymap import previews
-from netbox_facilitymap.imports import RenderRunner
+from netbox_facilitymap.render_runner import RenderRunner
 from netbox_facilitymap.models import FacilityMapBlob
 
 RENDER_HQ = 'plugins:netbox_facilitymap:api-settings-render-hq'
@@ -126,7 +126,7 @@ def spawned(monkeypatch):
         calls.append(argv)
         return _Proc()
 
-    monkeypatch.setattr('netbox_facilitymap.imports.subprocess.run', fake_run)
+    monkeypatch.setattr('netbox_facilitymap.render_runner.subprocess.run', fake_run)
     return calls
 
 
@@ -174,7 +174,7 @@ def fake_proc(monkeypatch):
     `RenderRunner.run`'s result-shaping is exercised without spawning a render subprocess."""
     def install(returncode=0, stdout='', stderr=''):
         proc = type('_Proc', (), {'returncode': returncode, 'stdout': stdout, 'stderr': stderr})()
-        monkeypatch.setattr('netbox_facilitymap.imports.subprocess.run',
+        monkeypatch.setattr('netbox_facilitymap.render_runner.subprocess.run',
                             lambda argv, **kw: proc)
     return install
 
@@ -217,7 +217,7 @@ def test_hq_timeout_points_at_the_timeout_setting(db, workdir, monkeypatch):
     _hq_on()
     def timeout(argv, **kw):
         raise subprocess.TimeoutExpired(argv, 1)
-    monkeypatch.setattr('netbox_facilitymap.imports.subprocess.run', timeout)
+    monkeypatch.setattr('netbox_facilitymap.render_runner.subprocess.run', timeout)
     result = RenderRunner().run('build')
     assert result['ok'] is False and 'render_timeout_s' in result['hint']
 
@@ -243,3 +243,19 @@ def test_scan_ignores_a_render_summary_line(db, workdir, fake_proc):
     fake_proc(stdout='{"folders": []}', stderr='RENDER-SUMMARY {"unrendered": 3}')
     result = RenderRunner().run('scan')
     assert result == {'ok': True, 'folders': []}
+
+
+def test_a_run_reads_the_render_hq_setting_once(db, workdir, fake_proc, monkeypatch):
+    """One run, one settings read (QUAL-7). The flag both selects `--scale` and decides whether a
+    resource failure is worth explaining as an HQ one, and it used to be read separately for each —
+    two queries for one boolean, with the standing risk of the two disagreeing across a concurrent
+    toggle. Exercised on the signal-kill path, which is where both uses meet."""
+    _hq_on()
+    reads = []
+    real = previews.render_hq_enabled
+    monkeypatch.setattr('netbox_facilitymap.render_runner.render_hq_enabled',
+                        lambda *a, **kw: (reads.append(1), real(*a, **kw))[1])
+    fake_proc(returncode=-9)
+    result = RenderRunner().run('build')
+    assert result['hq_mem'] is True     # the flag still reached the diagnostic…
+    assert reads == [1]                 # …off a single read

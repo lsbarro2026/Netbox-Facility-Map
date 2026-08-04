@@ -13,8 +13,9 @@
    durable user data and are never auto-deleted.
 
    Instantiated by `FloorEditor` (non-embed only); talks to the `/api/todos` endpoints via the `Api`
-   client. The create form is a shared `TodoComposer` and the ordering a shared `TodoModel` — both
-   also serve the facility-wide to-do page (TASK-5), so neither belongs to this class. Editing a row
+   client. The create form is a shared `TodoComposer`, the ordering a shared `TodoModel` and the
+   row's chips/pills a shared `TodoChips` (QUAL-10) — all three also serve the facility-wide to-do
+   page (TASK-5), so none of them belongs to this class. Editing a row
    (UX-9) opens that same `TodoComposer` in its edit mode, in place of the row: one form, so an edit
    reaches every field creating does. Like the rest
    of the map, edit affordances are shown to everyone and the server enforces the write permission
@@ -29,10 +30,6 @@ const TODO_MIN_W = 240;
 const TODO_COLLAPSE_W = 170;
 const TODO_DEFAULT_W = 320;
 const TODO_MAX_FRAC = 0.45;
-
-//: Avatars shown inline on a row before the rest collapse into a "+N" chip. Two is what fits beside
-//: the other meta chips at the panel's default width without wrapping the row.
-const TODO_AVATAR_MAX = 2;
 
 //: The filter pills, left to right. `match` is null for "All" (which shows everything, with the
 //: completed items tucked into their collapsed group rather than inline). `empty` is the word the
@@ -66,6 +63,7 @@ class FloorTodo {
 
   resizeOpts() {
     return {
+      title: 'Show or hide the floor to-do',
       widthKey: TODO_WIDTH_KEY, collapsedKey: TODO_COLLAPSED_KEY,
       minW: TODO_MIN_W, collapseW: TODO_COLLAPSE_W, defaultW: TODO_DEFAULT_W, maxFrac: TODO_MAX_FRAC,
     };
@@ -77,10 +75,16 @@ class FloorTodo {
 
   // ---- build ----
   /** Build the panel shell and kick off the async load. Returns the `<aside>` immediately (the list
-   *  fills in when the fetch lands), so `FloorEditor.show()` is never blocked on it. */
-  build() {
+   *  fills in when the fetch lands), so `FloorEditor.show()` is never blocked on it.
+   *
+   *  `opts.onClose` (optional) wires the header's ✕. It exists for the phone layout, where the panel
+   *  covers the stage as its own page (`.mobile-sheet`, NAV-21) and so needs a close of its own; CSS
+   *  hides the button everywhere else, since the desktop side column is closed by `#panel-toggle`
+   *  and the drag handle. The panel builds the button (its header, its DOM) but the caller supplies
+   *  the behaviour — collapsing the panel is `FloorEditor`'s business, not the list's. */
+  build({ onClose = null } = {}) {
     this.panel = Dom.el('aside', { class: 'todo-panel' });
-    this.panel.append(this._head(), this._filters(), this._composerHost());
+    this.panel.append(this._head(onClose), this._filters(), this._composerHost());
     this.listEl = Dom.el('div', { class: 'todo-list' },
       Dom.el('div', { class: 'todo-empty' }, 'Loading…'));
     this.panel.append(this.listEl);
@@ -88,17 +92,25 @@ class FloorTodo {
     return this.panel;
   }
 
-  _head() {
+  _head(onClose = null) {
     this.openCountEl = Dom.el('span', { class: 'todo-open-count' });
     // The discoverable way to add a to-do. TASK-4's per-room "+" on the floor plan is a hover
     // affordance and so undiscoverable by itself; this button is the one that's always visible.
     const add = Dom.el('button', { class: 'todo-new', title: 'Add a to-do',
       html: Icons.plus + '<span>New</span>' });
     add.addEventListener('click', () => this.openComposer());
+    // Mobile-sheet close (NAV-21) — built only when the caller supplied behaviour for it, and shown
+    // by CSS only inside `.mobile-sheet`.
+    let close = null;
+    if (onClose) {
+      close = Dom.el('button', { class: 'todo-close', type: 'button', title: 'Close the to-do list',
+        'aria-label': 'Close the to-do list' }, '×');
+      close.addEventListener('click', onClose);
+    }
     return Dom.el('div', { class: 'todo-head' }, [
       Dom.el('span', { class: 'todo-head-ico', html: Icons.todo }),
       Dom.el('span', { class: 'todo-head-title' }, 'Floor to-do'),
-      this.openCountEl, add,
+      this.openCountEl, add, close,
     ]);
   }
 
@@ -123,11 +135,7 @@ class FloorTodo {
 
   _setFilter(key) {
     this.filter = key;
-    for (const f of TODO_FILTERS) {
-      const on = f.key === key;
-      this.filterBtns[f.key].btn.classList.toggle('active', on);
-      this.filterBtns[f.key].btn.setAttribute('aria-pressed', String(on));
-    }
+    TodoChips.markActive(this.filterBtns, key);
     this._renderList();
   }
 
@@ -189,11 +197,7 @@ class FloorTodo {
   _endEdit() { this.editTarget = null; }
 
   _roomChoices() {
-    return this.rooms.map(r => ({ id: r.id, label: this._roomName(r) }));
-  }
-
-  _roomName(room) {
-    return room.label || (room.location && room.location.name) || room.id;
+    return this.rooms.map(r => ({ id: r.id, label: TodoChips.roomName(r) }));
   }
 
   // ---- data ----
@@ -229,8 +233,8 @@ class FloorTodo {
 
   /** Re-sync the assigned-room set after a live bind/unbind/delete/create (called by FloorEditor at
    *  each mutation point — never from render(), which fires every drag frame and would thrash the
-   *  panel). No-ops when the drawn-and-assigned room id+label set is unchanged (e.g. duplicateRoom's
-   *  new room is still unbound), so most calls touch nothing. `byRoom` is keyed by room id and
+   *  panel). No-ops when the drawn-and-assigned room id+label set is unchanged (e.g. a newly drawn
+   *  or duplicated room is still unbound), so most calls touch nothing. `byRoom` is keyed by room id and
    *  untouched here, so records survive a real refresh; the composer is likewise kept (only its room
    *  options are swapped), so a refresh landing mid-draft doesn't discard what the user typed. */
   syncRooms(rooms) {
@@ -315,60 +319,18 @@ class FloorTodo {
       this._meta(todo, room),
     ];
     if (todo.notes) parts.push(Dom.el('div', { class: 'todo-notes', title: todo.notes }, todo.notes));
-    parts.push(this._pills(todo, room));
+    parts.push(TodoChips.pills(todo, (status) => this._setStatus(todo, room, status)));
     return Dom.el('div', { class: 'todo-item status-' + todo.status + (mine ? ' mine' : '') }, parts);
   }
 
-  /** The meta chip row: room · priority · assignees · due. */
+  /** The meta chip row: room · priority · assignees · due — every chip from the shared `TodoChips`
+   *  vocabulary, so a to-do reads the same here as it does on the facility-wide page. */
   _meta(todo, room) {
-    const chips = [
-      Dom.el('span', { class: 'todo-chip todo-room-chip', title: this._roomName(room) },
-        [Dom.el('span', { class: 'todo-room-dot' }), Dom.el('span', {}, this._roomName(room))]),
-      this._priorityChip(todo),
-    ];
-    const avatars = this._avatars(todo);
+    const chips = [TodoChips.roomChip(room), TodoChips.priorityChip(todo)];
+    const avatars = TodoChips.avatars(todo);
     if (avatars) chips.push(avatars);
-    if (todo.due) chips.push(this._dueChip(todo));
+    if (todo.due) chips.push(TodoChips.dueChip(todo));
     return Dom.el('div', { class: 'todo-meta' }, chips);
-  }
-
-  _priorityChip(todo) {
-    const p = TodoModel.PRIORITIES.find(x => x.key === todo.priority);
-    return Dom.el('span', { class: 'todo-prio prio-' + todo.priority,
-      title: (p ? p.label : todo.priority) + ' priority' },
-      [Dom.el('span', { class: 'todo-prio-dot' }), Dom.el('span', {}, p ? p.short : todo.priority)]);
-  }
-
-  /** Initials avatars, capped at TODO_AVATAR_MAX with a "+N" overflow chip whose tooltip names
-   *  everyone who didn't fit (so the information is never actually lost, just folded). */
-  _avatars(todo) {
-    const users = todo.assignees || [];
-    if (!users.length) return null;
-    const shown = users.slice(0, TODO_AVATAR_MAX);
-    const rest = users.slice(TODO_AVATAR_MAX);
-    const els = shown.map(u => Dom.el('span', { class: 'todo-avatar', title: u.display }, u.initials));
-    if (rest.length) {
-      els.push(Dom.el('span', { class: 'todo-avatar todo-avatar-more',
-        title: rest.map(u => u.display).join(', ') }, '+' + rest.length));
-    }
-    return Dom.el('span', { class: 'todo-avatars' }, els);
-  }
-
-  _dueChip(todo) {
-    const overdue = TodoModel.isOverdue(todo);
-    return Dom.el('span', { class: 'todo-chip todo-due' + (overdue ? ' overdue' : ''),
-      title: (overdue ? 'Overdue — due ' : 'Due ') + todo.due }, TodoModel.dueLabel(todo.due));
-  }
-
-  _pills(todo, room) {
-    return Dom.el('div', { class: 'todo-pills' }, TodoModel.STATUSES.map(s => {
-      const b = Dom.el('button', {
-        class: 'todo-pill' + (todo.status === s.key ? ' active' : ''),
-        title: 'Mark ' + s.label.toLowerCase(),
-      }, s.label);
-      if (todo.status !== s.key) b.addEventListener('click', () => this._setStatus(todo, room, s.key));
-      return b;
-    }));
   }
 
   // ---- the completed group ----
@@ -412,7 +374,8 @@ class FloorTodo {
       title: 'Delete this room’s completed to-dos' }, 'Clear');
     clear.addEventListener('click', () => this._clearCompleted(room.id));
     const head = Dom.el('div', { class: 'todo-group-head' }, [
-      Dom.el('span', { class: 'todo-group-name', title: this._roomName(room) }, this._roomName(room)),
+      Dom.el('span', { class: 'todo-group-name', title: TodoChips.roomName(room) },
+        TodoChips.roomName(room)),
       Dom.el('span', { class: 'todo-count' }, String(items.length)), clear,
     ]);
     return Dom.el('div', { class: 'todo-group' }, [head, ...items.map(e => this._item(e))]);

@@ -32,9 +32,21 @@ user's object permissions hide is dropped from the manifest and its `images/<sit
 `dcim.Site.objects.restrict(user, 'view')` (via `facilities.facility_site_slugs`) per read, so it
 composes with, rather than replaces, the login/flat-perm layers. `may_view_map_for_site` is the
 panel-side check (a Location/device/rack whose Site the user can't view shows no plan). It is
-**fail-closed**: a building whose `siteSlug` resolves to no viewable Site is hidden. Scoping the
-raw annotation/placement blob geometry is a deeper, still-open follow-up — this layer covers the
-rendered pixels + manifest, not the blob JSON.
+**fail-closed**: a building whose `siteSlug` resolves to no viewable Site is hidden.
+
+The layer covers the **blob geometry** too (SEC-2): with scoping on, the annotation/placement/
+layout/siteplan documents and the to-do reads are filtered to the same viewable-Site set, so a
+hidden Site leaks neither its pixels nor its room polygons, labels, markers or to-dos.
+`viewable_site_slugs` resolves that set once per read; `scope_manifest` applies it to the manifest
+(dropping whole buildings) and `scope_floor_keys` to the per-floor sharded kinds (a `floor_key`'s
+first segment is its Site slug). All three live here, shared by `imports`, `frontend_api` and the
+tokened REST reads in `api/views.py`, so the convention can't drift — in particular so a tokened
+read is never a way around the scoping the browser is held to.
+
+**The scoping axis is `dcim.Site`, and only `dcim.Site`.** `tenancy.Tenant` is *not* a boundary
+here — the plugin never reads it, and a Tenant constraint on a user's object permissions affects
+the map only insofar as it already narrows which Sites they may view. Modelling Tenant as a
+scoping axis of its own would be a separate design decision, not an extension of this layer.
 """
 
 from django.contrib.auth.mixins import LoginRequiredMixin
@@ -60,6 +72,63 @@ def reads_scoped_to_sites():
     anyone who clears the flat map-read gate above; on, they are additionally filtered to the
     viewer's viewable Sites (see `ManifestView`/`MediaView` and `may_view_map_for_site`)."""
     return bool(get_plugin_config('netbox_facilitymap', 'scope_reads_to_sites'))
+
+
+def viewable_site_slugs(user, facility):
+    """The Site slugs within `facility` that `user` may view — the per-Site read-scope set shared by
+    every scoped read (`imports`' manifest/media and `frontend_api`'s geometry/to-do reads).
+
+    `None` when `scope_reads_to_sites` is off, which every caller treats as "filter nothing", so the
+    default read path costs no query and returns byte-identical responses. Otherwise a set (possibly
+    empty → the user may see nothing here), resolved through `dcim.Site.objects.restrict(user,
+    'view')` so it honours object permissions. One query per scoped read; `facilities` is imported
+    lazily to keep this module free of plugin-internal import order concerns."""
+    if not reads_scoped_to_sites():
+        return None
+    from .facilities import facility_site_slugs
+    return facility_site_slugs(facility, user=user)
+
+
+def may_view_site_slug(user, slug):
+    """Whether per-Site read scoping admits the Site named by `slug` — the single-slug counterpart
+    to `viewable_site_slugs`, for a read that already names exactly one Site (a `floor_key` embeds
+    its Site slug, so a per-floor read needs no facility-wide set). `True` with scoping off, and
+    with it on **fail-closed**: an empty or unmatched slug is not viewable."""
+    if not reads_scoped_to_sites():
+        return True
+    from dcim.models import Site
+    return bool(slug) and Site.objects.restrict(user, 'view').filter(slug=slug).exists()
+
+
+def scope_manifest(manifest, viewable):
+    """A copy of `manifest` with its `buildings` filtered to those whose `siteSlug` is in `viewable`
+    (a floor plan lives at `images/<siteSlug>/…`, so the slug is the Site key). Fail-closed: a
+    building whose Site is not viewable — including one whose siteSlug matches no Site at all — is
+    dropped. The campus `siteplan` is a facility-wide asset, kept while the user may view any Site
+    and dropped when they may view none. `viewable` is never `None` here (the caller guards on the
+    scoping flag). The input dict is shared/read-only (`read_manifest`'s memo), so this copies.
+
+    Lives here rather than in `imports` because both manifest readers share it: the page-mount
+    `serving.ManifestView` and the tokened REST `api.views.ManifestView` (API-1)."""
+    scoped = dict(manifest)
+    scoped['buildings'] = [b for b in manifest.get('buildings', [])
+                           if b.get('siteSlug') in viewable]
+    if not viewable:
+        scoped['siteplan'] = None
+    return scoped
+
+
+def scope_floor_keys(keys, viewable):
+    """The subset of `keys` (per-floor shard keys / `Room.floor_key`s) whose Site the viewer may see.
+
+    A `floor_key`'s **first** segment is always its Site slug — for both the 2-segment Site-anchored
+    and 3-segment Location-anchored shapes (`models.parse_floor_key`, MODEL-3) — so the per-floor
+    sharded blob kinds are scoped by dropping whole rows, with no extra query. **Fail-closed**, like
+    the manifest filter: a malformed key, or one whose slug matches no viewable Site, is dropped.
+    `viewable is None` (scoping off) returns `keys` unchanged."""
+    if viewable is None:
+        return list(keys)
+    return [k for k in keys if k.split('/')[0] in viewable]
 
 
 def may_view_map(user):

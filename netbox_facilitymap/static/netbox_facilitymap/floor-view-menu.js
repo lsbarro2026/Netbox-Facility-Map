@@ -152,16 +152,21 @@ class FloorViewMenu {
   }
 
   // ---- the toolbar control ----
-  /** The "View" button + its (initially closed) popover, wrapped so the popover can position
-   *  absolutely against the button. Handed to App.setToolbar. */
+  /** The "View" button + its (initially closed) popover, wrapped so the pair rides in the toolbar
+   *  as one node (`_overflowToolbar` folds only `button, select`, so a `.view-menu-wrap` div stays
+   *  put). Handed to App.setToolbar.
+   *
+   *  The shared `Popover` (lib.js) owns the button's click, the anchoring, dismissal and teardown —
+   *  including being closed by `App._detachCurrent` on navigation, which is what stops the `document`
+   *  listeners outliving the building view when the user hits Back with the menu open (QUAL-9).
+   *  Right-aligned: the button sits at the bar's trailing edge. */
   button() {
     this._btn = Dom.el('button', { class: 'tb-labeled', title: 'Display options for the floor list',
       html: Icons.sliders + '<span>View</span>' });
     this._pop = Dom.el('div', { class: 'view-menu' });
     this._wrap = Dom.el('div', { class: 'view-menu-wrap' }, [this._btn, this._pop]);
     this._paint();
-    // stopPropagation so the just-opened popover isn't immediately closed by the document handler.
-    this._btn.onclick = (e) => { e.stopPropagation(); this._toggle(); };
+    this._popover = new Popover({ trigger: this._btn, panel: this._pop, align: 'right' });
     return this._wrap;
   }
 
@@ -222,33 +227,10 @@ class FloorViewMenu {
     return this._row(labelText, Dom.el('div', { class: 'view-slider-wrap' }, [input, out]));
   }
   _resetRow() {
-    const btn = Dom.el('button', { class: 'view-reset', type: 'button' }, 'Reset to defaults');
+    const btn = Dom.el('button', { class: 'view-reset', type: 'button',
+      title: 'Reset these display preferences to their defaults' }, 'Reset to defaults');
     btn.onclick = () => this._reset();
     return Dom.el('div', { class: 'view-row view-row-action' }, btn);
-  }
-
-  _toggle() { this._pop.classList.contains('open') ? this._close() : this._open(); }
-  _open() {
-    // The popover is `position: fixed` (see CSS) to escape the toolbar's overflow clip, so anchor
-    // it to the button's current viewport rect — just under it, right edges aligned.
-    const r = this._btn.getBoundingClientRect();
-    this._pop.style.top = Math.round(r.bottom + 6) + 'px';
-    this._pop.style.right = Math.round(window.innerWidth - r.right) + 'px';
-    this._pop.classList.add('open');
-    this._btn.classList.add('active');
-    // Close on any outside click or Escape; both handlers are removed again on close, and a click
-    // on a floor card (outside the wrap) closes it before navigating.
-    this._onDoc = (e) => { if (!this._wrap.contains(e.target)) this._close(); };
-    this._onKey = (e) => { if (e.key === 'Escape') this._close(); };
-    document.addEventListener('click', this._onDoc);
-    document.addEventListener('keydown', this._onKey);
-  }
-  _close() {
-    this._pop.classList.remove('open');
-    this._btn.classList.remove('active');
-    if (this._onDoc) document.removeEventListener('click', this._onDoc);
-    if (this._onKey) document.removeEventListener('keydown', this._onKey);
-    this._onDoc = this._onKey = null;
   }
 
   // ---- the grid ----

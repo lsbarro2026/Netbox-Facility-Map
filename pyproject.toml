@@ -32,13 +32,27 @@ classifiers = [
 # APIs this code uses: pypdfium2 4.0 introduced the `render().to_pil()` v4 API used in
 # preprocess.py (4.x/5.x both satisfy it); Pillow 10 is a safe modern baseline.
 #
-# The BASE install is lean — pypdfium2 + Pillow only (coding-standard #3). That enables the
-# common siteplan formats: PDF plus the Pillow rasters (PNG/JPEG/GIF/TIFF/BMP/WebP). Every
-# advanced format is opt-in via a category extra below, gated at runtime by the `drawing_formats`
-# registry (PKG-1): an uninstalled format isn't offered, and uploading one names the extra to add.
+# The BASE install covers the common siteplan formats — PDF plus the Pillow rasters
+# (PNG/JPEG/GIF/TIFF/BMP/WebP) — plus offline floor-code OCR. Every advanced *format* is opt-in via
+# a category extra below, gated at runtime by the `drawing_formats` registry (PKG-1): an
+# uninstalled format isn't offered, and uploading one names the extra to add.
+#
+# onnxruntime + numpy back the import wizard's "Populate with OCR" (IMPORT-31), which reads a
+# drawing's floor code out of the crop region the user marked. They are BASE, not an extra, by
+# explicit decision (2026-07-27): the requirement was that a plain `pip install` just works with no
+# second step, on an air-gapped install. This deliberately trades away the lean base that
+# coding-standard #3 otherwise asks for — ~36 MB of additional wheels on every install, including
+# facilities that never OCR — and it re-adds the two dependencies `1.10.0` removed. Both are
+# self-contained wheels (onnxruntime MIT, numpy BSD) needing no system libraries and no network at
+# install or run time; the recognition model is vendored under `netbox_facilitymap/models/` (see
+# its README) so recognition is fully offline. The runtime capability gate (`capabilities.py`
+# `OcrCapability`) still hides the feature where the wheels or the model are absent, so a platform
+# without an onnxruntime wheel degrades rather than breaks.
 dependencies = [
     "pypdfium2>=4.0.0",
     "Pillow>=10.0.0",
+    "onnxruntime>=1.17",
+    "numpy>=1.24",
 ]
 
 # Optional format packages. Install the ones you need (`pip install netbox-facilitymap[svg,gis]`),
@@ -93,8 +107,11 @@ version = { attr = "netbox_facilitymap.__version__" }
 [tool.setuptools.packages.find]
 include = ["netbox_facilitymap*"]
 
+# `models/*.onnx` is the vendored PP-OCRv4 recognition model. It MUST ship in the wheel — that is
+# what keeps OCR offline (no download at install or first use). Without it the `ocr` capability
+# gate fails closed and the Populate button is never offered.
 [tool.setuptools.package-data]
-netbox_facilitymap = ["templates/**/*", "static/**/*"]
+netbox_facilitymap = ["templates/**/*", "static/**/*", "models/*.onnx", "models/README.md"]
 
 # `tests/` is a sibling of the package (not under netbox_facilitymap*), so the packages-find
 # above already excludes it from the wheel. `DJANGO_SETTINGS_MODULE` names NetBox's settings;

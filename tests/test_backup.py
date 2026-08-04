@@ -15,6 +15,28 @@ from netbox_facilitymap.backup import _check_safe_members, create_backup, restor
 
 # ---- archive traversal guard (no DB) ----
 
+def _tar_with(path, *infos):
+    """Write a tar holding `infos` (a `TarInfo`, or a `(TarInfo, bytes)` pair) and return its
+    members read back — the shape `_check_safe_members` is handed by `restore_backup`."""
+    with tarfile.open(path, 'w') as tar:
+        for info in infos:
+            info, payload = info if isinstance(info, tuple) else (info, b'')
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+    with tarfile.open(path) as tar:
+        return tar.getmembers()
+
+
+def test_check_safe_members_accepts_a_normal_archive(tmp_path):
+    # The positive control the negatives below are only meaningful against: the exact member shape
+    # `create_backup` writes passes the guard untouched.
+    members = _tar_with(tmp_path / 'ok.tar',
+                        (tarfile.TarInfo('db.json'), b'[]'),
+                        (tarfile.TarInfo('bindings.json'), b'{}'),
+                        (tarfile.TarInfo('workdir/images/s/f.png'), b'PNG'))
+    assert _check_safe_members(members) is None
+
+
 def test_check_safe_members_rejects_parent_escape(tmp_path):
     path = tmp_path / 'bad.tar'
     with tarfile.open(path, 'w') as tar:
@@ -47,6 +69,42 @@ def test_check_safe_members_rejects_symlink(tmp_path):
     with tarfile.open(path) as tar:
         with pytest.raises(ValueError, match='unsafe link'):
             _check_safe_members(tar.getmembers())
+
+
+def test_check_safe_members_rejects_nested_parent_escape(tmp_path):
+    # The escape doesn't have to lead: a `..` anywhere in the path still climbs out of the
+    # extraction dir, and a plausible-looking `workdir/` prefix is exactly how it would be hidden.
+    members = _tar_with(tmp_path / 'nested.tar', tarfile.TarInfo('workdir/../../evil'))
+    with pytest.raises(ValueError, match='unsafe path'):
+        _check_safe_members(members)
+
+
+def test_check_safe_members_rejects_hardlink(tmp_path):
+    # A hardlink escapes the same way a symlink does — the guard rejects both link types.
+    info = tarfile.TarInfo('evil')
+    info.type = tarfile.LNKTYPE
+    info.linkname = '/etc/passwd'
+    with pytest.raises(ValueError, match='unsafe link'):
+        _check_safe_members(_tar_with(tmp_path / 'hard.tar', info))
+
+
+def test_restore_rejects_a_traversal_archive_before_extracting_anything(tmp_path, workdir):
+    # End-to-end, not just the helper: `restore_backup` validates every member up front, so a
+    # crafted archive is refused before a single byte is written and the live working dir survives.
+    archive = tmp_path / 'evil.tar.gz'
+    payload = b'OWNED'
+    with tarfile.open(archive, 'w:gz') as tar:
+        for name in ('db.json', '../escaped.txt'):
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+    (workdir / 'manifest.json').write_text('{"siteplan": null, "buildings": ["keep"]}')
+
+    with pytest.raises(ValueError, match='unsafe path'):
+        restore_backup(archive)
+
+    assert '"keep"' in (workdir / 'manifest.json').read_text()   # the facility is untouched
+    assert not (tmp_path / 'escaped.txt').exists()
 
 
 def test_restore_missing_file_raises(tmp_path):
@@ -101,6 +159,37 @@ def test_create_restore_roundtrip(workdir, backupdir):
     assert img.read_bytes() == b'PNGDATA'
 
 
+@pytest.mark.django_db
+def test_restore_swaps_the_working_dir_after_the_transaction(workdir, backupdir, monkeypatch):
+    """The swap deletes the previous working dir irreversibly, so it must run **outside**
+    `restore_backup`'s transaction (QUAL-5): inside it, a rollback would restore the rows while the
+    files stayed the archive's, with the old tree already gone. `connection.in_atomic_block` can't
+    express that here — a `django_db` test is itself wrapped in a transaction, so it reads True
+    either way. Savepoint *depth* can: `restore_backup`'s own `atomic()` pushes one savepoint, so a
+    swap left inside it records depth + 1 rather than the depth measured around the call."""
+    from django.db import connection
+    from netbox_facilitymap import backup as backup_module
+    from netbox_facilitymap.models import FacilityMapBlob
+
+    FacilityMapBlob.objects.create(kind='siteplan', data={'hotspots': []})
+    (workdir / 'images').mkdir()
+    (workdir / 'images' / 'f.png').write_bytes(b'PNGDATA')
+    path, _ = create_backup(stamp='20200101-000001')
+
+    real_swap = backup_module._restore_workdir
+    depth_at_swap = []
+
+    def probe(tar, members):
+        depth_at_swap.append(len(connection.savepoint_ids))
+        return real_swap(tar, members)
+
+    monkeypatch.setattr(backup_module, '_restore_workdir', probe)
+    depth_outside_the_transaction = len(connection.savepoint_ids)
+
+    assert restore_backup(path)['workdir'] is True
+    assert depth_at_swap == [depth_outside_the_transaction]
+
+
 # ---- portable slug bindings + migration safety (BAK-1) ----
 
 @pytest.mark.django_db
@@ -134,6 +223,102 @@ def test_restore_rebinds_by_slug_onto_new_location_pks(workdir, backupdir):
     r = Room.objects.get(room_id='r1')
     assert r.location_id == new_room_loc.pk       # rebound to the new pk, not the archived one
     assert r.floor_location_id == new_floor.pk
+
+
+@pytest.mark.django_db
+def test_restore_rebinds_by_full_ancestor_path_not_bare_slug(workdir, backupdir):
+    """Location slugs are unique only per `(site, parent, slug)`, so two floors can each hold a room
+    Location called `r`. The whole reason `_location_portable_key` stores the ancestor *path* is that
+    a bare-slug lookup would silently bind the room to the wrong floor's namesake."""
+    from dcim.models import Location, Site
+    from netbox_facilitymap.models import FacilityMapBlob, Room
+
+    site = Site.objects.create(name='S', slug='s')
+    floor1 = Location.objects.create(name='F1', slug='f1', site=site)
+    floor2 = Location.objects.create(name='F2', slug='f2', site=site)
+    Location.objects.create(name='R', slug='r', site=site, parent=floor1)
+    room_loc2 = Location.objects.create(name='R', slug='r', site=site, parent=floor2)
+    Room.objects.create(floor_key='s/f2', room_id='r1', label='R1',
+                        location=room_loc2, floor_location=floor2)
+
+    path, _ = create_backup(stamp='20200101-000020')
+
+    # Rebuild the same tree with fresh pks so a pk replay can't accidentally pass, and re-create
+    # floor1's namesake FIRST — a bare-slug lookup would return that one.
+    Room.objects.all().delete()
+    FacilityMapBlob.objects.all().delete()
+    Location.objects.filter(parent__isnull=False).delete()
+    floor1.delete()
+    floor2.delete()
+    new_floor1 = Location.objects.create(name='F1', slug='f1', site=site)
+    decoy = Location.objects.create(name='R', slug='r', site=site, parent=new_floor1)
+    new_floor2 = Location.objects.create(name='F2', slug='f2', site=site)
+    new_room_loc2 = Location.objects.create(name='R', slug='r', site=site, parent=new_floor2)
+
+    result = restore_backup(path)
+
+    assert result['unresolved'] == []
+    r = Room.objects.get(room_id='r1')
+    assert r.location_id == new_room_loc2.pk    # the path resolved to floor2's `r`…
+    assert r.location_id != decoy.pk            # …not floor1's identically-slugged one
+    assert r.floor_location_id == new_floor2.pk
+
+
+@pytest.mark.django_db
+def test_restore_does_not_bind_a_matching_path_under_a_different_site(workdir, backupdir):
+    """The portable key is site-anchored: an identical ancestor path living under some *other* Site
+    is not a match. It reports unresolved rather than binding a room into the wrong facility."""
+    from dcim.models import Location, Site
+    from netbox_facilitymap.backup import RestoreUnresolvedError
+    from netbox_facilitymap.models import FacilityMapBlob, Room
+
+    site = Site.objects.create(name='S', slug='s')
+    floor = Location.objects.create(name='F', slug='f', site=site)
+    room_loc = Location.objects.create(name='R', slug='r', site=site, parent=floor)
+    Room.objects.create(floor_key='s/f', room_id='r1', label='R1',
+                        location=room_loc, floor_location=floor)
+
+    path, _ = create_backup(stamp='20200101-000021')
+
+    # Drop only the room Location, and stand up an identically-slugged `f/r` under a *different*
+    # Site. The floor still resolves under `s`, so the sole unresolved binding below is the room's —
+    # proving the decoy was rejected on its Site, not merely missed for some other reason.
+    Room.objects.all().delete()
+    FacilityMapBlob.objects.all().delete()
+    room_loc.delete()
+    other = Site.objects.create(name='Other', slug='other')
+    other_floor = Location.objects.create(name='F', slug='f', site=other)
+    Location.objects.create(name='R', slug='r', site=other, parent=other_floor)
+
+    with pytest.raises(RestoreUnresolvedError) as exc:
+        restore_backup(path)
+    assert exc.value.unresolved == [
+        "room 's/f/r1': bound Location 's/f/r' has no match on this instance"]
+    assert not Room.objects.exists()   # aborted before any write, as always
+
+
+@pytest.mark.django_db
+def test_restore_aborts_when_the_floor_binding_cannot_resolve(workdir, backupdir):
+    """The other half of `_resolve_room_bindings`: `floor_location` re-derives from the portable
+    `floor_key`, so a floor Location missing on the target aborts too — even for a room that was
+    never bound to a room Location at all."""
+    from dcim.models import Location, Site
+    from netbox_facilitymap.backup import RestoreUnresolvedError
+    from netbox_facilitymap.models import FacilityMapBlob, Room
+
+    site = Site.objects.create(name='S', slug='s')
+    floor = Location.objects.create(name='F', slug='f', site=site)
+    Room.objects.create(floor_key='s/f', room_id='r1', label='R1', floor_location=floor)
+
+    path, _ = create_backup(stamp='20200101-000022')
+
+    Room.objects.all().delete()
+    FacilityMapBlob.objects.all().delete()
+    floor.delete()
+
+    with pytest.raises(RestoreUnresolvedError) as exc:
+        restore_backup(path)
+    assert "floor 's/f' has no matching Site + Location" in str(exc.value)
 
 
 @pytest.mark.django_db

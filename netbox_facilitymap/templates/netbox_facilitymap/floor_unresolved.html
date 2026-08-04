@@ -11,7 +11,12 @@
 <div class="card">
   <h5 class="card-header">Facility Map — Rooms</h5>
   <div class="card-body">
-    <div style="border:1px solid #ccc;background:#f4f5f7;border-radius:4px;padding:1rem 1.25rem;color:#495057">
+    {% comment %}
+      Rendering inside a NetBox page, so the surface colours come from NetBox's Tabler palette
+      (hex fallbacks retained) and the notice follows NetBox's light/dark mode.
+    {% endcomment %}
+    <div style="border:1px solid var(--tblr-border-color,#ccc);background:var(--tblr-secondary-bg,#f4f5f7);
+                border-radius:4px;padding:1rem 1.25rem;color:var(--tblr-body-color,#495057)">
       <p style="margin:0 0 .35rem;font-weight:600">
         <i class="mdi mdi-map-marker-off"></i> Floor plan unavailable
       </p>

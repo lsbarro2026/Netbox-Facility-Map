@@ -127,6 +127,30 @@ def test_build_location_anchored_building_nests_dir_and_images(tmp_path, make_pd
     assert (tmp_path / floor['thumb']).is_file()
 
 
+def test_build_records_the_org_mode_only_when_location_anchored(tmp_path, make_pdf):
+    """The facility's declared organization mode (MODEL-6) is stamped into the import map by the
+    BuildView and copied onto the manifest here — recorded **only** for the non-default
+    `site-as-campus`, so a `site-as-building` manifest stays byte-identical to older builds."""
+    _write_pdf(tmp_path / 'uploads' / 'AlphaWing' / 'ground.pdf', make_pdf())
+    imap = {'buildings': {'AlphaWing': {'slug': 'alpha', 'name': 'Alpha Wing', 'abbr': 'AB',
+                                        'floors': {'ground': 'g'}}}}
+
+    for mode, expected in (('site-as-campus', 'site-as-campus'),
+                           ('site-as-building', None),
+                           (None, None),
+                           ('nonsense', None)):
+        imap.pop('orgMode', None)
+        if mode is not None:
+            imap['orgMode'] = mode
+        (tmp_path / 'import-map.json').write_text(json.dumps(imap))
+
+        proc = _run('build', tmp_path)
+        assert proc.returncode == 0, proc.stderr
+
+        manifest = json.loads((tmp_path / 'manifest.json').read_text())
+        assert manifest.get('orgMode') == expected, mode
+
+
 def test_build_site_anchored_manifest_omits_building_slug(tmp_path, make_pdf):
     """Regression: a Site-anchored build (no `buildingSlug`) is byte-identical to before — a flat
     `dir == siteSlug`, flat `images/<siteSlug>/…`, and NO `buildingSlug` field (readers treat it as
@@ -182,6 +206,40 @@ def test_scan_reports_page_count(tmp_path, make_pdf, make_multipage_pdf):
     by_file = {p['file']: p for p in json.loads(proc.stdout)['folders'][0]['pdfs']}
     assert by_file['set.pdf']['pages'] == 3
     assert by_file['single.pdf']['pages'] == 1
+
+
+def test_scan_reports_per_page_geometry(tmp_path, make_pdf, make_multipage_pdf):
+    """A PDF reports each page's physical size in the scan inventory (IMPORT-51). The wizard needs
+    the sheet's *shape*, not its render size, to re-anchor the marked floor-code region onto a
+    differently-shaped sheet — and a multi-page set's pages are not required to match each other,
+    so the sizes are per page, in the order the wizard explodes them into cards."""
+    _write_pdf(tmp_path / 'uploads' / 'AlphaWing' / 'set.pdf',
+               make_multipage_pdf([(120, 160), (200, 160), (120, 300)]))
+    _write_pdf(tmp_path / 'uploads' / 'AlphaWing' / 'single.pdf', make_pdf(300, 200))
+
+    proc = _run('scan', tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    by_file = {p['file']: p for p in json.loads(proc.stdout)['folders'][0]['pdfs']}
+    # Pillow writes a PDF at 72 dpi, so a WxH-pixel source page is W x H points.
+    assert by_file['set.pdf']['sizes'] == [[120, 160], [200, 160], [120, 300]]
+    assert by_file['single.pdf']['sizes'] == [[300, 200]]
+    assert by_file['set.pdf']['unit'] == by_file['single.pdf']['unit'] == 'pt'
+
+
+def test_scan_reports_no_geometry_for_a_raster(tmp_path, make_image):
+    """A raster reports **no** page size, deliberately. Its pixel dimensions are a scan resolution,
+    not a sheet size (the same sheet at 200 and 400 dpi differs 4x in pixels at identical physical
+    size), so publishing them as geometry would make the region adapter compare incomparable
+    numbers. Null means unknown, and the wizard falls back to plain fractions."""
+    _write(tmp_path / 'uploads' / 'AlphaWing' / '101.png', make_image('PNG', 400, 300))
+
+    proc = _run('scan', tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    (png,) = json.loads(proc.stdout)['folders'][0]['pdfs']
+    assert png['sizes'] is None
+    assert png['unit'] == ''
 
 
 def test_build_explodes_pdf_pages_into_separate_floors(tmp_path, make_multipage_pdf):
@@ -437,6 +495,30 @@ def test_build_without_labels_falls_back_to_token_guess(tmp_path, make_image):
     assert floor['label'] == 'Basement 2'
 
 
+def test_build_location_token_skips_compact_grammar_even_without_label(tmp_path, make_image):
+    """INTL-2 regression: a Location-mode floor whose token happens to full-match the compact
+    floor-code grammar (e.g. a Spanish "Bloque 1" slugged `b1`) must render as its title-cased
+    slug, not get silently mistranslated as `floor_label`'s compact-code guess ("Basement 1") —
+    even when the chosen Location label field resolved no text, the case `labels` alone can't
+    guard. `locationTokens` marks the origin so `floor_label` skips the grammar outright."""
+    _write(tmp_path / 'uploads' / 'AlphaWing' / 'ground.png',
+           make_image('PNG', 200, 300))
+    (tmp_path / 'import-map.json').write_text(json.dumps({
+        'buildings': {
+            'AlphaWing': {'slug': 'alpha', 'name': 'Alpha Wing', 'abbr': '',
+                          'floors': {'ground': 'b1'},
+                          'locationTokens': {'ground': True}},
+        },
+    }))
+
+    proc = _run('build', tmp_path)
+    assert proc.returncode == 0, proc.stderr
+
+    (building,) = json.loads((tmp_path / 'manifest.json').read_text())['buildings']
+    (floor,) = building['floors']
+    assert floor['label'] == 'B1'
+
+
 def test_build_renders_svg_floor(tmp_path):
     """An SVG vector drawing rasterizes (via CairoSVG) into a floor, indistinguishable downstream
     from a PDF/raster floor: a WebP image whose width is the forced render size. Skipped when the
@@ -536,11 +618,80 @@ def test_floor_label(preprocess_module, token, label):
     assert preprocess_module.Preprocessor.floor_label(token) == label
 
 
+@pytest.mark.parametrize('token,label', [
+    ('b1', 'B1'),   # would otherwise compact-parse to 'Basement 1' (INTL-2)
+    ('g', 'G'),     # would otherwise compact-parse to 'Ground'
+])
+def test_floor_label_from_location_skips_compact_grammar(preprocess_module, token, label):
+    assert preprocess_module.Preprocessor.floor_label(token, True) == label
+
+
 def test_dwg_sort_key_orders_sheets(preprocess_module):
     key = preprocess_module.Preprocessor.dwg_sort_key
     stems = ['101', '100-2', '100', 'building']
     # numeric first (a '-N' second sheet sorts right after its base), non-numeric last.
     assert sorted(stems, key=key) == ['100', '100-2', '101', 'building']
+
+
+def test_building_folders_skips_both_reserved_names(preprocess_module, tmp_path):
+    # IMPORT-24: `.thumbs` (the render cache) and `_excluded` (drawings the operator dropped from
+    # the import) are both reserved and skipped by exact name. This one filter is what keeps them
+    # out of every downstream stage, so it is the single place worth pinning.
+    for folder in ('AlphaWing', 'BetaHall', '.thumbs', '_excluded'):
+        (tmp_path / 'uploads' / folder).mkdir(parents=True)
+    # A file sharing a reserved name isn't a folder and was never a candidate either way.
+    (tmp_path / 'uploads' / 'notes.txt').write_text('x')
+    pre = preprocess_module.Preprocessor(str(tmp_path))
+    assert pre.building_folders() == ['AlphaWing', 'BetaHall']
+
+
+def test_scan_ignores_the_excluded_folder(preprocess_module, tmp_path, make_pdf):
+    # The reserved folder never reaches the wizard's inventory as a **building** — not as a folder
+    # of its own, and not with its drawings folded into another folder (IMPORT-24). The file stays
+    # on disk. (It is reported under the separate `excluded` key — see the next test — which is
+    # deliberately not a `folders` entry.)
+    _write_pdf(tmp_path / 'uploads' / 'AlphaWing' / '101.pdf', make_pdf())
+    _write_pdf(tmp_path / 'uploads' / '_excluded' / 'title-sheet.pdf', make_pdf())
+
+    proc = _run('scan', tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    inv = json.loads(proc.stdout)
+    assert [f['folder'] for f in inv['folders']] == ['AlphaWing']
+    assert [p['file'] for p in inv['folders'][0]['pdfs']] == ['101.pdf']
+    assert (tmp_path / 'uploads' / '_excluded' / 'title-sheet.pdf').is_file()
+
+
+def test_scan_reports_the_excluded_park_under_its_own_key(preprocess_module, tmp_path, make_pdf):
+    # IMPORT-26: the edit hub can only offer to restore an excluded drawing if `scan` tells it the
+    # drawing exists. It is reported under `excluded` — a second listing pass — and carries the same
+    # per-drawing record a building's drawings do, thumbnail included, since the operator decides
+    # what to restore by looking at it.
+    _write_pdf(tmp_path / 'uploads' / 'AlphaWing' / '101.pdf', make_pdf())
+    _write_pdf(tmp_path / 'uploads' / '_excluded' / 'title-sheet.pdf', make_pdf())
+
+    proc = _run('scan', tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    inv = json.loads(proc.stdout)
+    assert [p['file'] for p in inv['excluded']] == ['title-sheet.pdf']
+    entry = inv['excluded'][0]
+    assert entry['stem'] == 'title-sheet'
+    assert entry['pdf'] == 'uploads/_excluded/title-sheet.pdf'
+    assert entry['pages'] == 1
+    assert entry['thumb'] == 'uploads/.thumbs/_excluded/title-sheet.pdf.png'
+    assert (tmp_path / entry['thumb']).is_file()
+
+
+def test_scan_reports_an_empty_excluded_list_with_no_park(preprocess_module, tmp_path, make_pdf):
+    # The common case — nothing was ever excluded, so there is no park on disk. The key is still
+    # present (the wizard reads it unconditionally) and the missing directory is not an error.
+    _write_pdf(tmp_path / 'uploads' / 'AlphaWing' / '101.pdf', make_pdf())
+
+    proc = _run('scan', tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)['excluded'] == []
 
 
 def test_page_entries_splits_bare_and_compound(preprocess_module):
@@ -1572,6 +1723,58 @@ def test_build_drops_overlay_only_floor(preprocess_module, tmp_path, monkeypatch
         'AlphaWing', entry)
 
     assert building['floors'] == []
+
+
+def test_build_region_split_renders_source_page_once(preprocess_module, tmp_path, make_image,
+                                                    monkeypatch):
+    """A page fanned into several region floors is rendered **once** and cropped per region. Each
+    region floor is its own group, so the whole-page cache has to span the whole building — scoping
+    it per floor would still produce correct images while silently re-rendering the source page N
+    times, which only a render count catches."""
+    _write(tmp_path / 'uploads' / 'AlphaWing' / 'wing.png', make_image('PNG', 120, 160))
+    entry = {'slug': 'alpha', 'name': 'Alpha', 'abbr': 'AB',
+             'floors': {'wing': [{'token': 'l2', 'region': [0, 0, 0.5, 1]},
+                                 {'token': 'l3', 'region': [0.5, 0, 0.5, 0.5]}]}}
+    proc = preprocess_module.Preprocessor(str(tmp_path))
+    rendered = []
+    real_render_full = proc.render_full
+    monkeypatch.setattr(proc, 'render_full',
+                        lambda path, **kw: (rendered.append(path)
+                                            or real_render_full(path, **kw)))
+
+    building, _ = proc.build_building_from_pdfs('AlphaWing', entry)
+
+    floors = {f['id']: f for f in building['floors']}
+    assert set(floors) == {'ABl2', 'ABl3'}                          # both region floors built...
+    assert (floors['ABl2']['w'], floors['ABl2']['h']) == (60, 160)   # ...each cropped to its own
+    assert (floors['ABl3']['w'], floors['ABl3']['h']) == (60, 80)    #    region, but...
+    assert len(rendered) == 1                                        # ...off ONE page render
+
+
+def test_build_region_split_evicts_cached_page_once_fully_consumed(preprocess_module, tmp_path,
+                                                                    make_image, monkeypatch):
+    """The whole-page cache lets an N-way split render its source page once (the sibling test
+    above), but must not pin that raster in memory for the rest of the build once every region has
+    cropped it — QUAL-13, guarding against a would-be MemoryError in an all-region-split building
+    under the render child's RLIMIT_AS."""
+    _write(tmp_path / 'uploads' / 'AlphaWing' / 'wing.png', make_image('PNG', 120, 160))
+    entry = {'slug': 'alpha', 'name': 'Alpha', 'abbr': 'AB',
+             'floors': {'wing': [{'token': 'l2', 'region': [0, 0, 0.5, 1]},
+                                 {'token': 'l3', 'region': [0.5, 0, 0.5, 0.5]}]}}
+    proc = preprocess_module.Preprocessor(str(tmp_path))
+    cache_sizes = []
+    real_render_floor = proc._render_floor
+
+    def spy(*args, **kwargs):
+        result = real_render_floor(*args, **kwargs)
+        cache_sizes.append(len(args[6]))   # page_cache is _render_floor's 7th positional arg
+        return result
+    monkeypatch.setattr(proc, '_render_floor', spy)
+
+    building, _ = proc.build_building_from_pdfs('AlphaWing', entry)
+
+    assert {f['id'] for f in building['floors']} == {'ABl2', 'ABl3'}
+    assert cache_sizes == [1, 0]   # cached after the first (of two) consumers, evicted after the last
 
 
 # ---- render quality (READ-1) ----

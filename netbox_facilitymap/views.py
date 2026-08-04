@@ -22,13 +22,13 @@ from dcim.models import DeviceRole
 
 from . import capabilities, facilities, health
 from .access import IMPORT_PERM, MapReadAccessMixin
+from .device_shapes import custom_rules
 from .drawing_formats import COMPANION_EXTS, DRAWING_EXTS, OVERLAY_EXTS
-from .frontend_api import serialize_user
-from .models import FacilityMapBlob
+from .frontend_api import merge_settings, serialize_user
 from .previews import (
     ORIENTATION_DEFAULT, SIZE_DEFAULT, SIZE_MAX, SIZE_MIN, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN,
-    RoomEmbedSettings, ap_settings, clamp_embed_size, clamp_floor_label_field, clamp_orientation,
-    clamp_zoom, inline_room_creation_enabled, render_hq_enabled, todos_enabled, write_mode_enabled,
+    PluginSettings, clamp_embed_size, clamp_floor_label_field, clamp_orientation, clamp_zoom,
+    todos_enabled,
 )
 
 # Orientation choices for the Settings <select> (value → human label). The values are the keys
@@ -36,14 +36,15 @@ from .previews import (
 ORIENTATION_CHOICES = [('vertical', 'Vertical (taller)'), ('landscape', 'Landscape (wide)')]
 
 
-def _floor_label_field(embed=None):
+def _floor_label_field(settings=None):
     """The configured Location field for a floor's display label, resolved across three tiers:
     the Settings-page `settings` blob value → the `PLUGINS_CONFIG floor_label_field` default →
-    `'name'`. Pass an existing `RoomEmbedSettings` to reuse its single settings-row query (the
-    Settings view already has one); otherwise one is loaded. A blob value that is present but bogus
-    is clamped by `RoomEmbedSettings.floor_label_field` and still wins over `PLUGINS_CONFIG`; only a
-    truly unset blob value (its property returns `None`) defers to the config default."""
-    stored = (embed or RoomEmbedSettings()).floor_label_field
+    `'name'`. Pass an existing `PluginSettings` to reuse its single settings-row query (both
+    `MapView` and the Settings view already have one); otherwise one is loaded. A blob value that is
+    present but bogus is clamped by `PluginSettings.floor_label_field` and still wins over
+    `PLUGINS_CONFIG`; only a truly unset blob value (its property returns `None`) defers to the
+    config default."""
+    stored = (settings or PluginSettings()).floor_label_field
     if stored is not None:
         return stored
     return clamp_floor_label_field(get_plugin_config('netbox_facilitymap', 'floor_label_field'))
@@ -90,6 +91,13 @@ class MapView(MapReadAccessMixin, TemplateView):
         # this lists the installed optional-format extras (svg/cad/gis/visio); a feature capability
         # (e.g. NOTE-1) would appear here too.
         context['capabilities'] = json.dumps(capabilities.enabled_keys())
+        # The operator's extra device-role → glyph keywords (INTL-1), injected into
+        # `window.MAP.roleGlyphs`. Validated + normalized once here on the server
+        # (`device_shapes.custom_rules`) rather than in the browser, so the lockstep pair
+        # (`device_shapes.py` / `device-shapes.js`) classifies against the identical vocabulary —
+        # the server-side embeds read the same function directly. A fixed vocabulary like
+        # `capabilities`/`drawing_exts`, so it rides `json.dumps` + `|safe`, not `|escapejs`.
+        context['role_glyphs'] = json.dumps([[t, list(k)] for t, k in custom_rules()])
         # Stamp the plugin version into window.MAP so App.ensureScripts can cache-bust the
         # lazily-loaded editor/import bundles per deploy (a browser-cached stale bundle run
         # against fresh core scripts is what broke the floor editor). Sourced from the running
@@ -107,31 +115,36 @@ class MapView(MapReadAccessMixin, TemplateView):
         # could actually create. Both are re-checked server-side in `NbLocationCreateView` — this is
         # purely UX, like `can_import`/`can_reset`.
         context['can_create_location'] = self.request.user.has_perm('dcim.add_location')
+        # One `PluginSettings` instance serves every settings-derived flag below — including
+        # `_floor_label_field` and `facilities.default_facility`, whose settings live in the same
+        # row — so this render reads the shared settings row **once** instead of issuing a query
+        # per flag.
+        settings = PluginSettings()
         # Install-wide write mode (LOC-2): the runtime, admin-controlled **master gate** on
         # everything the plugin writes into NetBox core, replacing the old redeploy-time
         # `allow_location_create` capability flag. Flipped on the in-app Settings page
         # (SettingsPage), read back here so the write add-ons apply without a worker restart.
         # Server-enforced at each write endpoint; this is the UX mirror.
-        context['write_mode'] = write_mode_enabled()
+        context['write_mode'] = settings.write_mode
         # The inline-room-creation add-on's own switch (SET-5), sitting on top of that gate: it, write
         # mode, and `can_create_location` must all be true before the bind panel offers the create
         # tile. Server-enforced in `NbLocationCreateView`; UX mirror, like `write_mode` above.
-        context['inline_room_creation'] = inline_room_creation_enabled()
+        context['inline_room_creation'] = settings.inline_room_creation
         # High-quality rendering (READ-1), mirrored so the Settings page can show its current state.
         # Unlike the switches around it this one steers no browser behaviour at all — the render it
         # controls happens in the import subprocess — so this is purely the toggle's initial value.
-        context['render_hq'] = render_hq_enabled()
+        context['render_hq'] = settings.render_hq
         # The to-do feature's install-wide switch (ADDON-4) — a general (non-write) add-on. Mirrored
         # to the browser so the SPA hides the to-do pages, the floor panel, and the compose icon when
         # off; every to-do endpoint re-checks it server-side (frontend_api.TodoFeatureGateMixin), so
         # this is the UX mirror, like write_mode/ap_tool above.
-        context['todos'] = todos_enabled()
+        context['todos'] = settings.todos
         # Access-point tool configuration (DEV-3), mirrored to the browser so the Settings page can
         # render its current state and the floor editor can decide whether to offer the tool. Every
         # value is re-read/re-enforced server-side; this is the UX mirror, like `write_mode` above.
         # `can_create_device` is the per-user half (`dcim.add_device`), the exact analogue of
         # `can_create_location` — the AP tool's install-wide halves are `ap_tool` AND `write_mode`.
-        ap = ap_settings()
+        ap = settings.ap
         context['ap_tool'] = ap['enabled']
         context['ap_name_template'] = ap['name_template']
         context['ap_count_scope'] = ap['count_scope']
@@ -152,19 +165,22 @@ class MapView(MapReadAccessMixin, TemplateView):
         context['ap_device_role'] = {'id': role.pk, 'name': role.name} if role else None
         # Default Location field the import wizard's floor-label picker starts on; the wizard
         # lets the user override it per import without editing PLUGINS_CONFIG.
-        context['floor_label_field'] = _floor_label_field()
+        context['floor_label_field'] = _floor_label_field(settings)
         # The operator-pinned default facility (SET-2): which facility the SPA boots into when the
         # URL hash names none. '' unless one is pinned on the in-app Settings page; a pin that no
         # longer resolves to a reachable, content-having facility degrades to '' here (HEALTH-1), so
         # the frontend never boots into a dead or empty facility. See facilities.default_facility.
-        context['default_facility'] = facilities.default_facility()
+        context['default_facility'] = facilities.default_facility(settings)
         # A read-only pointer banner (HEALTH-1): flag when the install holds map data parked under a
         # facility no current Site resolves to, so a viewer sees "the map looks empty because a
         # grouping change orphaned it" rather than a silently blank map. Surfaced to EVERY map viewer
         # (HEALTH-6), not just importers — the template shows the actionable "reassign it in Settings"
         # link only to `can_import` users, since the reassignment itself is the IMPORT_PERM-gated
         # Settings action; other viewers are told an admin must reassign it. Purely informational.
-        context['has_orphaned_data'] = bool(facilities.orphaned_facility_keys())
+        # The grouping is resolved off the same `settings` instance as everything above, so the
+        # banner costs a data scan and not a second read of the settings row.
+        context['has_orphaned_data'] = bool(
+            facilities.orphaned_facility_keys(group=facilities.grouping(settings)))
         # Who is looking at the map (TASK-3). The to-do surfaces sort a user's own to-dos above
         # everyone else's, so they need the viewer's identity client-side; it is stamped here rather
         # than fetched because it can't change within a page load, and a round-trip to learn it would
@@ -234,7 +250,7 @@ class SettingsView(LoginRequiredMixin, PermissionRequiredMixin, View):
     per-room map embed: `room_embed_zoom` (magnification), `room_embed_size` (footprint —
     the box's width as a percent of its column) and `room_embed_orientation` (box shape).
     Each is validated/clamped at this boundary; a value edited outside this form (admin/REST)
-    is re-clamped on read by the matching `previews.RoomEmbedSettings` property.
+    is re-clamped on read by the matching `previews.PluginSettings` property.
 
     This page owns only the settings about how the plugin *interacts with NetBox* — the per-room
     embed here and `facility_grouping` (set via `frontend_api.NbFacilitiesView`). Everything else
@@ -251,7 +267,7 @@ class SettingsView(LoginRequiredMixin, PermissionRequiredMixin, View):
 
     def _context(self, request):
         # One instance reads all three current values off a single settings-row query.
-        embed = RoomEmbedSettings()
+        embed = PluginSettings()
         return {
             'room_embed_zoom': embed.zoom,
             'zoom_min': ZOOM_MIN,
@@ -314,23 +330,19 @@ class SettingsView(LoginRequiredMixin, PermissionRequiredMixin, View):
         zoom = clamp_zoom(raw_zoom)
         size = clamp_embed_size(raw_size)
         orientation = clamp_orientation(request.POST.get('room_embed_orientation'))
-        # Merge onto the existing settings document (other keys preserved), then persist as a
-        # single write so the audit trail gets exactly one entry (AUDIT-1). Snapshot the row
-        # before overwriting so the change-log entry carries the before/after diff and an
-        # unchanged save is suppressed as a no-op; a first-ever save is a plain insert with no
-        # prechange state. (Unlike the editor blobs this isn't on the optimistic-concurrency
-        # path, so there's no version token / select_for_update here.)
-        blob = FacilityMapBlob.objects.filter(kind='settings', key='').first()
-        data = dict(blob.data if blob else {})
-        data['room_embed_zoom'] = zoom
-        data['room_embed_size'] = size
-        data['room_embed_orientation'] = orientation
-        if blob is None:
-            FacilityMapBlob.objects.create(kind='settings', key='', data=data)
-        else:
-            blob.snapshot()
-            blob.data = data
-            blob.save(update_fields=['data', 'updated', 'last_updated'])
+        # Merge onto the existing settings document through the one shared settings upsert, so the
+        # other keys survive, the audit trail gets exactly one entry with a before/after diff and an
+        # unchanged save is suppressed as a no-op (AUDIT-1), and — the part this page used to be
+        # missing — the read-modify-write happens under `select_for_update()` inside a transaction.
+        # Without that row lock a concurrent save from the in-app Settings page could interleave
+        # between this page's read and its write and lose one side's keys. (This page is still not
+        # on the optimistic-concurrency path: a stale *form* is a person re-submitting values they
+        # can see, not a blind document overwrite, so there's no version token — only the row lock.)
+        merge_settings({
+            'room_embed_zoom': zoom,
+            'room_embed_size': size,
+            'room_embed_orientation': orientation,
+        })
 
         messages.success(
             request,

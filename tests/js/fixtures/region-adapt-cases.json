@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "Code-region adaptation cases, run by BOTH ports (IMPORT-63) — `tests/js/import-regions.test.js`",
+    "asserts that `ImportRegions.adapt` produces `adapted`, and `tests/test_ocr.py` renders a sheet",
+    "of `target`'s shape with the caption drawn inside `anchored` and asserts that OCR, handed",
+    "`adapted`, still reads it. Before this fixture the two halves were tested apart: the JS side",
+    "checked the geometry and the Python side was only ever given hand-written boxes, so nothing",
+    "covered an adapt()-widened region actually reaching the crop — which is the path a facility",
+    "mixing sheet templates takes on every read.",
+    "",
+    "`anchored` is the re-anchored box BEFORE `ADAPT_MARGIN` grows it: where the marked block",
+    "physically lands on the target sheet, and so where the caption is drawn. `adapted` is that box",
+    "grown 10% a side, which is what OCR is actually sent. The gap between the two is the estimate",
+    "the picker now shows the operator rather than applying invisibly.",
+    "",
+    "Every number is derived by hand from `_axis` + `_widen`, not captured from a run — a fixture",
+    "blessed from the implementation it checks would only ever restate it."
+  ],
+  "cases": [
+    {
+      "name": "a same-shaped sheet keeps the fractions it was marked with",
+      "why": "Same aspect means one template printed at two scales, where the title block scales with the sheet. Plain fractions are already exactly right and re-anchoring would move a correct box.",
+      "region": {"x": 0.70, "y": 0.85, "w": 0.25, "h": 0.10,
+                 "pageSize": {"w": 2448, "h": 1584, "unit": "pt"}},
+      "target": {"w": 1224, "h": 792, "unit": "pt"},
+      "anchored": {"x": 0.70, "y": 0.85, "w": 0.25, "h": 0.10},
+      "adapted": {"x": 0.70, "y": 0.85, "w": 0.25, "h": 0.10},
+      "widened": false,
+      "renderPx": [1224, 792],
+      "caption": ["LEVEL 3 PLAN"],
+      "expect": "LEVEL 3"
+    },
+    {
+      "name": "a centred block is re-anchored and grown onto a portrait sheet",
+      "why": "Its midpoint sits inside CENTRE_BAND on both axes, so it keeps its centre and its physical size: 0.10*2448=244.8pt wide on a 612pt page is 0.40, 0.06*1584=95.04pt tall on a 792pt page is 0.12, then 10% a side.",
+      "region": {"x": 0.40, "y": 0.45, "w": 0.10, "h": 0.06,
+                 "pageSize": {"w": 2448, "h": 1584, "unit": "pt"}},
+      "target": {"w": 612, "h": 792, "unit": "pt"},
+      "anchored": {"x": 0.25, "y": 0.42, "w": 0.40, "h": 0.12},
+      "adapted": {"x": 0.21, "y": 0.408, "w": 0.48, "h": 0.144},
+      "widened": true,
+      "renderPx": [816, 1056],
+      "caption": ["GROUND FLOOR PLAN"],
+      "expect": "GROUND"
+    },
+    {
+      "name": "a bottom-right title block too wide for the target page clamps to the axis",
+      "why": "0.22*2448=538.56pt does not fit 612pt at its original 195.84pt right margin, so the horizontal start clamps to 0 rather than overflowing. Vertically it keeps its 47.52pt bottom margin (0.06 of 792pt) and its 142.56pt height (0.18).",
+      "region": {"x": 0.70, "y": 0.88, "w": 0.22, "h": 0.09,
+                 "pageSize": {"w": 2448, "h": 1584, "unit": "pt"}},
+      "target": {"w": 612, "h": 792, "unit": "pt"},
+      "anchored": {"x": 0, "y": 0.76, "w": 0.88, "h": 0.18},
+      "adapted": {"x": 0, "y": 0.742, "w": 0.968, "h": 0.216},
+      "widened": true,
+      "renderPx": [816, 1056],
+      "caption": ["SECOND BASEMENT", "LEVEL (B2) PLAN"],
+      "expect": "B2"
+    }
+  ]
+}

@@ -1,11 +1,11 @@
-"""Tier C — the room-embed settings tier of `previews.py`.
+"""Tier C — the settings-reading tier of `previews.py`.
 
-Covers the two halves that the `RoomEmbedSettings` refactor centres on: the stateless
-write-side `clamp_*` validators (shared by the Settings view and the class, no DB), and the
-`RoomEmbedSettings` reader — its defaults, clamping, and the single-query invariant that is the
-whole reason the tier is a class (load the `kind='settings'` row once in `__init__`, read all
-three properties off the cached dict). The geometry helpers (`floor_sheets`, `room_viewbox`, …)
-are exercised through `test_template_content.py` and are unchanged here.
+Covers the two halves that the `PluginSettings` refactor centres on: the stateless write-side
+`clamp_*` validators (shared by the Settings view and the class, no DB), and the `PluginSettings`
+reader — its defaults, clamping, and the single-query invariant that is the whole reason the tier
+is a class (load the install-wide `kind='settings'` row once in `__init__`, read every property off
+the cached dict). The geometry helpers (`floor_sheets`, `room_viewbox`, …) are exercised through
+`test_template_content.py` and are unchanged here.
 """
 
 import json
@@ -15,7 +15,7 @@ import pytest
 
 from netbox_facilitymap.previews import (
     FLOOR_LABEL_FIELD_DEFAULT, ORIENTATION_DEFAULT, SIZE_DEFAULT, SIZE_MAX, SIZE_MIN, ZOOM_DEFAULT,
-    ZOOM_MAX, ZOOM_MIN, RoomEmbedSettings, clamp_embed_size, clamp_floor_label_field,
+    ZOOM_MAX, ZOOM_MIN, PluginSettings, clamp_embed_size, clamp_floor_label_field,
     clamp_orientation, clamp_zoom,
 )
 
@@ -81,12 +81,12 @@ def test_clamp_floor_label_field_defaults_on_unrecognised():
     assert clamp_floor_label_field(None) == FLOOR_LABEL_FIELD_DEFAULT
 
 
-# ---- RoomEmbedSettings (DB-backed) ----
+# ---- PluginSettings (DB-backed) ----
 
 @pytest.mark.django_db
 def test_room_embed_settings_defaults_when_no_row():
     """No `kind='settings'` blob → every property falls back to its default."""
-    embed = RoomEmbedSettings()
+    embed = PluginSettings()
     assert embed.zoom == ZOOM_DEFAULT
     assert embed.size == SIZE_DEFAULT
     assert embed.orientation == ORIENTATION_DEFAULT
@@ -96,12 +96,12 @@ def test_room_embed_settings_defaults_when_no_row():
 def test_room_embed_settings_floor_label_field_none_when_unset():
     """Unlike the embed settings, `floor_label_field` returns None when unset — the signal that
     `views._floor_label_field` should fall through to the PLUGINS_CONFIG default."""
-    assert RoomEmbedSettings().floor_label_field is None
+    assert PluginSettings().floor_label_field is None
 
     from netbox_facilitymap.models import FacilityMapBlob
     # A settings row that exists but lacks the key still reads as unset (None), not a default.
     FacilityMapBlob.objects.create(kind='settings', key='', data={'room_embed_zoom': 3.0})
-    assert RoomEmbedSettings().floor_label_field is None
+    assert PluginSettings().floor_label_field is None
 
 
 @pytest.mark.django_db
@@ -111,11 +111,11 @@ def test_room_embed_settings_floor_label_field_reads_and_clamps():
     from netbox_facilitymap.models import FacilityMapBlob
 
     blob = FacilityMapBlob.objects.create(kind='settings', key='', data={'floor_label_field': 'slug'})
-    assert RoomEmbedSettings().floor_label_field == 'slug'
+    assert PluginSettings().floor_label_field == 'slug'
 
     blob.data = {'floor_label_field': 'bogus'}
     blob.save(update_fields=['data'])
-    assert RoomEmbedSettings().floor_label_field == FLOOR_LABEL_FIELD_DEFAULT
+    assert PluginSettings().floor_label_field == FLOOR_LABEL_FIELD_DEFAULT
 
 
 @pytest.mark.django_db
@@ -150,7 +150,7 @@ def test_room_embed_settings_reads_stored_values():
         'room_embed_size': 60,
         'room_embed_orientation': 'landscape',
     })
-    embed = RoomEmbedSettings()
+    embed = PluginSettings()
     assert embed.zoom == 3.5
     assert embed.size == 60.0
     assert embed.orientation == 'landscape'
@@ -165,23 +165,90 @@ def test_room_embed_settings_clamps_and_defaults_bogus_values():
         'room_embed_size': 'not-a-number',     # unparseable → default
         'room_embed_orientation': 'sideways',  # unrecognised → default
     })
-    embed = RoomEmbedSettings()
+    embed = PluginSettings()
     assert embed.zoom == ZOOM_MAX
     assert embed.size == SIZE_DEFAULT
     assert embed.orientation == ORIENTATION_DEFAULT
 
 
 @pytest.mark.django_db
-def test_room_embed_settings_reads_all_in_one_query(django_assert_num_queries):
-    """The core encapsulation win: one instance + reading every property (all three embed settings
-    plus floor_label_field) hits the shared settings row exactly once, not once per value."""
+def test_plugin_settings_reads_all_in_one_query(django_assert_num_queries):
+    """The core encapsulation win: one instance + reading **every** property — the room-embed trio,
+    floor_label_field, and each add-on switch — hits the shared settings row exactly once, not once
+    per value. This is what collapses `MapView`'s per-flag queries into one."""
     from netbox_facilitymap.models import FacilityMapBlob
 
     FacilityMapBlob.objects.create(kind='settings', key='', data={'room_embed_zoom': 2.5})
     with django_assert_num_queries(1):
-        embed = RoomEmbedSettings()
-        _ = (embed.zoom, embed.size, embed.orientation, embed.floor_label_field)
+        s = PluginSettings()
+        _ = (s.zoom, s.size, s.orientation, s.floor_label_field,
+             s.write_mode, s.inline_room_creation, s.ap_tool, s.todos, s.render_hq, s.ap)
 
+
+@pytest.mark.django_db
+def test_convenience_wrappers_reuse_a_passed_instance(django_assert_num_queries):
+    """Each wrapper takes an optional `PluginSettings`, so a caller already holding one (`MapView`,
+    `RenderRunner.run`) reads the row once for all of them instead of once per wrapper call."""
+    from netbox_facilitymap.models import FacilityMapBlob
+    from netbox_facilitymap.previews import (
+        ap_settings, ap_tool_enabled, inline_room_creation_enabled, render_hq_enabled,
+        todos_enabled, write_mode_enabled)
+
+    FacilityMapBlob.objects.create(kind='settings', key='', data={
+        'write_mode': True, 'ap_tool': True, 'todos': True, 'render_hq': True,
+        'inline_room_creation': False})
+    with django_assert_num_queries(1):
+        s = PluginSettings()
+        assert write_mode_enabled(s) is True
+        assert inline_room_creation_enabled(s) is False
+        assert ap_tool_enabled(s) is True
+        assert todos_enabled(s) is True
+        assert render_hq_enabled(s) is True
+        assert ap_settings(s)['enabled'] is True
+    # Called bare they still read for themselves — no caller has to pass one.
+    with django_assert_num_queries(1):
+        assert write_mode_enabled() is True
+
+
+@pytest.mark.django_db
+def test_get_returns_the_raw_value_for_the_facilities_owned_keys(django_assert_num_queries):
+    """`get` is how `facilities` reads its three settings off the same instance — unclamped, since
+    their vocabularies live in that module (importing them here would be a cycle). It must return
+    the stored value verbatim, junk included, so the caller's own clamp is the one that decides."""
+    from netbox_facilitymap.models import FacilityMapBlob
+
+    FacilityMapBlob.objects.create(kind='settings', key='', data={
+        'facility_grouping': 'nonsense', 'default_facility': 'west'})
+    with django_assert_num_queries(1):
+        s = PluginSettings()
+        assert s.get('facility_grouping') == 'nonsense'
+        assert s.get('default_facility') == 'west'
+        assert s.get('facility_org_modes') is None
+        assert s.get('facility_org_modes', {}) == {}
+
+
+
+@pytest.mark.django_db
+def test_plugin_settings_switch_defaults_off_except_inline_room_creation():
+    """Every add-on switch defaults **off** with no settings row — except `inline_room_creation`,
+    whose absent key deliberately reads **on** so an install predating the SET-5 split keeps the
+    create tile write mode used to imply. Pins the one asymmetry the consolidation could flatten."""
+    s = PluginSettings()
+    assert (s.write_mode, s.ap_tool, s.todos, s.render_hq) == (False, False, False, False)
+    assert s.inline_room_creation is True
+
+
+@pytest.mark.django_db
+def test_plugin_settings_reads_only_the_install_wide_row():
+    """Settings are install-wide (`facility=''`, MULTI-1). A row parked under another facility key
+    — e.g. one orphaned by a grouping change — must not be picked up as the settings document."""
+    from netbox_facilitymap.models import FacilityMapBlob
+
+    FacilityMapBlob.objects.create(kind='settings', facility='west', key='',
+                                   data={'todos': True, 'room_embed_zoom': 4.0})
+    s = PluginSettings()
+    assert s.todos is False
+    assert s.zoom == ZOOM_DEFAULT
 
 # ---- floor_sheets keys off the manifest floor-key string, never a live Location slug (HEALTH-4) --
 

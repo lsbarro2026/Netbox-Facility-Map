@@ -3,8 +3,8 @@
     python manage.py facilitymap_restore --src /path/to/facilitymap-backup-YYYYMMDD-HHMMSS.tar.gz
 
 Replaces ALL current `FacilityMapBlob` + `Room` rows and the working-dir files with the
-archive's contents (`backup.restore_backup`, wrapped in a transaction). Prompts for
-confirmation unless `--noinput` is given. Restore re-links rooms to Locations by portable
+archive's contents (`backup.restore_backup`: the rows in a transaction, then the working-dir
+swap once it commits). Prompts for confirmation unless `--noinput` is given. Restore re-links rooms to Locations by portable
 **slug**, so it targets the **same or a new** NetBox instance (a migration path, BAK-1). If a
 binding can't be re-resolved on the target it aborts **without changing anything** and reports
 what's missing; `--allow-unresolved` proceeds anyway, leaving those rooms unbound. To-do assignees

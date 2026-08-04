@@ -157,26 +157,6 @@
             </table>
           {% endif %}
 
-          {% if health.unbound_rooms %}
-            <h5 class="text-warning">Unbound rooms ({{ health.unbound_rooms|length }})</h5>
-            <p class="form-text mt-0">
-              Rooms with geometry but no Location binding. They were never bound, or their bound
-              Location was deleted. Re-bind them in the map editor.
-            </p>
-            <table class="table table-sm">
-              <thead><tr><th>Floor key</th><th>Room id</th><th>Label</th></tr></thead>
-              <tbody>
-                {% for row in health.unbound_rooms %}
-                  <tr>
-                    <td><code>{{ row.floor_key }}</code></td>
-                    <td><code>{{ row.room_id }}</code></td>
-                    <td>{{ row.label|default:"—" }}</td>
-                  </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          {% endif %}
-
           {% if health.stale_placements %}
             <h5 class="text-warning">Stale placements ({{ health.stale_placements|length }})</h5>
             <p class="form-text mt-0">
@@ -198,6 +178,32 @@
             </table>
           {% endif %}
 
+        {% endif %}
+
+        {# Draw-only rooms sit OUTSIDE the drift conditional above (DOC-12): they are a supported
+           state, not a fault, so they are listed alongside a green all-clear rather than instead
+           of it. Muted, not `text-warning`, for the same reason. #}
+        {% if health.unbound_rooms %}
+          <h5 class="text-muted mt-3">Draw-only rooms ({{ health.unbound_rooms|length }})</h5>
+          <p class="form-text mt-0">
+            Rooms drawn on a floor plan with no NetBox Location bound to them. This is a supported
+            way to use the map — a room only needs a Location if you want it to carry racks, access
+            points or to-dos, or to appear on a Location page. Bind one in the map editor if you
+            want those; otherwise nothing here needs fixing. A room whose bound Location was
+            deleted also lands in this list.
+          </p>
+          <table class="table table-sm">
+            <thead><tr><th>Floor key</th><th>Room id</th><th>Name</th></tr></thead>
+            <tbody>
+              {% for row in health.unbound_rooms %}
+                <tr>
+                  <td><code>{{ row.floor_key }}</code></td>
+                  <td><code>{{ row.room_id }}</code></td>
+                  <td>{{ row.label|default:"—" }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
         {% endif %}
       </div>
     </div>

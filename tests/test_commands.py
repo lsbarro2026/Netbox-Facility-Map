@@ -1,9 +1,9 @@
 """Tier C — the management-command CLI entry points, driven via `call_command`.
 
-The commands are thin wrappers whose real work lives in shared modules (`backup.py`,
+The commands are thin wrappers whose real work lives in shared modules (`backup.py`, `wipe.py`,
 `frontend_api`), tested there directly. This file covers the CLI plumbing those tests don't: arg
 parsing, the confirmation prompt, `CommandError` on bad input, and the success messages. The
-fourth command, `facilitymap_check`, is already driven directly in `test_health.py`
+remaining command, `facilitymap_check`, is already driven directly in `test_health.py`
 (`test_command_exit_{zero_when_clean,one_on_drift}`), so it isn't repeated here."""
 
 import json
@@ -110,3 +110,67 @@ def test_restore_aborts_when_the_prompt_is_declined(workdir, backupdir, monkeypa
         call_command('facilitymap_restore', '--src', str(archive), stdout=StringIO())
 
     assert FacilityMapBlob.objects.filter(kind='siteplan').exists()   # nothing was wiped
+
+
+# ---- facilitymap_wipe ----
+
+def test_wipe_all_reports_what_it_deleted(workdir):
+    from netbox_facilitymap.models import FacilityMapBlob
+    FacilityMapBlob.objects.create(kind='siteplan', data={'hotspots': []})
+    (workdir / 'images').mkdir(parents=True)
+
+    out = StringIO()
+    call_command('facilitymap_wipe', '--all', '--noinput', stdout=out)
+
+    assert not FacilityMapBlob.objects.exists()
+    assert 'wiped 1 blob(s)' in out.getvalue()
+    assert 'working dir cleared' in out.getvalue()
+
+
+def test_wipe_requires_a_scope_flag(workdir):
+    """Neither `--all` nor `--facility` means the operator hasn't said what to destroy — argparse's
+    required mutually-exclusive group refuses rather than picking a default."""
+    from netbox_facilitymap.models import FacilityMapBlob
+    FacilityMapBlob.objects.create(kind='siteplan', data={'k': 'v'})
+
+    with pytest.raises(CommandError):
+        call_command('facilitymap_wipe', '--noinput', stdout=StringIO())
+
+    assert FacilityMapBlob.objects.exists()
+
+
+def test_wipe_scoped_to_the_default_facility_is_distinct_from_all(workdir):
+    """`--facility ""` is a real scope (the default facility), not an absent flag — so it must
+    leave the install-wide settings row that `--all` removes."""
+    from netbox_facilitymap.models import FacilityMapBlob
+    FacilityMapBlob.objects.create(kind='settings', facility='', key='', data={'todos': True})
+    FacilityMapBlob.objects.create(kind='siteplan', facility='', key='', data={'hotspots': []})
+
+    call_command('facilitymap_wipe', '--facility', '', '--noinput', stdout=StringIO())
+
+    assert FacilityMapBlob.objects.filter(kind='settings').exists()
+    assert not FacilityMapBlob.objects.filter(kind='siteplan').exists()
+
+
+def test_wipe_aborts_when_the_prompt_is_declined(workdir, monkeypatch):
+    from netbox_facilitymap.models import FacilityMapBlob
+    FacilityMapBlob.objects.create(kind='siteplan', data={'k': 'v'})
+
+    monkeypatch.setattr('builtins.input', lambda *a: 'no')
+    with pytest.raises(CommandError, match='aborted'):
+        call_command('facilitymap_wipe', '--all', stdout=StringIO())
+
+    assert FacilityMapBlob.objects.filter(kind='siteplan').exists()
+
+
+def test_wipe_can_take_a_backup_first(workdir, backupdir):
+    """`--backup` is the mitigation for an irreversible op: the archive is written *before* the
+    delete, and survives it (backups live outside the working dir)."""
+    from netbox_facilitymap.models import FacilityMapBlob
+    FacilityMapBlob.objects.create(kind='siteplan', data={'hotspots': []})
+
+    call_command('facilitymap_wipe', '--all', '--backup', '--noinput', stdout=StringIO())
+
+    (archive,) = backupdir.glob('facilitymap-backup-*.tar.gz')
+    assert archive.is_file()
+    assert not FacilityMapBlob.objects.exists()

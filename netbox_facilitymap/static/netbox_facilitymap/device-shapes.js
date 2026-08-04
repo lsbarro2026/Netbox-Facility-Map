@@ -17,25 +17,38 @@
 
 class DeviceShapes {
   /** Resolve a placement to a glyph type. Racks are always 'rack'; a device is keyed
-   *  off its NetBox role (slug/name), then its own name, by case-insensitive keyword —
-   *  so it still works when roles are unset (name fallback) and survives unknown role
-   *  slugs. Returns one of the keys in `box()`/`glyph()`. */
+   *  off its NetBox role (slug/name), then its own name, then the marker label, by
+   *  case-insensitive keyword over a *normalized* haystack (`_normalize` folds camelCase and
+   *  separators to spaces) — so 'AccessPoint', 'access-point', 'ACCESS POINT' and 'ap' all
+   *  resolve alike. Still works when the role is unset (name/label fallback) and survives
+   *  unknown role slugs. Returns one of the keys in `box()`/`glyph()`.
+   *
+   *  The operator's `role_glyphs` keywords (window.MAP.roleGlyphs, validated server-side by
+   *  `device_shapes.custom_rules`) are tried BEFORE the built-in English rules, so a facility that
+   *  names its roles in another language keeps working without losing the defaults — merge, not
+   *  replace (INTL-1). An install that sets nothing behaves exactly as before. */
   static typeFor(p, item) {
     if (p.kind === 'rack') return 'rack';
-    const role = (item && item.role) || {};
-    const hay = [role.slug, role.name, item && item.name, p.label]
-      .filter(Boolean).join(' ').toLowerCase();
+    const hay = DeviceShapes._normalize(p, item);
+    for (const [type, keywords] of DeviceShapes._customRules())
+      if (keywords.some(k => DeviceShapes._matches(hay, k))) return type;
     const rules = [
-      [/fire ?wall|\bfw\b/,            'firewall'],
-      [/patch|panel/,                  'patchpanel'],
-      [/switch|leaf|spine|\btor\b/,    'switch'],
-      [/rout|gateway|\bgw\b/,          'router'],
+      [/fire ?wall|\bfw\b/,                       'firewall'],
+      [/patch|panel/,                             'patchpanel'],
+      // Access/edge switch before the generic switch rule so "access switch" wins over the
+      // broad `switch` catch-all; can't collide with the `ap` rule (which requires "point").
+      [/access ?switch|\basw\b/,                  'accessswitch'],
+      [/switch|leaf|spine|\btor\b/,               'switch'],
+      [/rout|gateway|\bgw\b/,                     'router'],
       // No existing keyword is a standalone "ap" token, so this can't shadow or be
       // shadowed by another rule; placed ahead of the broad server/storage catch-alls
       // (host, node, disk, array, filer) so e.g. "Wireless Host Controller" resolves here.
       [/wifi|wireless|access ?point|\bap\b|\bwap\b/, 'ap'],
-      [/ups|battery/,                  'ups'],
-      [/pdu|outlet|power|\brpp\b|busway/, 'pdu'],
+      [/ups|battery/,                             'ups'],
+      // Wall outlet/receptacle before pdu, and pdu no longer claims a bare "outlet": a single
+      // wall socket reads as `outlet`, a power strip / distribution unit as `pdu`.
+      [/wall ?outlet|\boutlet\b|socket|receptacle/, 'outlet'],
+      [/pdu|power|\brpp\b|busway/,                'pdu'],
       [/storage|disk|\bnas\b|\bsan\b|array|filer/, 'storage'],
       [/server|host|compute|blade|node|hypervisor|esxi/, 'server'],
     ];
@@ -43,26 +56,93 @@ class DeviceShapes {
     return 'generic';
   }
 
-  /** Default footprint (display px) per type, picked so the shapes read at different
-   *  sizes at a glance: a rack is a tall cabinet, a PDU/switch a thin strip, a UPS a
-   *  chunky box. A rack is the largest object (a full cabinet); every unracked device
-   *  is sized to read as *smaller than a rack* — none is wider than the rack's 30px, so
-   *  a lone outlet/switch never out-sizes a cabinet. Used when a placement has no
-   *  user-set w/h. */
+  /** The operator's validated `role_glyphs` vocabulary as ordered [type, [keyword, …]] pairs.
+   *  Validation/normalization happens ONCE, server-side (`device_shapes.custom_rules`), and rides
+   *  `window.MAP.roleGlyphs` — so the lockstep pair can't disagree about what the setting means.
+   *  Empty on a non-plugin page or an install that configures nothing, which is the built-in
+   *  English behaviour. Mirrors the Python `custom_rules`. */
+  static _customRules() {
+    return (window.MAP && window.MAP.roleGlyphs) || [];
+  }
+
+  /** Whether an already-normalized `keyword` appears in the normalized `hay` as a whole word (or
+   *  whole phrase). Both are runs of unicode letters/digits joined by single spaces, so padding
+   *  each with a space makes plain containment an exact word-boundary test — no RegExp, and so no
+   *  JS/Python dialect divergence in the lockstep pair. Mirrors the Python `_matches`. */
+  static _matches(hay, keyword) {
+    return ` ${hay} `.includes(` ${keyword} `);
+  }
+
+  /** Normalize the role/name/label haystack for keyword matching: join the parts, split
+   *  camelCase (`AccessPoint` → `Access Point`), lowercase, then fold every non-alphanumeric
+   *  run (hyphen, underscore, dot, slash, extra spaces) to a single space. So 'AccessPoint',
+   *  'access-point' and 'ACCESS_POINT' all collapse to 'access point' and match one rule —
+   *  the tolerance real-world NetBox role names need.
+   *
+   *  The fold keeps UNICODE letters/digits (`\p{L}\p{N}`). It used to be `[^a-z0-9]+`, which
+   *  deleted every non-ASCII character outright — a Japanese/Greek/Cyrillic role name normalized
+   *  to the empty string and could never match any rule, custom or built-in (INTL-1). The camelCase
+   *  split stays deliberately ASCII (a Latin-script convention), as does the Python mirror. */
+  static _normalize(p, item) {
+    const role = (item && item.role) || {};
+    return [role.slug, role.name, item && item.name, p && p.label]
+      .filter(Boolean).join(' ')
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .trim();
+  }
+
+  /** Default footprint (display px) per type, sized as one cohesive set so every object reads
+   *  at a sensible relative scale. The **rack is the reference and the largest** (a full
+   *  cabinet, 30px wide); every unracked device is narrower than it, so a lone device never
+   *  out-sizes a cabinet. Two families: icon-bearing *appliances* (server/router/firewall/
+   *  storage/ups) are compact square-ish chips holding a Lucide glyph; rack-mount *strips*
+   *  (switch/accessswitch/patchpanel/pdu) are wide and thin; the wall `outlet` is the smallest,
+   *  a thin slice; `ap` a small puck; a UPS a chunky box that reads bigger than a thin PDU.
+   *  Used when a placement has no user-set w/h. */
   static box(type) {
     return ({
-      rack:       { w: 30, h: 40 },
-      switch:     { w: 30, h: 11 },
-      router:     { w: 22, h: 16 },
-      server:     { w: 28, h: 14 },
-      firewall:   { w: 22, h: 17 },
-      ap:         { w: 16, h: 16 },
-      ups:        { w: 18, h: 26 },
-      pdu:        { w: 26, h: 9 },
-      storage:    { w: 24, h: 18 },
-      patchpanel: { w: 30, h: 13 },
-      generic:    { w: 22, h: 15 },
+      rack:         { w: 30, h: 40 },
+      server:       { w: 22, h: 18 },
+      router:       { w: 20, h: 18 },
+      firewall:     { w: 20, h: 18 },
+      storage:      { w: 22, h: 18 },
+      ups:          { w: 16, h: 20 },
+      switch:       { w: 26, h: 10 },
+      accessswitch: { w: 24, h: 10 },
+      patchpanel:   { w: 26, h: 12 },
+      pdu:          { w: 24, h: 8 },
+      outlet:       { w: 12, h: 7 },
+      ap:           { w: 16, h: 16 },
+      generic:      { w: 22, h: 15 },
     })[type] || { w: 22, h: 15 };
+  }
+
+  /** The vendored Lucide icon for a device type that maps cleanly to one — an array of path
+   *  `d` strings on Lucide's native 24×24 viewBox (server, router, firewall = brick-wall-shield,
+   *  storage = hard-drive, ups = battery-charging). `undefined` for types drawn as bespoke
+   *  schematics (rack/switch/accessswitch/ap/pdu/outlet/patchpanel/generic), where a
+   *  purpose-built glyph reads better than any Lucide icon. Lockstep with the Python mirror and
+   *  the vendored SVGs under `icons/` (see this file's header). */
+  static _lucide(type) {
+    return ({
+      server:   ['M4 2h16a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z',
+                 'M4 14h16a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2z',
+                 'M6 6h.01', 'M6 18h.01'],
+      router:   ['M4 14h16a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2z',
+                 'M6.01 18H6', 'M10.01 18H10', 'M15 10v4',
+                 'M17.84 7.17a4 4 0 0 0-5.66 0', 'M20.66 4.34a8 8 0 0 0-11.31 0'],
+      firewall: ['M12 9v1.258', 'M16 3v5.46',
+                 'M21 9.118V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h5.75',
+                 'M22 17.5c0 2.499-1.75 3.749-3.83 4.474a.5.5 0 0 1-.335-.005c-2.085-.72-3.835-1.97-3.835-4.47V14a.5.5 0 0 1 .5-.499c1 0 2.25-.6 3.12-1.36a.6.6 0 0 1 .76-.001c.875.765 2.12 1.36 3.12 1.36a.5.5 0 0 1 .5.5z',
+                 'M3 15h7', 'M3 9h12.142', 'M8 15v6', 'M8 3v6'],
+      storage:  ['M10 16h.01',
+                 'M2.212 11.577a2 2 0 0 0-.212.896V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.527a2 2 0 0 0-.212-.896L18.55 5.11A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z',
+                 'M21.946 12.013H2.054', 'M6 16h.01'],
+      ups:      ['m11 7-3 5h4l-3 5', 'M14.856 6H16a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.935',
+                 'M22 14v-4', 'M5.14 18H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2.936'],
+    })[type];
   }
 
   /** Build the glyph for a type as an array of SVG children, centered at origin and
@@ -70,43 +150,38 @@ class DeviceShapes {
   static glyph(type, wpx, hpx) {
     const hw = wpx / 2, hh = hpx / 2;
     const R = (x, y, w, h, c = 'dev-body') => Dom.svg('rect', { x, y, width: w, height: h, rx: 2, class: c });
-    const L = (x1, y1, x2, y2, c = 'dev-line') => Dom.svg('line', { x1, y1, x2, y2, class: c });
     const C = (cx, cy, r, c = 'dev-line') => Dom.svg('circle', { cx, cy, r, class: c });
-    const P = (d, c = 'dev-line') => Dom.svg('path', { d, fill: 'none', class: c });
+    const P = (d, c = 'dev-line', t) => Dom.svg('path', t ? { d, fill: 'none', class: c, transform: t } : { d, fill: 'none', class: c });
     const body = () => R(-hw, -hh, wpx, hpx);
     const els = [];
+
+    // Appliance roles with a clean Lucide match: the body chip + that icon, uniformly scaled
+    // to fit the smaller box dimension and centred (Lucide's 24×24 viewBox centre is 12,12).
+    const icon = DeviceShapes._lucide(type);
+    if (icon) {
+      els.push(body());
+      const s = Math.min(wpx, hpx) * 0.82 / 24, off = (-12 * s).toFixed(3);
+      const tf = `translate(${off},${off}) scale(${s.toFixed(4)})`;
+      for (const d of icon) els.push(P(d, 'dev-line', tf));
+      return els;
+    }
 
     switch (type) {
       case 'rack': {                       // plain cabinet box — its name rides inside it
         els.push(body());
         break;
       }
-      case 'switch': {                     // one dense row of ports
+      case 'switch': {                     // core/aggregation switch: one dense row of ports
         els.push(body());
         const n = Math.max(3, Math.floor((wpx - 6) / 7)), gap = (wpx - 6) / n, pw = Math.min(5, gap - 2);
         for (let i = 0; i < n; i++) els.push(R(-hw + 4 + i * gap, -3, pw, 6, 'dev-port'));
         break;
       }
-      case 'router': {                     // routing crosshair in a ring
+      case 'accessswitch': {               // access/edge switch: dense access-port row + uplink
         els.push(body());
-        const r = Math.min(hw, hh) * 0.5;
-        els.push(C(0, 0, r), L(-r, 0, r, 0), L(0, -r, 0, r));
-        break;
-      }
-      case 'server': {                     // horizontal bays + status LEDs
-        els.push(body());
-        for (let k = 1; k <= 2; k++) { const y = -hh + k * hpx / 3; els.push(L(-hw + 3, y, hw - 3, y)); }
-        els.push(C(-hw + 5, -hh + 4, 1.4, 'dev-led'), C(-hw + 9, -hh + 4, 1.4, 'dev-led'));
-        break;
-      }
-      case 'firewall': {                   // staggered brick courses
-        els.push(body());
-        const rh = hpx / 3;
-        for (let r = 1; r <= 2; r++) { const y = -hh + r * rh; els.push(L(-hw, y, hw, y)); }
-        for (let r = 0; r < 3; r++) {
-          const y0 = -hh + r * rh, off = (r % 2) ? wpx / 4 : wpx / 2;
-          for (let x = -hw + off; x < hw - 0.5; x += wpx / 2) els.push(L(x, y0, x, y0 + rh));
-        }
+        const n = Math.max(4, Math.floor((wpx - 6) / 5)), gap = (wpx - 6) / n, pw = Math.min(3.5, gap - 1.5);
+        for (let i = 0; i < n; i++) els.push(R(-hw + 4 + i * gap, hh - 4.5, pw, 3, 'dev-port'));
+        els.push(R(hw - 6, -hh + 2, 4, 2.5, 'dev-port'));   // separated uplink SFP, top-right
         break;
       }
       case 'ap': {                         // ceiling-mount puck + concentric broadcast rings;
@@ -117,23 +192,15 @@ class DeviceShapes {
         for (const f of [0.55, 0.8, 1.0]) els.push(C(0, 0, r * f));
         break;
       }
-      case 'ups': {                        // battery body + terminal + bolt
-        els.push(body(), R(-4, -hh - 3, 8, 3));
-        els.push(P(`M 2 ${(-hh * 0.4).toFixed(1)} L -2 0 L 1 0 L -2 ${(hh * 0.4).toFixed(1)}`));
-        break;
-      }
-      case 'pdu': {                        // power strip: row of outlets
+      case 'pdu': {                        // power strip: row of round outlets
         els.push(body());
         const n = Math.max(3, Math.floor((wpx - 6) / 9)), gap = (wpx - 6) / n, r = Math.min(gap * 0.3, hh * 0.5);
         for (let i = 0; i < n; i++) els.push(C(-hw + 4 + gap * (i + 0.5), 0, r, 'dev-port'));
         break;
       }
-      case 'storage': {                    // stacked disk bays, each with an LED
-        const bh = hpx / 3;
-        for (let i = 0; i < 3; i++) {
-          els.push(R(-hw, -hh + i * bh + 0.5, wpx, bh - 1));
-          els.push(C(-hw + 5, -hh + i * bh + bh / 2, 1.6, 'dev-led'));
-        }
+      case 'outlet': {                     // top-down wall receptacle: a thin faceplate + two slots
+        els.push(body());
+        for (const x of [-2.2, 2.2]) els.push(R(x - 0.6, -1.6, 1.2, 3.2, 'dev-port'));
         break;
       }
       case 'patchpanel': {                 // two dense rows of ports

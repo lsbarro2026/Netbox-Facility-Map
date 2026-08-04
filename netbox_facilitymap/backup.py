@@ -226,7 +226,12 @@ def _check_safe_members(members):
 def _restore_workdir(tar, members):
     """Replace the working dir with the archive's `workdir/` tree. Extracts to a temp dir on the
     same filesystem (so the swap is an atomic rename), then swaps it in and removes the old tree.
-    No-op when the archive carried no working dir. Returns True if a working dir was restored."""
+    No-op when the archive carried no working dir. Returns True if a working dir was restored.
+
+    The old tree is **renamed aside** to `<workdir>.restore-old` and only removed once the new one
+    is live, so a crash mid-swap leaves the previous content recoverable there rather than deleted;
+    the next restore that finds a live working dir clears a stale `.restore-old` before reusing the
+    name. Keep that order — it is what makes a failed swap recoverable (see `restore_backup`)."""
     wmembers = [m for m in members
                 if m.name == WORKDIR_PREFIX or m.name.startswith(WORKDIR_PREFIX + '/')]
     if not wmembers:
@@ -296,7 +301,7 @@ def _resolve_room_bindings(deserialized, room_locations):
     non-null FK) but can't be recreated here — a room unbound in the backup stays unbound, never a
     failure."""
     # Lazy import: keep this engine's module load free of the view layer (frontend_api).
-    from .frontend_api import _resolve_floor_location
+    from .frontend_api import resolve_floor_location
 
     loc_key = {(e.get('floor_key'), e.get('room_id')): e for e in room_locations}
     rebind, unresolved = {}, []
@@ -305,7 +310,7 @@ def _resolve_room_bindings(deserialized, room_locations):
         if not isinstance(room, Room):
             continue
         # Floor binding: re-derive the sticky FK from the portable floor_key (matches sync_rooms).
-        floor_loc = _resolve_floor_location(room.floor_key)
+        floor_loc = resolve_floor_location(room.floor_key)
         floor_loc_id = floor_loc.pk if floor_loc is not None else None
         if room.floor_location_id is not None and floor_loc_id is None:
             unresolved.append(f"room '{room.floor_key}/{room.room_id}': floor "
@@ -371,7 +376,7 @@ def restore_backup(src, *, allow_unresolved=False):
     `Room.floor_location` as raw DB pks, meaningless on a *different* NetBox instance. A new-format
     archive carries `bindings.json` (portable room→Location slug keys), and restore **re-resolves**
     every binding against this instance's live `dcim.Location` rows: the floor from the portable
-    `floor_key` (via `frontend_api._resolve_floor_location`, the same sticky FK `sync_rooms` sets),
+    `floor_key` (via `frontend_api.resolve_floor_location`, the same sticky FK `sync_rooms` sets),
     the room from its ancestor-slug path (`_resolve_location_path`). This makes restore a real
     migration path *and* keeps same-instance restore working (slugs are stable within an instance).
     Resolution runs **before** any delete: if a binding that existed in the backup can't be recreated
@@ -394,7 +399,20 @@ def restore_backup(src, *, allow_unresolved=False):
     **Legacy archives (no `bindings.json`).** Pre-BAK-1 archives carry no portable keys, so they
     restore via the original pk-replay path — **same instance only**, exactly as before.
 
-    DB rows restore inside `transaction.atomic()` (PKs preserved); the working dir swaps afterwards.
+    **Ordering: DB first, then disk.** The rows restore inside `transaction.atomic()` (PKs
+    preserved) and the working dir swaps **after that transaction commits** — the same DB-then-disk
+    order `wipe.wipe_data` and the `facilities`/`signals` remaps follow, so the authoritative DB is
+    never rolled back out from under an irreversible filesystem change. Concretely: a DB failure
+    rolls back and leaves the working dir untouched (**nothing** changed), while a failure in the
+    swap after the commit leaves the instance **half-restored** — the archive's rows, the previous
+    files. That state is recoverable by simply **re-running the same restore**: the archive is the
+    sole source of both halves, the rows are deleted and re-created from it again, and the swap is
+    retried, so the operation is idempotent. A swap that dies mid-way doesn't destroy the previous
+    tree either — `_restore_workdir` renames it to `<workdir>.restore-old` and removes it only once
+    the new tree is live. Because the ordering rests on this function's own `atomic()` being the
+    outermost one, **don't call `restore_backup` inside an enclosing transaction** — that would put
+    the swap back before the commit, which is exactly the hazard this order avoids.
+
     A backup taken **before** the CONC-1 per-floor shard (whole-document `key=''` rows) restored into
     a post-shard install reinstates those rows, which the per-floor readers ignore; restore into a
     matching version, or re-import. Returns
@@ -459,7 +477,11 @@ def restore_backup(src, *, allow_unresolved=False):
                     rooms += 1
                 elif isinstance(obj, FacilityMapBlob):
                     blobs += 1
-            restored_wd = _restore_workdir(tar, members)
+
+        # Outside the transaction, deliberately: the swap deletes the previous working dir, so
+        # running it before the commit would let a rollback restore the rows while the files stay
+        # irreversibly the archive's. Still inside the `tarfile` context — the swap reads from `tar`.
+        restored_wd = _restore_workdir(tar, members)
 
     return {'blobs': blobs, 'rooms': rooms, 'todos': todos, 'workdir': restored_wd,
             'unresolved': unresolved, 'dropped_assignees': dropped_assignees}

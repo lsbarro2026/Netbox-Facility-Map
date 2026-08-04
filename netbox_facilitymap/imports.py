@@ -1,424 +1,62 @@
-"""In-app PDF import: upload → scan → build, plus authenticated serving of the result.
+"""In-app PDF import: the workflow endpoints that drive upload → scan → build, plus the admin
+backup surface and the wizard's supporting endpoints (draft, regroup, preview).
 
-These endpoints replace the standalone tool's `/api/import/*` routes and its static
-serving of `images/` + `manifest.json`. The security posture (the whole reason import was
-kept out of NetBox originally) is enforced here:
+This module is one of four the import surface is split across; the security posture (the whole
+reason import was kept out of NetBox originally) is enforced across all of them:
 
-  * **Isolation** — PDFs are never parsed in this process. `RenderRunner` shells out to
-    `preprocess.py` *by file path* (so the package's NetBox-importing `__init__` is not
-    loaded into the child), with a timeout and POSIX resource limits. A PDFium exploit is
-    contained in a short-lived, capped subprocess.
+  * **Isolation** — PDFs are never parsed in this process. `render_runner.RenderRunner` shells out
+    to `preprocess.py` *by file path* (so the package's NetBox-importing `__init__` is not loaded
+    into the child), with a timeout and POSIX resource limits. A PDFium exploit is contained in a
+    short-lived, capped subprocess.
   * **Authorization** — every import endpoint requires the custom `import_facilitymapblob`
-    permission (`PermissionRequiredMixin`), not merely a login, unlike the legacy
-    localhost-trust model. This is split off `change_facilitymapblob` (which still gates the
-    everyday `frontend_api` map writes) so a rack-placer can edit placements without being able
-    to rebuild/wipe the facility (PERM-1). `reset` tightens it one step further — it also
-    requires a superuser. The admin backup surface rides the same tiers: **archive export**
-    (`create_backup`) is on the import gate (it writes a persisted archive, an operator action);
-    **archive restore** (`restore_backup`) is on the reset tier — import + superuser — because a
-    whole-archive restore wipes ALL rows *and* the working dir. Manifest/media reads share the
-    map's read gate (login-only by default; `view_facilitymapblob` when `require_view_permission`
-    is on — see access.py).
-  * **Input validation** — uploads must carry an accepted drawing magic (PDF or a raster
-    image — see `DRAWING_EXTS`/`_sniff`) within a size cap and a traversal-guarded path; an
-    import is rejected past a drawing-count cap. The bytes are only *sniffed* here; the actual
-    decode still happens exclusively in the render subprocess.
-  * **Serving** — rendered floor plans are streamed from `MEDIA_ROOT` through a login-gated
-    view, never exposed at a guessable public static URL. Browser caching is allowed but
-    always `private` (immutable when the URL carries the manifest's `?v=<built>` token,
-    revalidated otherwise) so shared caches never store the authenticated images.
-  * **Concurrency** — a working-dir lockfile serializes renders across worker processes
-    (a thread lock could not), with stale-lock recovery.
+    permission (`import_base.ImportView`), not merely a login, unlike the legacy localhost-trust
+    model. This is split off `change_facilitymapblob` (which still gates the everyday
+    `frontend_api` map writes) so a rack-placer can edit placements without being able to
+    rebuild/wipe the facility (PERM-1). `reset` tightens it one step further — it also requires a
+    superuser, as does the full data `wipe` (`WipeView`, DB rows *and* files — the complete version
+    of `reset`). The admin backup surface rides the same tiers: **archive export** (`create_backup`)
+    is on the import gate (it writes a persisted archive, an operator action); **archive restore**
+    (`restore_backup`) is on the reset tier — import + superuser — because a whole-archive restore
+    wipes ALL rows *and* the working dir. Manifest/media reads share the map's read gate
+    (login-only by default; `view_facilitymapblob` when `require_view_permission` is on — see
+    access.py).
+  * **Input validation** — uploads must carry an accepted drawing magic (PDF or a raster image)
+    within a size cap and a traversal-guarded path (`uploads.py`); an import is rejected past a
+    drawing-count cap (`_count_rendered_drawings`, below). The bytes are only *sniffed* there; the
+    actual decode still happens exclusively in the render subprocess.
+  * **Serving** — rendered floor plans stream through login-gated views (`serving.py`), never at a
+    guessable public static URL.
+  * **Concurrency** — a working-dir lockfile serializes renders across worker processes (a thread
+    lock could not), with stale-lock recovery. See `render_runner.RenderRunner.hold_lock`.
+
+**Where the rest lives.** This file used to carry all of it (~1100 lines); it is now the workflow
+half only, and the pieces that stand on their own moved out:
+
+  * `import_base.py` — `cfg`/`request_facility`/`busy_response`/`ImportView`, the shared
+    foundation every part of the import surface needs (kept separate to keep the graph acyclic).
+  * `render_runner.py` — `RenderRunner`: the isolated render subprocess and the working-dir lock.
+  * `uploads.py` — `UploadView`/`UploadZipView` plus the acceptance gate and zip member mapping.
+  * `serving.py` — `ManifestView`/`MediaView`: the read-gated manifest/media serving.
 """
 
-import hashlib
 import json
-import mimetypes
 import os
+import secrets
 import shutil
-import subprocess
-import sys
 import tarfile
 import tempfile
-import time
-import zipfile
 from pathlib import Path
-from urllib.parse import quote
 
-from django.contrib.auth.mixins import PermissionRequiredMixin
-from django.http import (FileResponse, Http404, HttpResponse, HttpResponseBadRequest,
-                         JsonResponse)
-from django.utils.cache import get_conditional_response
-from django.utils.http import http_date
-from django.views import View
+from django.http import FileResponse, Http404, HttpResponseBadRequest, JsonResponse
 
-from netbox.plugins import get_plugin_config
-
-from .access import IMPORT_PERM, MapReadAccessMixin, reads_scoped_to_sites
 from .backup import RestoreUnresolvedError, create_backup, restore_backup
-from .drawing_formats import (COMPANION_EXTS, DRAWING_EXTS, install_hint_for,
-                              sniff as _sniff, sniff_companion as _sniff_companion)
-from .facilities import facility_site_slugs
-from .previews import render_hq_enabled
-from .storage import (EMPTY_MANIFEST, MANIFEST_NAME, SERVE_ROOTS, SITEPLAN_DIRNAME, safe_path,
-                      valid_facility, work_dir)
-
-# Importing/rebuilding a facility rewrites the whole map (and `reset` wipes it), so gate it on the
-# custom `import_facilitymapblob` permission (`IMPORT_PERM`, shared from access.py) — admin-grantable
-# and split off the everyday `change_facilitymapblob` map-write gate (PERM-1). `ResetView` adds a
-# superuser requirement on top. Manifest/media serving is a *read*, so it rides `MapReadAccessMixin`.
-
-# Accepted drawing inputs (`DRAWING_EXTS`) and their header magic (`_sniff`) come from the
-# `drawing_formats` registry — the one Python source of truth, so adding a format is a single
-# handler entry there. The base install carries PDFs plus common raster plan formats (public
-# measured-drawing collections — e.g. the Library of Congress HABS/HAER/HALS scans — ship as
-# TIFF/JPEG/GIF, never PDF); advanced formats (SVG/DXF/Visio/GIS) are gated behind their pip extra
-# or external binary, so `DRAWING_EXTS` here is the *installed* set (PKG-1). An upload of a
-# recognized-but-uninstalled format is rejected with `install_hint_for`, naming the extra to add.
-# The registry is pure stdlib (its decoders load lazily, only in the render subprocess), so
-# importing it here does not pull pypdfium2/Pillow into the worker. Untrusted bytes are still only
-# *decoded* in that subprocess — here we cheaply sniff the header and enforce the size/traversal caps.
-#
-# The upload layer also accepts a drawing's COMPANION siblings (a Shapefile's `.shx/.dbf/.prj/.cpg`)
-# so a multi-file set stays together in one folder; those are NOT drawings (kept out of
-# DRAWING_EXTS), so the scan/build/mapping layers still see one logical `.shp` drawing.
-UPLOAD_EXTS = DRAWING_EXTS + COMPANION_EXTS
-
-
-def _upload_ok(rel, head):
-    """Cheap upload-acceptance gate for a path + its leading bytes: a companion sibling is sniffed
-    by its (weaker) companion signature, any other accepted file by its drawing magic. False for an
-    unaccepted extension or a failed sniff. The real decode is still the render subprocess."""
-    ext = os.path.splitext(rel)[1].lower()
-    if ext in COMPANION_EXTS:
-        return _sniff_companion(head, ext)
-    return _sniff(head) is not None
-
-
-def _cfg(key):
-    return get_plugin_config('netbox_facilitymap', key)
-
-
-def _facility(request):
-    """The validated `?facility=` slug for a request (default '' = the default facility), raising
-    `ValueError` on a bad slug so the caller can 400. A facility namespaces the whole import — its
-    working dir, uploads, images, and manifest (MULTI-2)."""
-    return valid_facility(request.GET.get('facility') or '')
-
-
-# --- per-Site read scoping (SEC-1) -------------------------------------------------
-
-def _viewable_site_slugs(request, facility):
-    """The Site slugs within `facility` the request's user may view — the per-Site read-scope set.
-    `None` when `scope_reads_to_sites` is off (the caller then filters nothing, so the default read
-    path is untouched). Otherwise a set (possibly empty → the user may see no building here),
-    resolved through `dcim.Site.objects.restrict(user, 'view')` so it honours object permissions."""
-    if not reads_scoped_to_sites():
-        return None
-    return facility_site_slugs(facility, user=request.user)
-
-
-def _scope_manifest(manifest, viewable):
-    """A copy of `manifest` with its `buildings` filtered to those whose `siteSlug` is in `viewable`
-    (a floor plan lives at `images/<siteSlug>/…`, so the slug is the Site key). Fail-closed: a
-    building whose Site is not viewable — including one whose siteSlug matches no Site at all — is
-    dropped. The campus `siteplan` is a facility-wide asset, kept while the user may view any Site
-    and dropped when they may view none. `viewable` is never `None` here (the caller guards on the
-    scoping flag). The input dict is shared/read-only (`read_manifest`'s memo), so this copies."""
-    scoped = dict(manifest)
-    scoped['buildings'] = [b for b in manifest.get('buildings', [])
-                           if b.get('siteSlug') in viewable]
-    if not viewable:
-        scoped['siteplan'] = None
-    return scoped
-
-
-def _scope_etag(etag, viewable):
-    """Fold a stable digest of the sorted viewable slugs into `etag`, so a permission change (a
-    different viewable set for the same unchanged manifest file) busts that user's conditional
-    cache. `etag` is the quoted `"mtime-size"` string from `_file_validators`; the digest is spliced
-    inside the closing quote. Media stays `private`, so this only guards a user's *own* revalidation
-    across a permission change — cross-user leakage is already impossible."""
-    digest = hashlib.sha1('\n'.join(sorted(viewable)).encode()).hexdigest()[:12]
-    return '%s-%s"' % (etag[:-1], digest)
-
-
-# --- render subprocess (isolated + resource-limited) -------------------------------
-
-class RenderRunner:
-    """Owns the security-critical render isolation: spawn `preprocess.py` **by file path**
-    (never `-m`, so the package's Django/NetBox-importing `__init__` never loads into the child),
-    under a working-dir lockfile that serializes renders across worker processes, with a timeout
-    plus POSIX CPU/address-space rlimits. Every import endpoint drives the render subprocess
-    through this class. It holds only the (immutable) target facility — the working dir is read
-    fresh from `work_dir(self.facility)` on each call — so instantiate one per request. The
-    lockfile lives in the per-facility working dir, so imports into different facilities never
-    block each other."""
-
-    # On-demand high-res preview renders are cached under uploads/.thumbs (mirrors preprocess.py's
-    # THUMBS_DIRNAME), so `scan` skips it and `reset` wipes it for free.
-    THUMBS_DIRNAME = '.thumbs'
-    LOCK_NAME = '.import.lock'
-    SCRIPT = 'preprocess.py'
-
-    # Render-quality multiplier handed to `preprocess.py --scale` when the operator has switched
-    # `render_hq` on (READ-1). 1.5 lifts PdfFormat.RENDER_SCALE 2.0 -> 3.0 (~144 -> ~216 DPI), so
-    # the room names printed in a plan stay legible when it is displayed below 1:1. It costs
-    # roughly the SQUARE of that in pixels — hence the opt-in + the Settings-page warning — but it
-    # cannot run the child out of address space: the renderer derives each page's scale from its
-    # point size and clamps to PdfFormat.MAX_IMAGE_PX.
-    HQ_SCALE = 1.5
-
-    def __init__(self, facility=''):
-        self.facility = facility
-
-    # Fraction of detected host memory a single render's RLIMIT_AS may occupy. The rest is left
-    # for the co-resident gunicorn workers + Postgres, so a render that overruns fails *inside*
-    # the capped child (MemoryError → degrades gracefully) instead of tripping the kernel
-    # OOM-killer, which would reap an unrelated worker → intermittent 502s (PERF-2).
-    MEM_HEADROOM_FRACTION = 0.5
-
-    @staticmethod
-    def _detect_avail_mb():
-        """Best-effort total memory available to this process, in MB, or None if undetectable.
-        Prefers the cgroup limit (correct inside an LXC/Docker container, where `/proc/meminfo`
-        can report the *host*'s RAM, not the container's) and falls back to `/proc/meminfo`
-        MemTotal. Reads only stdlib files — no new dependency, and never raises."""
-        for path in ('/sys/fs/cgroup/memory.max',                     # cgroup v2
-                     '/sys/fs/cgroup/memory/memory.limit_in_bytes'):   # cgroup v1
-            try:
-                raw = Path(path).read_text().strip()
-            except OSError:
-                continue
-            if not raw or raw == 'max':      # v2 reports the literal 'max' when unlimited
-                continue
-            try:
-                nbytes = int(raw)
-            except ValueError:
-                continue
-            # An unlimited v1 cgroup reports a huge sentinel (~PAGE_SIZE * INT_MAX); treat any
-            # absurd value as "no limit" and fall through to MemTotal.
-            if 0 < nbytes < (1 << 62):
-                return nbytes // (1024 * 1024)
-        try:
-            for line in Path('/proc/meminfo').read_text().splitlines():
-                if line.startswith('MemTotal:'):
-                    return int(line.split()[1]) // 1024   # kB → MB
-        except (OSError, ValueError, IndexError):
-            pass
-        return None
-
-    @classmethod
-    def _effective_mem_mb(cls, mem_mb):
-        """The RLIMIT_AS ceiling (MB) to actually apply for `render_mem_mb` == `mem_mb`.
-
-        Auto-clamps the *packaged default* down to a safe fraction of detected host memory so a
-        single pypdfium2/Pillow render can't allocate the whole machine and OOM-kill a worker
-        (PERF-2). An operator who tuned `render_mem_mb` away from the default has made an
-        informed choice and is honored verbatim — notably, *raising* it is the documented remedy
-        when a LibreOffice/Visio (`soffice`) conversion, which reserves a large *virtual* address
-        space that RLIMIT_AS caps, is killed by too tight a limit. Returns `mem_mb` unchanged when
-        it is falsy (no cap) or host memory can't be detected."""
-        if not mem_mb:
-            return mem_mb
-        from . import FacilityMapConfig
-        if mem_mb != FacilityMapConfig.default_settings['render_mem_mb']:
-            return mem_mb            # explicit operator override — soffice escape hatch
-        avail = cls._detect_avail_mb()
-        if not avail:
-            return mem_mb
-        return max(1, min(mem_mb, int(avail * cls.MEM_HEADROOM_FRACTION)))
-
-    @staticmethod
-    def _rlimits(timeout_s, mem_mb):
-        """Return a POSIX `preexec_fn` capping the child's CPU time and address space, so a
-        runaway or malicious render can't exhaust the host. `mem_mb` is the already-clamped
-        ceiling (see `_effective_mem_mb`); this runs post-fork so it stays minimal — just
-        `setrlimit`, no file reads or allocation."""
-        def apply():
-            import resource
-            cpu = int(timeout_s) + 5
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-            if mem_mb:
-                nbytes = int(mem_mb) * 1024 * 1024
-                resource.setrlimit(resource.RLIMIT_AS, (nbytes, nbytes))
-        return apply
-
-    def _is_hq_build(self, mode):
-        """True when this run is a **build** with high-quality rendering on — the only run whose
-        failure/quality-loss is worth explaining in terms of the render memory budget (HEALTH-3).
-        `scan`/`preview` never carry `--scale`, so a resource failure there isn't an HQ one."""
-        return mode == 'build' and render_hq_enabled()
-
-    def _mem_hint(self):
-        """An actionable remedy for an HQ render the render memory budget just defeated, naming the
-        **effective** (post-headroom-clamp) ceiling so the operator sees the number actually in
-        force, not the raw `render_mem_mb` the auto-clamp may have lowered."""
-        eff = self._effective_mem_mb(_cfg('render_mem_mb'))
-        return ('High-quality rendering was stopped, most likely by exceeding the render memory '
-                'budget (render_mem_mb=%s MB in effect). Raise render_mem_mb, or turn off '
-                '“High quality floor plans” in Settings, then rebuild.' % eff)
-
-    @staticmethod
-    def _parse_summary(stderr):
-        """The render diagnostics `preprocess.build` prints as its final `RENDER-SUMMARY {json}`
-        line, as a dict — or `{}` when absent (an older child, or a non-build mode) or unparseable.
-        Reads the **untruncated** stderr (the summary is the last line, past the 2000-char log cap)
-        and scans from the end so only the current build's summary is read."""
-        for line in reversed((stderr or '').splitlines()):
-            marker = 'RENDER-SUMMARY '
-            if line.startswith(marker):
-                try:
-                    return json.loads(line[len(marker):])
-                except json.JSONDecodeError:
-                    return {}
-        return {}
-
-    def run(self, mode, extra=None):
-        """Spawn `preprocess.py <mode> --base <workdir> [extra...]` and shape its result. Invoked
-        by file path (not `-m`) so the child stays minimal/isolated — no Django in-process. The
-        render relies on this isolation: the `render_timeout_s` timeout plus POSIX CPU/address-space
-        rlimits cap a runaway or malicious child. `extra` carries mode-specific argv (e.g.
-        `--pdf`/`--out` for `preview`). `scan` reads the child's stdout as the JSON inventory;
-        every other mode returns stderr as a log.
-
-        A `build` additionally picks up the operator's `render_hq` setting as `--scale`, resolved
-        here rather than by the callers so no build path can forget it — and scoped to `build`
-        because that is the mode whose output the map actually serves. `scan` thumbnails and the
-        wizard's on-demand `preview` stay at standard scale on purpose: they exist to *identify* a
-        plan, and `preview` is an interactive request that shouldn't spike memory."""
-        base = work_dir(self.facility)
-        base.mkdir(parents=True, exist_ok=True)
-        script = str(Path(__file__).resolve().parent / self.SCRIPT)
-        if mode == 'build' and render_hq_enabled():
-            extra = [*(extra or []), '--scale', str(self.HQ_SCALE)]
-        timeout = _cfg('render_timeout_s')
-        kwargs = {}
-        if os.name == 'posix':
-            kwargs['preexec_fn'] = self._rlimits(
-                timeout, self._effective_mem_mb(_cfg('render_mem_mb')))
-        try:
-            proc = subprocess.run(
-                [sys.executable, script, mode, '--base', str(base), *(extra or [])],
-                capture_output=True, text=True, cwd=str(base), timeout=timeout, **kwargs)
-        except subprocess.TimeoutExpired:
-            result = {'ok': False, 'error': '%s timed out after %ss' % (mode, timeout)}
-            if self._is_hq_build(mode):
-                result['hint'] = ('The render timed out (render_timeout_s=%ss). High-quality '
-                                  'rendering is slower and heavier — raise render_timeout_s, or '
-                                  'turn off “High quality floor plans” in Settings, then rebuild.'
-                                  % timeout)
-            return result
-        if proc.returncode != 0:
-            result = {'ok': False,
-                      'error': (proc.stderr or proc.stdout).strip()[:2000] or (mode + ' failed')}
-            # A negative return code means the child was killed by signal `-returncode` — an OOM
-            # kill, a CPU-rlimit SIGXCPU, or a C-level allocation crash, all consistent with the
-            # render outgrowing its limits. When it was an HQ build, say so and point at the fix
-            # instead of surfacing a truncated, opaque traceback (HEALTH-3).
-            if proc.returncode < 0:
-                result['signal'] = -proc.returncode
-                if self._is_hq_build(mode):
-                    result['hq_mem'] = True
-                    result['hint'] = self._mem_hint()
-            return result
-        if mode == 'scan':
-            try:
-                return {'ok': True, **json.loads(proc.stdout or '{}')}
-            except json.JSONDecodeError:
-                return {'ok': False, 'error': (proc.stderr or proc.stdout)[:1000]}
-        result = {'ok': True, 'log': proc.stderr.strip()[:2000]}
-        # Surface the build's render diagnostics (HEALTH-3): sheets that couldn't render, and HQ
-        # sheets the size cap clamped below full quality — a *successful* build that quietly lost
-        # content/quality, which the frontend turns into a non-blocking heads-up. Only >0 counts
-        # ride along, so an all-clean build's result is byte-identical to before.
-        if mode == 'build':
-            summary = self._parse_summary(proc.stderr)
-            for k in ('hq_clamped', 'unrendered'):
-                if summary.get(k):
-                    result[k] = summary[k]
-        return result
-
-    def ensure_preview(self, src_rel, page=0, angle=0):
-        """Ensure the full-scale PNG for an uploaded drawing exists (rendering it via
-        `preprocess.py` if missing/stale) and return its working-dir-relative cache path. Backs the
-        preview endpoint and the wizard's enlarged/cropped mapping cards via the
-        `.thumbs/<...>.full.png` cache. `src_rel` is working-dir-relative (`uploads/...`) and may be
-        a PDF or a raster image. `page` is the 0-based page index of a multi-page PDF (default the
-        first — the whole-file/single-page case). `angle` (clockwise degrees, default 0) previews a
-        rotated card the way it will build. Raises `Http404` when the source is absent; returns
-        `None` on a render failure. Renders a single file to a distinct cache path **without taking
-        the import lock**, so opening a preview never 409s against an in-flight scan."""
-        base = work_dir(self.facility).resolve()
-        full = safe_path(src_rel, self.facility)
-        try:
-            inside = full.relative_to(base / 'uploads')
-        except ValueError:
-            raise Http404
-        if not full.is_file():
-            raise Http404
-        # Key the cache on the full source filename (not the stem), so `1.pdf` and `1.png` sharing a
-        # folder render to distinct caches (`1.pdf.full.png` vs `1.png.full.png`) instead of colliding.
-        # A page beyond the first gets its own cache suffix (`.p<N>.full.png`, 1-based to match the
-        # wizard's `?page=`); page 0 keeps the bare name so single-page previews are unchanged. A
-        # non-zero rotation gets its own `.a<deg>` cache too, so an unrotated preview stays
-        # byte-identical to before and each orientation caches separately (`reset` wipes `.thumbs`).
-        suffix = ('.p%d' % (page + 1) if page else '') + ('.a%g' % angle if angle % 360 else '') \
-            + '.full.png'
-        cache = base / 'uploads' / self.THUMBS_DIRNAME / inside.parent / (inside.name + suffix)
-        cache_rel = cache.relative_to(base).as_posix()
-        try:
-            fresh = cache.is_file() and cache.stat().st_mtime >= full.stat().st_mtime
-        except OSError:
-            fresh = False
-        if not fresh:
-            extra = ['--pdf', full.relative_to(base).as_posix(), '--out', cache_rel]
-            if page:
-                extra += ['--page', str(page)]
-            if angle % 360:
-                extra += ['--angle', ('%g' % angle)]
-            result = self.run('preview', extra)
-            if not result.get('ok') or not cache.is_file():
-                return None
-        return cache_rel
-
-    def _acquire_lock(self, stale_after):
-        """Atomically create the working-dir lockfile. Returns its Path, or None if another
-        import holds a still-fresh lock. A lock older than `stale_after` (a crashed render) is
-        reclaimed once."""
-        base = work_dir(self.facility)
-        base.mkdir(parents=True, exist_ok=True)
-        lock = base / self.LOCK_NAME
-        try:
-            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            try:
-                age = time.time() - lock.stat().st_mtime
-            except FileNotFoundError:
-                age = stale_after + 1
-            if age <= stale_after:
-                return None
-            try:
-                os.unlink(str(lock))
-                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except (FileExistsError, FileNotFoundError):
-                return None
-        os.close(fd)
-        return lock
-
-    def run_locked(self, mode):
-        """Run a render under the working-dir lock; 409 if one is already in flight."""
-        lock = self._acquire_lock(_cfg('render_timeout_s') * 2)
-        if lock is None:
-            return JsonResponse({'ok': False, 'error': 'an import is already running'}, status=409)
-        try:
-            result = self.run(mode)
-        finally:
-            try:
-                os.unlink(str(lock))
-            except FileNotFoundError:
-                pass
-        return JsonResponse(result)
+from .drawing_formats import COMPANION_EXTS, DRAWING_EXTS
+from .facilities import org_mode
+from .import_base import ImportView, busy_response, cfg, request_facility
+from .render_runner import RenderRunner
+from .serving import serve_file
+from .storage import MANIFEST_NAME, safe_path, work_dir
+from .wipe import WipeBusyError, wipe_data
 
 
 def _count_rendered_drawings(imap):
@@ -443,213 +81,20 @@ def _count_rendered_drawings(imap):
     return n
 
 
-def _zip_targets(names):
-    """Map a zip's drawing member paths (any accepted format) to `(folder, file)` upload
-    destinations, mirroring the wizard's folder-upload split (see `ImportUploader.split`). A
-    single directory shared by every drawing — the wrapper folder a zip usually has — is
-    stripped first; a drawing then sitting at the root alongside subfoldered drawings is treated
-    as the overall site map.
-
-    A drawing's COMPANION siblings (a Shapefile's `.shx/.dbf/.prj/.cpg`) ride along into the same
-    `(folder, file)` — routed by the layout of the **primary** drawings, and only when a same-stem
-    primary sits in the same zip directory (orphan companions are dropped). The layout decisions
-    (wrapper-folder peel, site-map detection) are made on primaries alone, so companions never sway
-    them. Count *drawings* off the result with `n.lower().endswith(DRAWING_EXTS)`."""
-    def norm(n):
-        return [s for s in n.replace('\\', '/').split('/') if s]
-
-    drawings = [n for n in names
-                if n.lower().endswith(DRAWING_EXTS) and not n.endswith('/')]
-    split = [norm(n) for n in drawings]
-    # Peel off any leading directory shared by every drawing (nested wrapper folders). Track how
-    # many segments were peeled so a companion's path can be peeled identically.
-    peeled = 0
-    while split and all(len(s) > 1 for s in split) and len({s[0] for s in split}) == 1:
-        split = [s[1:] for s in split]
-        peeled += 1
-    has_subfolders = any(len(s) >= 2 for s in split)
-    out = {}
-    for name, segs in zip(drawings, split):
-        if not segs:
-            continue
-        if has_subfolders and len(segs) == 1:
-            out[name] = ('Site Plan', segs[-1])
-        else:
-            out[name] = (segs[-2] if len(segs) > 1 else 'Building', segs[-1])
-
-    # Attach each companion sibling to a primary drawing sharing its directory + stem, landing it in
-    # the primary's target folder under its own filename (pyshp finds it by shared basename). The
-    # primary index is a snapshot so companion inserts don't mutate what's being scanned.
-    primaries = [(norm(pname)[peeled:-1], os.path.splitext(pfile)[0].lower(), folder)
-                 for pname, (folder, pfile) in out.items()]
-    for name in names:
-        if name.endswith('/') or not name.lower().endswith(COMPANION_EXTS):
-            continue
-        segs = norm(name)[peeled:]
-        if not segs:
-            continue
-        cdir, cfile = segs[:-1], segs[-1]
-        stem = os.path.splitext(cfile)[0].lower()
-        for pdir, pstem, folder in primaries:
-            if pdir == cdir and pstem == stem:
-                out[name] = (folder, cfile)
-                break
-    return out
-
-
 # --- endpoints ---------------------------------------------------------------------
 
-class _ImportView(PermissionRequiredMixin, View):
-    """Base for the import-gated endpoints (mostly POST; the export download is a GET):
-    unauthenticated → login redirect; authenticated without the import permission → 403
-    (PermissionRequiredMixin default)."""
-    permission_required = IMPORT_PERM
-
-
-class UploadView(_ImportView):
-    """Store one uploaded drawing (PDF or a raster image) under
-    `<workdir>/uploads/<folder>/<file>`. The file rides a multipart form (`file` field) so
-    Django streams it to disk rather than buffering the whole body in memory."""
-
-    def post(self, request):
-        rel = (request.GET.get('path') or '').lstrip('/')
-        if not rel.lower().endswith(UPLOAD_EXTS):
-            # A recognized-but-uninstalled format (e.g. .svg without the [svg] extra) gets an
-            # actionable "install the extra" message; anything else, the generic installed-set list.
-            hint = install_hint_for(rel)
-            if hint:
-                return HttpResponseBadRequest(hint)
-            return HttpResponseBadRequest('an accepted drawing path is required (installed '
-                                          'formats: %s)' % ', '.join(DRAWING_EXTS))
-        try:
-            facility = _facility(request)
-            target = safe_path('uploads/' + rel, facility)
-            parts = target.relative_to(work_dir(facility).resolve()).parts
-        except ValueError:
-            return HttpResponseBadRequest('invalid path')
-        if not parts or parts[0] != 'uploads':
-            return HttpResponseBadRequest('invalid path')
-
-        up = request.FILES.get('file')
-        if up is None:
-            return HttpResponseBadRequest('missing file')
-        if up.size > _cfg('max_pdf_mb') * 1024 * 1024:
-            return JsonResponse({'ok': False, 'error': 'file exceeds size limit'}, status=413)
-        if not _upload_ok(rel, up.read(16)):
-            return HttpResponseBadRequest('unsupported file type (bad magic bytes)')
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        part = target.with_name(target.name + '.part')
-        up.seek(0)
-        with open(part, 'wb') as f:
-            for chunk in up.chunks():
-                f.write(chunk)
-        os.replace(part, target)
-        return JsonResponse({'ok': True, 'bytes': up.size})
-
-
-class UploadZipView(_ImportView):
-    """Extract one uploaded `.zip` of building drawings (PDFs and/or raster images) into
-    `<workdir>/uploads/...`, mapping members the same way folder uploads are (`_zip_targets`).
-    Extraction only writes bytes and sniffs magic — drawings are still parsed solely in the
-    isolated render subprocess, so this does not breach that isolation. Guarded against oversize
-    archives, zip bombs (per-file + cumulative decompressed caps), path traversal, and
-    symlink/special members."""
-
-    def post(self, request):
-        up = request.FILES.get('file')
-        if up is None:
-            return HttpResponseBadRequest('missing file')
-        if not (up.name or '').lower().endswith('.zip'):
-            return HttpResponseBadRequest('a .zip file is required')
-        if up.size > _cfg('max_zip_mb') * 1024 * 1024:
-            return JsonResponse({'ok': False, 'error': 'zip exceeds size limit'}, status=413)
-        if not up.read(4).startswith(b'PK\x03\x04'):
-            return HttpResponseBadRequest('not a zip (bad magic bytes)')
-        up.seek(0)
-
-        try:
-            facility = _facility(request)
-        except ValueError:
-            return HttpResponseBadRequest('invalid facility')
-        max_pdfs = _cfg('max_pdfs')
-        per_file_cap = _cfg('max_pdf_mb') * 1024 * 1024
-        total_cap = _cfg('max_zip_uncompressed_mb') * 1024 * 1024
-        base = work_dir(facility)
-        base.mkdir(parents=True, exist_ok=True)
-
-        count, total = 0, 0
-        try:
-            with zipfile.ZipFile(up) as zf:
-                targets = _zip_targets(zf.namelist())
-                # The cap counts *drawings*, not companion siblings (which don't render).
-                drawings = sum(1 for n in targets if n.lower().endswith(DRAWING_EXTS))
-                if not drawings:
-                    return JsonResponse(
-                        {'ok': False, 'error': 'no drawings in the zip'}, status=400)
-                if drawings > max_pdfs:
-                    return JsonResponse(
-                        {'ok': False, 'error': 'too many drawings (limit %d)' % max_pdfs},
-                        status=400)
-                for info in zf.infolist():
-                    if info.filename not in targets or info.is_dir():
-                        continue
-                    # Refuse symlinks/special files — safe_path's resolve() would follow them.
-                    mode = (info.external_attr >> 16) & 0o170000
-                    if mode and mode != 0o100000:
-                        return HttpResponseBadRequest('zip contains a non-regular file')
-                    folder, fname = targets[info.filename]
-                    try:
-                        target = safe_path('uploads/' + folder + '/' + fname, facility)
-                        parts = target.relative_to(base.resolve()).parts
-                    except ValueError:
-                        return HttpResponseBadRequest('zip entry escapes the working directory')
-                    if not parts or parts[0] != 'uploads':
-                        return HttpResponseBadRequest('invalid zip entry path')
-
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    part = target.with_name(target.name + '.part')
-                    written = 0
-                    with zf.open(info) as src, open(part, 'wb') as dst:
-                        chunk = src.read(1024 * 1024)
-                        if not _upload_ok(fname, chunk[:16]):
-                            os.unlink(part)
-                            return HttpResponseBadRequest(
-                                'zip contains an unsupported file (%s)' % fname)
-                        while chunk:
-                            written += len(chunk)
-                            total += len(chunk)
-                            if written > per_file_cap:
-                                os.unlink(part)
-                                return JsonResponse(
-                                    {'ok': False, 'error': 'a drawing exceeds the size limit'},
-                                    status=413)
-                            if total > total_cap:
-                                os.unlink(part)
-                                return JsonResponse(
-                                    {'ok': False, 'error': 'zip decompresses too large'}, status=413)
-                            dst.write(chunk)
-                            chunk = src.read(1024 * 1024)
-                    os.replace(part, target)
-                    if fname.lower().endswith(DRAWING_EXTS):   # report drawings, not companions
-                        count += 1
-        except zipfile.BadZipFile:
-            return HttpResponseBadRequest('corrupt zip file')
-        return JsonResponse({'ok': True, 'count': count})
-
-
-class ScanView(_ImportView):
+class ScanView(ImportView):
     """Render a thumbnail per uploaded PDF and return the folders/drawings inventory."""
 
     def post(self, request):
         try:
-            facility = _facility(request)
+            facility = request_facility(request)
         except ValueError:
             return HttpResponseBadRequest('invalid facility')
         return RenderRunner(facility).run_locked('scan')
 
 
-class BuildView(_ImportView):
+class BuildView(ImportView):
     """Persist the wizard's import map, then render images + manifest."""
 
     def post(self, request):
@@ -660,25 +105,43 @@ class BuildView(_ImportView):
         if not isinstance(data, dict):
             return HttpResponseBadRequest('import map must be an object')
         try:
-            facility = _facility(request)
+            facility = request_facility(request)
         except ValueError:
             return HttpResponseBadRequest('invalid facility')
         base = work_dir(facility)
         base.mkdir(parents=True, exist_ok=True)
-        max_pdfs = _cfg('max_pdfs')
+        max_pdfs = cfg('max_pdfs')
         if _count_rendered_drawings(data) > max_pdfs:
             return JsonResponse(
                 {'ok': False, 'error': 'too many drawings (limit %d)' % max_pdfs}, status=400)
-        (base / 'import-map.json').write_text(json.dumps(data))
-        return RenderRunner(facility).run_locked('build')
+        # The map write rides `prepare`, so it happens *under* the render lock: written before the
+        # lock, a second build starting in the window between the two could render this request's
+        # map (or have its own overwritten by ours).
+        # Stamp the facility's declared organization mode into the map the build renders (MODEL-6),
+        # server-side rather than trusting a wizard-supplied value: the stored setting is the single
+        # source of truth, and `preprocess` copies it onto the manifest so a built facility records
+        # how it was organized. Written here (not by the client) so a hand-rolled import map can't
+        # claim a mode the install never declared.
+        data['orgMode'] = org_mode(facility)
+
+        def write_map():
+            (base / 'import-map.json').write_text(json.dumps(data))
+
+        return RenderRunner(facility).run_locked('build', prepare=write_map)
 
 
-class ResetView(_ImportView):
+class ResetView(ImportView):
     """Clear an import so the user can start over (uploads/images/manifest/map/lock).
 
     Reset is the one irreversible operation (it wipes the working dir), so on top of the import
     permission it requires a **superuser** — the strongest tier, one step above `import` (PERM-1).
-    A non-superuser importer gets the same 403/login handling as any missing-permission caller."""
+    A non-superuser importer gets the same 403/login handling as any missing-permission caller.
+
+    It runs under the render lock (`hold_lock`, 409 when a render is in flight): deleting
+    `uploads/`/`images/` beneath a live render subprocess would leave a half-rendered facility
+    behind the wipe. The lockfile itself is therefore no longer deleted here — we *hold* it, and
+    `hold_lock` releases it on the way out; a lock stranded by a crashed render is already reclaimed
+    by `_acquire_lock`'s stale-lock recovery."""
 
     def has_permission(self):
         # `super()` enforces IMPORT_PERM; the superuser check is the extra reset-only tier.
@@ -686,26 +149,30 @@ class ResetView(_ImportView):
 
     def post(self, request):
         try:
-            base = work_dir(_facility(request))
+            facility = request_facility(request)
         except ValueError:
             return HttpResponseBadRequest('invalid facility')
-        for d in ('uploads', 'images'):
-            shutil.rmtree(base / d, ignore_errors=True)
-        for f in (MANIFEST_NAME, 'import-map.json', 'import-map.stub.json',
-                  'import-map.draft.json', RenderRunner.LOCK_NAME):
-            try:
-                (base / f).unlink()
-            except FileNotFoundError:
-                pass
+        base = work_dir(facility)
+        with RenderRunner(facility).hold_lock() as held:
+            if not held:
+                return busy_response()
+            for d in ('uploads', 'images'):
+                shutil.rmtree(base / d, ignore_errors=True)
+            for f in (MANIFEST_NAME, 'import-map.json', 'import-map.stub.json',
+                      'import-map.draft.json'):
+                try:
+                    (base / f).unlink()
+                except FileNotFoundError:
+                    pass
         return JsonResponse({'ok': True})
 
 
-class ExportArchiveView(_ImportView):
+class ExportArchiveView(ImportView):
     """Download a full self-contained backup archive of all plugin data (DB rows + working dir).
 
     Wraps `backup.create_backup()` — the same engine the `facilitymap_backup` CLI drives — so the
     admin UI and the operator command produce interchangeable `.tar.gz` files. Gated on the import
-    permission (`_ImportView`): exporting bundles every blob/room plus the uploaded drawings and
+    permission (`ImportView`): exporting bundles every blob/room plus the uploaded drawings and
     rendered images, and it *writes* a persisted archive to the backup dir, so it is an
     operator-tier action, not a plain read. `create_backup` FIFO-prunes the backup dir but always
     keeps the newest file — the one we just wrote — so streaming it back is safe. The persisted
@@ -719,16 +186,17 @@ class ExportArchiveView(_ImportView):
         return response
 
 
-class RestoreArchiveView(_ImportView):
+class RestoreArchiveView(ImportView):
     """Restore a backup archive, **replacing ALL plugin data** (blobs + rooms + working dir).
 
-    Wraps `backup.restore_backup()` (destructive full replace inside `transaction.atomic()`), the
-    single most destructive operation in the plugin — strictly more so than `reset` (which only
+    Wraps `backup.restore_backup()` (destructive full replace — rows inside `transaction.atomic()`,
+    then the working-dir swap once it commits), the single most destructive operation in the plugin — strictly more so than `reset` (which only
     wipes the working dir). So on top of the import permission it requires a **superuser**, exactly
     the `ResetView` tier. The uploaded archive is untrusted: it is size- and magic-validated here,
     and `restore_backup` traversal-guards every member (`_check_safe_members`) before extracting —
     that guard is not loosened. The archive is streamed to a temp file (no in-memory cap) and
-    removed afterwards; the working dir is only touched by `restore_backup`'s atomic swap.
+    removed afterwards; the working dir is only touched by `restore_backup`'s post-commit rename
+    swap (this view adds no transaction of its own, which is what keeps that swap after the commit).
 
     Restore re-links rooms to Locations by portable **slug** (BAK-1), so a backup can be restored to
     a *new* instance. This web path is **strict** (no `allow_unresolved`): if a binding can't be
@@ -745,7 +213,7 @@ class RestoreArchiveView(_ImportView):
             return HttpResponseBadRequest('missing file')
         if not (up.name or '').lower().endswith(('.tar.gz', '.tgz', '.gz')):
             return HttpResponseBadRequest('a .tar.gz backup archive is required')
-        if up.size > _cfg('backup_max_mb') * 1024 * 1024:
+        if up.size > cfg('backup_max_mb') * 1024 * 1024:
             return JsonResponse({'ok': False, 'error': 'archive exceeds size limit'}, status=413)
         if not up.read(2).startswith(b'\x1f\x8b'):  # gzip magic
             return HttpResponseBadRequest('not a gzip archive (bad magic bytes)')
@@ -758,9 +226,18 @@ class RestoreArchiveView(_ImportView):
                 tmp.write(chunk)
             tmp_path = tmp.name
         try:
-            # Strict on the web path (no allow_unresolved): the most destructive action in the
-            # plugin aborts + reports rather than silently dropping bindings.
-            result = restore_backup(tmp_path)
+            # Under the render lock, like `reset`: `_restore_workdir` swaps the whole working-dir
+            # tree, which would strand a live render writing into the tree it renames away. The lock
+            # is the **default** facility's, because that is the root `restore_backup` replaces —
+            # so a render into some *other* facility's subdir is not serialized against it (a
+            # whole-instance restore during another facility's import is out of scope here; the
+            # archive replaces every facility either way).
+            with RenderRunner().hold_lock() as held:
+                if not held:
+                    return busy_response()
+                # Strict on the web path (no allow_unresolved): the most destructive action in the
+                # plugin aborts + reports rather than silently dropping bindings.
+                result = restore_backup(tmp_path)
         except RestoreUnresolvedError as e:
             # Bindings didn't resolve on this instance — nothing was changed. Surface the list so
             # the operator sees exactly which Sites/Locations to recreate before retrying.
@@ -776,7 +253,49 @@ class RestoreArchiveView(_ImportView):
         return JsonResponse({'ok': True, **result})
 
 
-class SaveDraftView(_ImportView):
+class WipeView(ImportView):
+    """Delete the plugin's data — DB rows *and* working-dir files (HEALTH-12). **Irreversible.**
+
+    The complete counterpart to `ResetView`, which clears one facility's working-dir files but
+    leaves every `FacilityMapBlob`/`Room` row standing (so "start over" resurrects the old rooms).
+    A thin wrap over `wipe.wipe_data` — the same engine the `facilitymap_wipe` command drives, so
+    the CLI and the UI wipe identically. POST `{"all": true}` for the blank slate (every row
+    including the install-wide settings, every room, the whole working dir) or `{"facility": …}`
+    for one facility's map data.
+
+    Destructive, so it sits on the **reset tier** — `IMPORT_PERM` plus a **superuser**, exactly
+    `ResetView`/`RestoreArchiveView`. `wipe_data` takes every affected facility's render lock
+    itself, so a render in flight surfaces as the shared 409 with nothing changed."""
+
+    def has_permission(self):
+        # `super()` enforces IMPORT_PERM; the superuser check is the extra wipe-only tier.
+        return super().has_permission() and self.request.user.is_superuser
+
+    def post(self, request):
+        try:
+            data = json.loads(request.body or b'{}')
+        except json.JSONDecodeError:
+            return HttpResponseBadRequest('invalid JSON')
+        if not isinstance(data, dict):
+            return HttpResponseBadRequest('body must be an object')
+        # `facility: ''` is the *default facility*, a different request from "wipe everything", so
+        # the scope is chosen by an explicit `all` flag rather than by the facility's truthiness.
+        if data.get('all'):
+            facility = None
+        else:
+            facility = data.get('facility') or ''
+            if not isinstance(facility, str):
+                return HttpResponseBadRequest('invalid facility')
+        try:
+            result = wipe_data(facility)
+        except ValueError:
+            return HttpResponseBadRequest('invalid facility')
+        except WipeBusyError:
+            return busy_response()
+        return JsonResponse({'ok': True, **result})
+
+
+class SaveDraftView(ImportView):
     """Persist the wizard's in-progress building/floor assignments for smart resume."""
 
     def post(self, request):
@@ -785,7 +304,7 @@ class SaveDraftView(_ImportView):
         except json.JSONDecodeError:
             return HttpResponseBadRequest('invalid JSON')
         try:
-            base = work_dir(_facility(request))
+            base = work_dir(request_facility(request))
         except ValueError:
             return HttpResponseBadRequest('invalid facility')
         base.mkdir(parents=True, exist_ok=True)
@@ -793,12 +312,12 @@ class SaveDraftView(_ImportView):
         return JsonResponse({'ok': True})
 
 
-class LoadDraftView(_ImportView):
+class LoadDraftView(ImportView):
     """Return the saved wizard draft (buildings/site) if one exists."""
 
     def get(self, request):
         try:
-            draft = work_dir(_facility(request)) / 'import-map.draft.json'
+            draft = work_dir(request_facility(request)) / 'import-map.draft.json'
         except ValueError:
             return HttpResponseBadRequest('invalid facility')
         if not draft.is_file():
@@ -810,7 +329,7 @@ class LoadDraftView(_ImportView):
         return JsonResponse({'ok': True, **data})
 
 
-class RegroupView(_ImportView):
+class RegroupView(ImportView):
     """Relocate uploaded drawings into per-building folders — the server half of the wizard's
     in-app building assignment for an unsorted pile of drawings (IMPORT-3).
 
@@ -827,7 +346,19 @@ class RegroupView(_ImportView):
     collision is refused, and only *bytes* are moved — the untrusted decode still happens solely in
     the render subprocess, so this doesn't breach that isolation. A source folder left empty by the
     moves is pruned so it doesn't linger as a phantom (floorless) building at the next scan. No
-    render, so — like `UploadView` — it takes no import lock; the wizard re-scans afterwards."""
+    render, so — like `UploadView` — it takes no import lock; the wizard re-scans afterwards.
+
+    **The two reserved folder names are handled asymmetrically** (IMPORT-24). `building_folders()`
+    skips both, so a drawing in either is invisible to `scan` and `build`. `THUMBS_DIRNAME` is
+    therefore **refused** as a destination — nothing legitimate moves a drawing into the thumbnail
+    cache, and one that landed there would silently disappear from the wizard. `EXCLUDED_DIRNAME`
+    is **accepted**, because moving a drawing there is exactly how the organize step drops it from
+    the import; that is the same act however the request was built, so it needs no second signal.
+
+    `EXCLUDED_DIRNAME` is equally legitimate as a **source**: that is how the edit hub's restore
+    (IMPORT-26) brings an excluded drawing back into a building. It needs no special case here —
+    a source is validated only by `safe_path` + "is a file", the companion-sibling sweep carries a
+    multi-file set back with it, and the prune below removes the park once it empties."""
 
     def post(self, request):
         try:
@@ -838,7 +369,7 @@ class RegroupView(_ImportView):
         if not isinstance(groups, dict):
             return HttpResponseBadRequest('groups must be an object')
         try:
-            facility = _facility(request)
+            facility = request_facility(request)
         except ValueError:
             return HttpResponseBadRequest('invalid facility')
         uploads = work_dir(facility).resolve() / 'uploads'
@@ -869,6 +400,13 @@ class RegroupView(_ImportView):
             if not isinstance(dest, str) or not dest or dest in ('.', '..') \
                     or '/' in dest or '\\' in dest:
                 return HttpResponseBadRequest('invalid building folder name')
+            # The thumbnail cache is reserved and is never a legitimate destination: `scan` skips it
+            # by name, so a drawing moved there would vanish from the wizard with no way back.
+            # `EXCLUDED_DIRNAME` is reserved too but IS a legitimate destination — it is how the
+            # organize step drops a drawing from the import (IMPORT-24) — so only the cache is
+            # refused here; the client keeps both out of its "Add building" field.
+            if dest == RenderRunner.THUMBS_DIRNAME:
+                return HttpResponseBadRequest('reserved building folder name')
             if not isinstance(files, list):
                 return HttpResponseBadRequest('each group must be a list of paths')
             for rel in files:
@@ -904,7 +442,9 @@ class RegroupView(_ImportView):
             os.replace(src, dst)
             moved += 1
         # Prune source folders emptied by the moves so an emptied bucket doesn't survive as a
-        # phantom (floorless) building at the next scan. Never the uploads root or the thumb cache.
+        # phantom (floorless) building at the next scan — and, when the source was the excluded
+        # park, so a fully-restored facility doesn't leave an empty park behind (IMPORT-26; the
+        # scan reports `excluded: []` either way). Never the uploads root or the thumb cache.
         for d in src_dirs:
             if d == uploads or d.name == RenderRunner.THUMBS_DIRNAME:
                 continue
@@ -915,7 +455,7 @@ class RegroupView(_ImportView):
         return JsonResponse({'ok': True, 'moved': moved})
 
 
-class PreviewView(_ImportView):
+class PreviewView(ImportView):
     """Render one uploaded drawing (PDF or raster image) at full scale on demand and stream the
     PNG back — the wizard's high-res preview for the popup and for enlarged/zoomed mapping cards.
     Permission-gated + isolated like the other render endpoints, but it renders a single file to
@@ -940,7 +480,7 @@ class PreviewView(_ImportView):
         except ValueError:
             angle = 0
         try:
-            facility = _facility(request)
+            facility = request_facility(request)
             cache_rel = RenderRunner(facility).ensure_preview(rel, page=page, angle=angle)
         except ValueError:
             raise Http404
@@ -948,127 +488,126 @@ class PreviewView(_ImportView):
             return JsonResponse({'ok': False, 'error': 'preview render failed'}, status=500)
         # The cached preview lives under `uploads/.thumbs` in the working dir; serve it through
         # the shared helper so it honours the same optional nginx offload as MediaView.
-        return _serve_file(work_dir(facility) / cache_rel, Path(cache_rel).parts, facility)
+        return serve_file(work_dir(facility) / cache_rel, Path(cache_rel).parts, facility)
 
 
-def _file_validators(stat):
-    """(etag, last_modified) HTTP validators for a working-dir file, derived from its
-    stat. mtime+size is a sufficient change signal here: every file under the working dir
-    is either rewritten by an import (new mtime) or replaced by an upload."""
-    return '"%d-%d"' % (int(stat.st_mtime), stat.st_size), int(stat.st_mtime)
+def _valid_region(raw):
+    """A posted normalized-0..1 crop box as a plain `{x, y, w, h}` dict, or None when it isn't one.
+    Allows a hair over 1 on the far edges so a box dragged to the very edge isn't rejected by
+    float rounding (the wizard clamps to 0..1, but the round-trip through JSON need not be exact)."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        x, y, w, h = (float(raw[k]) for k in ('x', 'y', 'w', 'h'))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (x >= 0 and y >= 0 and w > 0 and h > 0 and x + w <= 1.001 and y + h <= 1.001):
+        return None
+    return {'x': x, 'y': y, 'w': w, 'h': h}
 
 
-def _serve_file(full, parts, facility=''):
-    """Response body for the working-dir file at `full` (whose traversal-validated per-facility
-    working-dir-relative path is `parts`), letting the caller set the caching/validator headers.
+class OcrReadView(ImportView):
+    """Read the floor code out of a marked region on each drawing, so the wizard can pre-fill floor
+    assignments (IMPORT-31). The user has already dragged one box over the spot that identifies a
+    floor; this reads that same normalized region on every drawing in scope and returns the
+    recognized text + confidence per drawing. The wizard turns text into a *suggestion* the
+    operator confirms — this endpoint never assigns anything.
 
-    By default the file is streamed from this worker via `FileResponse`. When the
-    `x_accel_redirect` setting is on, instead return an empty response carrying an
-    `X-Accel-Redirect` header pointing at `<x_accel_location>/<facility>/<parts>`, so a cooperating
-    nginx `internal` location streams the bytes and the gunicorn worker is freed immediately — the
-    fix for worker exhaustion under slow/many concurrent media loads. The nginx `internal` alias
-    points at the working-dir **root**, but `parts` is relative to the *per-facility* subdir, so the
-    facility slug is prefixed back on to form the root-relative path. Callers MUST run the auth +
-    traversal + serve-root gate *before* calling this: nginx only ever receives an internal path
-    it can't be reached at directly, so the media stays authenticated exactly as when streamed."""
-    ctype = mimetypes.guess_type(str(full))[0] or 'application/octet-stream'
-    if _cfg('x_accel_redirect'):
-        location = (_cfg('x_accel_location') or '/facilitymap-internal/').rstrip('/')
-        response = HttpResponse(content_type=ctype)
-        # `parts` is already confined to the facility's working dir; prefix the facility (so the
-        # path is relative to the working-dir root nginx aliases) and encode each segment for the
-        # header URI (quote keeps '/'), so nginx resolves the same path under its `internal` alias.
-        rel = ((facility + '/') if facility else '') + '/'.join(parts)
-        response['X-Accel-Redirect'] = location + '/' + quote(rel)
-        return response
-    return FileResponse(open(full, 'rb'), content_type=ctype)
+    **The caller supplies the work list.** Unlike the endpoint removed in `1.10.0`, which
+    re-enumerated `uploads/` and understood only first-page PDFs, the wizard knows things the
+    filesystem does not: exploded `#pN` page rows, excluded drawings, region-split cards, the
+    chosen siteplan, and the current bulk scope. So it posts exactly which drawings to read, and
+    this view validates them. A per-item `region` overrides the default, which is what lets one
+    pass cover a building whose title block sits in a different corner (`building.codeRegion`).
 
+    Each drawing is read at **angle 0**, from the same full-scale preview render the wizard's
+    code-crop thumbnails use: the region was marked on the *unrotated* drawing, so cropping a
+    straightened render would read the wrong pixels (the reason `_codeCropThumb` also drops its
+    crop on a rotated card).
 
-class ManifestView(MapReadAccessMixin, View):
-    """Serve the rendered manifest, or the empty stub before any facility is imported.
-    Read-gated (same access as the map — login-only by default), not a public static file. Cached
-    `private, no-cache`: the browser must revalidate (a rebuild changes the manifest and
-    its `built` token), but an unchanged manifest costs only a 304."""
+    Isolated + permission-gated like every import endpoint, but lock-free like `PreviewView` — it
+    only reads images, so a Populate never 409s against an in-flight scan. OCR itself runs in the
+    `ocr.py` subprocess over already-rendered, trusted PNGs; no PDF is opened here.
 
-    def get(self, request):
+    **One request, one job file.** The wizard's background sweep (IMPORT-53) slices a facility into
+    many small reads, so two of them can be in flight at once across worker processes — a sweep
+    chunk overlapping the manual re-read, most obviously. A fixed `ocr-job.json` would have the
+    second request overwrite the first's work list between its write and its subprocess spawn, so
+    the name carries a random token and is removed once the child has run.
+
+    **Per-line candidates, not one joined string.** The reader returns each text line it found in
+    the region as its own candidate, because the recognizer can only read one line at a time and
+    joining them produced both an unparseable string and a confidence averaged over characters
+    that had nothing to do with the floor code. `text`/`confidence` are the reader's best single
+    candidate — vocabulary-free, since `ocr.py` knows nothing about floors — and `lines` carries
+    them all, for the wizard to run its own floor parser over. A region nothing plausible could be
+    read from comes back with an empty `text` and an empty `lines`: read, found nothing.
+
+    POST {"region": {"x","y","w","h"},                     (0..1, the default)
+          "items": [{"folder", "stem", "path", "page"?, "region"?}]}
+    → {"ok": true, "results": [{"folder", "stem", "text", "confidence",
+                                "lines": [{"text", "confidence", "min_p", "y"}]}]}"""
+
+    def post(self, request):
         try:
-            facility = _facility(request)
-        except ValueError:
-            return HttpResponseBadRequest('invalid facility')
-        path = work_dir(facility) / MANIFEST_NAME
+            data = json.loads(request.body or b'{}')
+        except json.JSONDecodeError:
+            return HttpResponseBadRequest('invalid JSON')
+        region = _valid_region(data.get('region'))
+        if region is None:
+            return HttpResponseBadRequest('region needs numeric x/y/w/h within 0..1')
+        items = data.get('items')
+        if not isinstance(items, list) or not items:
+            return HttpResponseBadRequest('items must be a non-empty list')
+        # Bound the work the same way an import is bounded. This is the cap that matters here:
+        # each item costs a preview render plus a model inference, so an unbounded list would be
+        # an easy way to tie up a worker and the render budget.
+        max_pdfs = cfg('max_pdfs')
+        if len(items) > max_pdfs:
+            return HttpResponseBadRequest('too many drawings to read (limit %d)' % max_pdfs)
+
         try:
-            stat = path.stat()
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            response = JsonResponse(EMPTY_MANIFEST, safe=False)
-            response['Cache-Control'] = 'no-store'
-            return response
-        etag, last_modified = _file_validators(stat)
-        # Per-Site read scoping (SEC-1): filter the buildings to the viewer's viewable Sites so a
-        # user whose object permissions hide a Site never even learns that building exists. The
-        # viewable set folds into the ETag so a permission change busts the user's own 304. Off by
-        # default (`viewable is None`) → the manifest is served whole, exactly as before.
-        viewable = _viewable_site_slugs(request, facility)
-        if viewable is not None:
-            data = _scope_manifest(data, viewable)
-            etag = _scope_etag(etag, viewable)
-        not_modified = get_conditional_response(request, etag=etag, last_modified=last_modified)
-        if not_modified is not None:
-            not_modified['ETag'] = etag
-            return not_modified
-        response = JsonResponse(data, safe=False)
-        response['ETag'] = etag
-        response['Last-Modified'] = http_date(last_modified)
-        response['Cache-Control'] = 'private, no-cache'
-        return response
-
-
-class MediaView(MapReadAccessMixin, View):
-    """Stream a rendered image / thumbnail / uploaded PDF from the working dir. Read-gated
-    (`MapReadAccessMixin`) + traversal-guarded + confined to the `images`/`uploads` subtrees, so
-    floor plans are not exposed at a guessable public URL. The view-perm gate is *additive* — the
-    traversal guard, `SERVE_ROOTS` confinement, and `private` caching below all still apply.
-
-    Caching is always **private** (the images are deliberately authenticated — never let a
-    shared cache store them). Requests carrying the manifest's `?v=<built>` token cache
-    immutably for a year — a rebuild writes a new token into the manifest, so stale entries
-    are simply never requested again. Unversioned requests (wizard thumbnails, uploads)
-    revalidate via ETag/Last-Modified and cost a 304 when unchanged.
-
-    The bytes stream from this worker via `FileResponse` by default; with the `x_accel_redirect`
-    setting on, `_serve_file` offloads the transfer to nginx (see `_serve_file`). The auth +
-    traversal + serve-root gate below runs first either way, and the validators/Cache-Control
-    are set here in both modes — so revalidation stays worker-authoritative regardless of nginx."""
-
-    def get(self, request, path):
-        try:
-            facility = _facility(request)
-            full = safe_path(path, facility)
-            parts = full.relative_to(work_dir(facility).resolve()).parts
+            facility = request_facility(request)
         except ValueError:
             raise Http404
-        if not parts or parts[0] not in SERVE_ROOTS or not full.is_file():
-            raise Http404
-        # Per-Site read scoping (SEC-1): a floor plan lives at `images/<siteSlug>/…`, so gate that
-        # segment on the viewer's viewable Sites — a hidden Site's pixels 404 (not 403: don't reveal
-        # the file exists). The campus siteplan (`images/Siteplan/…`) is a facility-wide asset, shown
-        # when the user may view any Site and hidden when none. `uploads/` is import-only (importers
-        # hold IMPORT_PERM and legitimately see every source), so it stays on the flat gate. This
-        # runs BEFORE `_serve_file`, so the x_accel offload never hands nginx an out-of-scope path.
-        viewable = _viewable_site_slugs(request, facility)
-        if viewable is not None and parts[0] == 'images':
-            seg = parts[1] if len(parts) > 1 else None
-            allowed = bool(viewable) if seg == SITEPLAN_DIRNAME else (seg in viewable)
-            if not allowed:
-                raise Http404
-        etag, last_modified = _file_validators(full.stat())
-        not_modified = get_conditional_response(request, etag=etag, last_modified=last_modified)
-        if not_modified is not None:
-            not_modified['ETag'] = etag
-            return not_modified
-        response = _serve_file(full, parts, facility)
-        response['ETag'] = etag
-        response['Last-Modified'] = http_date(last_modified)
-        response['Cache-Control'] = ('private, max-age=31536000, immutable'
-                                     if 'v' in request.GET else 'private, no-cache')
-        return response
+        runner = RenderRunner(facility)
+        images = []
+        for item in items:
+            if not isinstance(item, dict):
+                return HttpResponseBadRequest('each item must be an object')
+            rel = (item.get('path') or '').lstrip('/')
+            if not rel.lower().endswith(DRAWING_EXTS):
+                return HttpResponseBadRequest('an accepted drawing path is required')
+            try:
+                page = max(0, int(item.get('page') or 1) - 1)
+            except (TypeError, ValueError):
+                page = 0
+            # `ensure_preview` is the traversal guard as well as the renderer. It rejects a path in
+            # two different ways — `safe_path` raises **ValueError** when the path escapes the
+            # working dir, and `ensure_preview` itself raises **Http404** when it lands outside
+            # `uploads/` or names no file — so both must be caught, or a crafted `path` would 500
+            # instead of 400.
+            try:
+                cache_rel = runner.ensure_preview(rel, page=page)
+            except (Http404, ValueError):
+                return HttpResponseBadRequest('unknown drawing: %s' % rel)
+            if not cache_rel:
+                continue        # this drawing's render failed — skip it, don't sink the batch
+            entry = {'folder': item.get('folder'), 'stem': item.get('stem'), 'image': cache_rel}
+            own = _valid_region(item.get('region'))
+            if own:
+                entry['region'] = own
+            images.append(entry)
+        if not images:
+            return JsonResponse({'ok': False, 'error': 'nothing could be read'}, status=400)
+
+        base = work_dir(facility)
+        base.mkdir(parents=True, exist_ok=True)
+        job_name = 'ocr-job-%s.json' % secrets.token_hex(8)
+        (base / job_name).write_text(
+            json.dumps({'region': region, 'images': images}), encoding='utf-8')
+        try:
+            result = runner.run_ocr(job_name)
+        finally:
+            (base / job_name).unlink(missing_ok=True)
+        return JsonResponse(result, status=200 if result.get('ok') else 500)

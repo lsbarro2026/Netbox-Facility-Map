@@ -85,6 +85,48 @@ def test_fk_covered_floor_key_not_flagged_after_rename():
     assert health.run_checks().unresolved_floor_keys == []
 
 
+def test_fk_covered_key_is_still_flagged_when_its_site_segment_died():
+    # HEALTH-11: the FK covers only the FLOOR segment. When the key's *Site* segment no longer names a
+    # live Site, `SiteFloors` (which matches the manifest on `siteSlug == site.slug`) drops the whole
+    # floor-picker panel — damage no per-room FK compensates for — so the key must still be reported.
+    from dcim.models import Location, Site
+    site = Site.objects.create(name='Renamed', slug='new-site-slug')
+    floor = Location.objects.create(name='Floor 1', slug='floor-1', site=site)
+    Room.objects.create(floor_key='old-site-slug/floor-1', room_id='r1', floor_location=floor)
+
+    rows = {r.floor_key: r for r in health.run_checks().unresolved_floor_keys}
+    assert 'old-site-slug/floor-1' in rows
+    assert rows['old-site-slug/floor-1'].reason == 'no such site'
+
+
+def test_fk_covered_key_is_still_flagged_when_its_building_segment_died():
+    # The 3-segment counterpart: `BuildingFloors` matches on `(siteSlug, buildingSlug)`, so a dead
+    # building anchor kills that picker the same way — flag it even though the rooms stay FK-bound.
+    from dcim.models import Location, Site
+    campus = Site.objects.create(name='Campus', slug='campus')
+    building = Location.objects.create(name='Alpha', slug='new-bldg-slug', site=campus)
+    floor = Location.objects.create(name='Level 1', slug='level-1', site=campus, parent=building)
+    Room.objects.create(floor_key='campus/old-bldg-slug/level-1', room_id='r1', floor_location=floor)
+
+    rows = {r.floor_key: r for r in health.run_checks().unresolved_floor_keys}
+    assert 'campus/old-bldg-slug/level-1' in rows
+    assert rows['campus/old-bldg-slug/level-1'].reason == 'no building Location under site'
+
+
+def test_fk_covered_key_with_only_floor_segment_drift_stays_unflagged():
+    # The complement that keeps the BIND-1 suppression meaningful: both anchor segments are live and
+    # only the floor segment drifted. Both pickers still render (a card's link goes dead, no more), so
+    # this stays covered by the FK and unreported.
+    from dcim.models import Location, Site
+    campus = Site.objects.create(name='Campus', slug='campus')
+    building = Location.objects.create(name='Alpha', slug='alpha-bldg', site=campus)
+    floor = Location.objects.create(name='Level 1', slug='level-1-renamed', site=campus,
+                                    parent=building)
+    Room.objects.create(floor_key='campus/alpha-bldg/level-1', room_id='r1', floor_location=floor)
+
+    assert health.run_checks().unresolved_floor_keys == []
+
+
 def test_unresolved_floor_key_from_manifest_only(workdir):
     # A manifest floor with no matching Location and no rooms — surfaced with room_count 0.
     _write_manifest(workdir, 'test-site', 'orphan-floor')
@@ -120,7 +162,9 @@ def test_three_segment_manifest_key_wrong_building_is_flagged(workdir):
 
     rows = {r.floor_key: r for r in health.run_checks().unresolved_floor_keys}
     assert 'campus/alpha-bldg/level-1' in rows
-    assert rows['campus/alpha-bldg/level-1'].reason == 'no floor Location under site'
+    # The building segment is what's missing here, and the reason says so (HEALTH-11) — 'no floor
+    # Location under site' would misdirect an operator to look for the floor.
+    assert rows['campus/alpha-bldg/level-1'].reason == 'no building Location under site'
 
 
 def test_empty_floor_remapped_on_rename_is_not_flagged(workdir, django_capture_on_commit_callbacks):
@@ -239,6 +283,23 @@ def test_unbound_rooms():
     assert rows[0].label == 'Unbound'
 
 
+def test_unbound_room_is_reported_but_is_not_drift():
+    # DOC-12: a draw-only room is a supported state, not a fault. It must still be *reported* (an
+    # operator wants to see them, and a deleted Location lands here too), but it must not set
+    # `has_drift` — otherwise an install that deliberately doesn't model a Location per room reads
+    # as permanently unhealthy and its `facilitymap_check` cron alerts forever.
+    # The floor key resolves, so an unbound room is the report's ONLY finding.
+    _site_floor()
+    Room.objects.create(floor_key='test-site/floor-1', room_id='r1', label='Draw only', location=None)
+
+    report = health.run_checks()
+    assert len(report.unbound_rooms) == 1
+    assert report.unresolved_floor_keys == []
+    assert report.stale_placements == []
+    assert report.orphaned_facilities == []
+    assert not report.has_drift
+
+
 def test_stale_placement_flagged_when_object_gone():
     from dcim.models import Manufacturer, Rack, RackType
     site, _ = _site_floor()
@@ -323,9 +384,71 @@ def test_command_exit_zero_when_clean():
     call_command('facilitymap_check')  # does not raise
 
 
-def test_command_exit_one_on_drift():
+def test_command_exit_one_on_drift(capsys):
     from django.core.management import call_command
+    # This room is unbound AND sits on an unresolvable floor key. Since DOC-12 only the latter is
+    # drift, so assert the exit is driven by the floor key — otherwise this test would keep passing
+    # for the wrong reason if the unbound-room demotion were ever reverted.
     Room.objects.create(floor_key='gone-site/floor-x', room_id='r1', location=None)
     with pytest.raises(SystemExit) as exc:
         call_command('facilitymap_check')
     assert exc.value.code == 1
+    out = capsys.readouterr()
+    assert 'Unresolved floor keys' in out.out
+    assert '1 issue(s) found.' in out.err   # the draw-only room is NOT counted
+
+
+def test_command_exits_zero_when_only_draw_only_rooms(capsys):
+    # DOC-12: the whole point of the demotion — a draw-only install must exit 0 so a cron job
+    # doesn't alert forever, while still *printing* the rooms so the operator can see them.
+    from django.core.management import call_command
+    _site_floor()
+    Room.objects.create(floor_key='test-site/floor-1', room_id='r1', label='Draw only', location=None)
+
+    call_command('facilitymap_check')   # must not raise SystemExit
+    out = capsys.readouterr()
+    assert 'Draw-only rooms' in out.out
+    assert 'Draw only' in out.out
+    assert 'No consistency issues found.' in out.out
+
+
+def test_command_reports_orphaned_facilities(capsys):
+    # HEALTH-11: `has_drift` counts orphaned facilities, so the command must PRINT them too. It used
+    # to report only the other three classes — an install whose sole drift was an orphaned facility
+    # got three green OK lines, "0 issue(s) found." and a bare exit 1, with nothing to act on.
+    from django.core.management import call_command
+    from dcim.models import Site, SiteGroup
+    west = SiteGroup.objects.create(name='West', slug='west')
+    Site.objects.create(name='A', slug='a', group=west)
+    FacilityMapBlob.objects.create(kind='annotations', key='a/floor-1', facility='', data={})
+
+    with pytest.raises(SystemExit) as exc:
+        call_command('facilitymap_check')
+    assert exc.value.code == 1
+    out = capsys.readouterr()
+    assert 'Orphaned facilities' in out.out
+    assert 'annotations' in out.out
+    assert 'reassign to west' in out.out
+    assert '1 issue(s) found.' in out.err   # counted, not just flagged
+
+
+# --- orphan detection under the `location` grouping (MODEL-8) ------------------------------------
+
+def test_location_facility_data_not_orphaned_while_its_root_lives():
+    from dcim.models import Location, Site
+
+    FacilityMapBlob.objects.update_or_create(
+        kind='settings', facility='', key='', defaults={'data': {'facility_grouping': 'location'}})
+    site = Site.objects.create(name='Campus', slug='campus')
+    root = Location.objects.create(name='Building A', slug='bldg-a', site=site)
+    Location.objects.create(name='A L1', slug='a-l1', site=site, parent=root)
+    FacilityMapBlob.objects.create(kind='annotations', facility='bldg-a',
+                                   key='campus/bldg-a/a-l1', data={})
+
+    assert health.run_checks().orphaned_facilities == []
+
+    # Deleting the root (the org edit the mode is sensitive to) strands the facility's data —
+    # the HEALTH-1 detector must flag it so the reassignment surface can recover it.
+    root.delete()
+    report = health.run_checks()
+    assert [o.facility for o in report.orphaned_facilities] == ['bldg-a']
