@@ -512,7 +512,7 @@ def _seed_two_building_manifest(workdir):
 def _site_scoped_user(name, slugs):
     from dcim.models import Site
     from utilities.testing import create_test_user
-    from tests.conftest import grant
+    from conftest import grant
 
     user = create_test_user(name)
     grant(user, Site, ['view'], constraints={'slug__in': list(slugs)})

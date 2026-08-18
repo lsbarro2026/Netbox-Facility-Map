@@ -71,8 +71,8 @@ dependencies = [
 # Visio (`.vsdx/.vsd`) is NOT a pip extra: it needs the external LibreOffice `soffice` binary on
 # PATH (e.g. `apt install libreoffice`), gated the same way at runtime.
 # `dev` is the test runner: `pip install -e '.[dev]'` into the NetBox venv; the tests hook NetBox's
-# Django settings via pytest-django (see the [tool.pytest.ini_options] block and README
-# "Running the tests"). Not needed at runtime.
+# Django settings via pytest-django (see the [tool.pytest.ini_options] block below). Not needed at
+# runtime.
 [project.optional-dependencies]
 svg = [
     "cairosvg>=2.5.0",
@@ -116,7 +116,8 @@ netbox_facilitymap = ["templates/**/*", "static/**/*", "models/*.onnx", "models/
 # `tests/` is a sibling of the package (not under netbox_facilitymap*), so the packages-find
 # above already excludes it from the wheel. `DJANGO_SETTINGS_MODULE` names NetBox's settings;
 # the machine-specific PYTHONPATH pointing at the NetBox source tree is passed on the CLI, not
-# committed here (see README "Running the tests").
+# committed here — e.g. `PYTHONPATH=/path/to/netbox/netbox pytest --reuse-db`, run from `tests/`
+# after `pip install -e '.[dev]'`.
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "netbox.settings"
 testpaths = ["tests"]

@@ -21,16 +21,14 @@ from dcim.models import DeviceRole
 
 from ..access import IMPORT_PERM
 from ..facilities import clamp_default_facility, set_org_mode
-from ..previews import (
-    clamp_ap_count_scope, clamp_ap_device_role, clamp_floor_label_field, clean_ap_name_template,
-)
+from ..previews import clamp_floor_label_field, clean_device_presets
 from .blobs import merge_settings
 from .common import _parse_json_body
 
 
 class _SettingView(LoginRequiredMixin, View):
     """Shared base for the small install-wide settings endpoints — inline room creation (SET-5),
-    the three access-point ones (DEV-3), and `render_hq` (READ-1).
+    the device-placement tool pair (DEV-3/DEV-8), and `render_hq` (READ-1).
 
     Each is admin-tier configuration merged into the single install-wide (`facility=''`, MULTI-1)
     `settings` blob beside `write_mode`/`default_facility`/`floor_label_field`/`facility_grouping`/
@@ -121,7 +119,7 @@ class WriteModeSettingView(_SettingView):
     Write mode is the runtime, admin-controlled replacement for the old redeploy-time
     `allow_location_create` `PLUGINS_CONFIG` flag. Since SET-5 it is a **pure master gate**: it says
     whether this install may write to NetBox core at all, and each write add-on carries its own switch
-    on top (`inline_room_creation`, `ap_tool`). Stored as the `write_mode` boolean in the single
+    on top (`inline_room_creation`, `device_tool`). Stored as the `write_mode` boolean in the single
     install-wide (`facility=''`, MULTI-1) `settings` blob beside `default_facility`/
     `floor_label_field`/`room_embed_*`, merged so those sibling keys survive — see `_SettingView`. It
     carries no `?facility=` — the setting is install-wide, living only in the default-facility
@@ -130,7 +128,7 @@ class WriteModeSettingView(_SettingView):
     Turning it **off leaves every add-on's stored value untouched** — they simply go inert behind the
     closed gate, and come back as they were when it reopens. That's why this endpoint never cascades
     into the add-on keys: an operator closing the gate for an afternoon shouldn't have to reconfigure
-    the AP tool afterwards.
+    the device tool afterwards.
 
     This toggle is only an *install-wide* gate; `NbLocationCreateView` still enforces the per-user
     `dcim.add_location` object permission server-side, so flipping write mode on does not grant anyone
@@ -142,14 +140,17 @@ class WriteModeSettingView(_SettingView):
         return {'write_mode': bool(payload.get('write_mode'))}
 
 
-class ApToolSettingView(_SettingView):
-    """POST the install-wide `ap_tool` on/off setting from the in-app Settings page (DEV-3).
+class DeviceToolSettingView(_SettingView):
+    """POST the install-wide `device_tool` on/off setting from the in-app Settings page (DEV-3,
+    generalized by DEV-8 from the old `ap_tool` key — which stays readable for back-compat but is
+    never written again; see `PluginSettings.device_tool`).
 
-    The access-point tool's own feature switch, stored **separately from write mode** by design: it
-    answers "is this feature in play?", where write mode answers "may this install write to NetBox at
-    all?" (the same master-gate-plus-feature-switch pair `inline_room_creation` follows, SET-5).
-    Creating an AP needs both gates plus `dcim.add_device`, all re-checked server-side (DEV-5) — so
-    switching this on grants nobody the ability to create who couldn't already.
+    The device-placement tool's own feature switch, stored **separately from write mode** by
+    design: it answers "is this feature in play?", where write mode answers "may this install
+    write to NetBox at all?" (the same master-gate-plus-feature-switch pair
+    `inline_room_creation` follows, SET-5). Creating a device needs both gates plus
+    `dcim.add_device`, all re-checked server-side (DEV-5) — so switching this on grants nobody
+    the ability to create who couldn't already.
 
     The endpoint accepts a flip either way regardless of write-mode state, deliberately: it is the
     Settings *page* that keeps this in step with the gate (the row is disabled while write mode is
@@ -157,7 +158,7 @@ class ApToolSettingView(_SettingView):
     write path doesn't need, and would strand a value an operator had already stored."""
 
     def values(self, payload, request):
-        return {'ap_tool': bool(payload.get('ap_tool'))}
+        return {'device_tool': bool(payload.get('device_tool'))}
 
 
 class TodosSettingView(_SettingView):
@@ -249,41 +250,32 @@ class OrgModeSettingView(LoginRequiredMixin, View):
         return JsonResponse({'ok': True, 'org_modes': saved})
 
 
-class ApDeviceRoleSettingView(_SettingView):
-    """POST the install-wide `ap_device_role` setting from the in-app Settings page (DEV-3).
+class DevicePresetsSettingView(_SettingView):
+    """POST the install-wide `device_presets` list from the in-app Settings page (DEV-8).
 
-    Which `dcim.DeviceRole` new access points are created with. Stored as the role's numeric id (or
-    `None` to clear it, leaving the tool unconfigured and hidden). A non-null id must resolve to a
-    role the *saving operator* can see (`restrict(user, 'view')`) — a bogus or hidden id is a clean
-    400 rather than a silently-stored dangling reference that would only surface much later, as a
-    500 from the Device-create path."""
+    The device-type presets the Add-device tool offers — the whole list at once, replacing the old
+    per-value `ap_device_role`/`ap_naming` endpoints: create, edit, delete, and reorder are all
+    "send the new list", so there is exactly one write path and the stored order IS the toolbar
+    order. Validation is `previews.clean_device_presets` — label/icon/template/fields/key rules,
+    the preset cap, and server-side key assignment for new entries (a preset's key is what
+    placements and per-preset browser state reference, so it must be minted once and never change).
 
-    def values(self, payload, request):
-        raw = payload.get('ap_device_role')
-        if raw in (None, ''):
-            return {'ap_device_role': None}
-        role = clamp_ap_device_role(raw)
-        if role is None:
-            raise ValueError('device role must be a numeric id')
-        if not DeviceRole.objects.restrict(request.user, 'view').filter(pk=role).exists():
-            raise ValueError('device role not found')
-        return {'ap_device_role': role}
+    This view adds the one check the validator can't make: each non-null `device_role` must
+    resolve to a role the *saving operator* can see (`restrict(user, 'view')`) — a bogus or hidden
+    id is a clean 400 rather than a silently-stored dangling reference that would only surface
+    much later, as a mystery 400 from the Device-create path. A preset with a **null** role is
+    storable (an admin mid-configuration); the toolbar skips it and the write paths refuse it.
 
-
-class ApNamingSettingView(_SettingView):
-    """POST the install-wide `ap_name_template` + `ap_count_scope` settings from the in-app Settings
-    page (DEV-3).
-
-    One endpoint for both because they are one Settings *row* — a free-text template plus the count
-    dropdown to its right — and a template is only meaningful alongside the counter scope that
-    suffixes it. The template accepts only the `{room}`/`{role_short}` placeholders; anything else is
-    a 400 from `clean_ap_name_template` (a typo'd `{rack}` must not slip through as a literal and
-    quietly land in every device name). The scope is enum-clamped like the other string settings. The
-    counter itself is appended by the name-suggestion logic (DEV-5), never typed into the template —
-    which is why there is no `{count}` placeholder."""
+    The POST returns the stored list (`_SettingView` echoes the merged values), so the page adopts
+    the server's canonical form — assigned keys, clamped fields — rather than its own draft."""
 
     def values(self, payload, request):
-        return {
-            'ap_name_template': clean_ap_name_template(payload.get('ap_name_template')),
-            'ap_count_scope': clamp_ap_count_scope(payload.get('ap_count_scope')),
-        }
+        presets = clean_device_presets(payload.get('device_presets'))
+        role_ids = {p['device_role'] for p in presets if p['device_role'] is not None}
+        if role_ids:
+            visible = set(DeviceRole.objects.restrict(request.user, 'view')
+                          .filter(pk__in=role_ids).values_list('pk', flat=True))
+            missing = role_ids - visible
+            if missing:
+                raise ValueError('device role not found')
+        return {'device_presets': presets}

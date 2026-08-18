@@ -44,7 +44,7 @@ class Editor {
     this.dragItem = null;          // { move(nx,ny) } while dragging a free point (e.g. a rack marker)
     this.dragEdge = null;          // { move(nx,ny,ev) } while dragging a whole polygon edge (both endpoints)
     this.dragSheet = null;         // { move(nx,ny), drop() } while dragging a whole sheet (Arrange mode)
-    this.pan = null;               // { x, y, moved, btn } while panning the viewport
+    this.pan = null;               // { x, y, moved, btn, grab?, forced? } while panning the viewport
     this.initialFocus = null;      // [nx0,ny0,nx1,ny1] to frame on first mount, else full fit
     this.rectMode = false;         // rectangle draw tool armed: drag a box instead of clicking points
     this.rectDraft = null;         // { a:[nx,ny], b:[nx,ny] } while dragging out a rectangle
@@ -98,11 +98,84 @@ class Editor {
   _addShape(poly, msg) {
     this.snapshot();
     const shape = this._newShape(poly);
+    // Settle the stacking order before anything reads the array — the render, the panel's layering
+    // readout and `_afterShapeAdded` all see the final position, never the appended-on-top one.
+    const contained = this._placeNewShape(shape);
     this.draft = null; this.selected = shape.id; this.markDirty();
     this._afterShapeAdded();
     this.render(); this._openShapePanel(shape);
-    if (msg) Toast.show(msg);
+    // There is one shared `#toast`, so a placement notice and a caller's `msg` can't both show. The
+    // placement wins: it reports a decision the user didn't ask for and can't otherwise see, whereas
+    // `msg` (only Duplicate passes one) restates something they just did.
+    if (contained) this._placedToast(shape, contained);
+    else if (msg) Toast.show(msg);
     return shape;
+  }
+
+  /** Where a shape at index `i` belongs once `inside` — the ascending indices of the shapes it
+   *  fully contains, from `Geom.containedIndices` — is known (ROOM-8). Answers an index into the
+   *  same array, or `i` when it shouldn't move (contains nothing, or already sits below everything
+   *  it contains).
+   *
+   *  `inside[0]` is the lowest shape it contains, and inserting there puts it below **every** one of
+   *  them: the others all sit at higher indices and the remove-then-insert splice pair shifts them
+   *  up as a block. It is also the *highest* index that achieves that, so this is the minimal move —
+   *  a linear z-order cannot also keep the shape above non-contained shapes interleaved further up,
+   *  and dropping it lower than needed would bury it under more of them than necessary.
+   *
+   *  Pure, and split out of `_placeNewShape` below for the reason `_movedIndex` is — one wrong
+   *  comparison silently stacks a new room the wrong way round, and the JS unit tier can pin the
+   *  arithmetic without a constructed editor. */
+  static _placedIndex(inside, i) {
+    return inside.length && inside[0] < i ? inside[0] : i;
+  }
+
+  /** Drop a just-created shape below every shape it fully contains (ROOM-8), and report how many
+   *  those are (0 = left where it was, which is the common case).
+   *
+   *  `_newShape` appends, and array order IS the z-order, so a shape drawn *around* existing ones
+   *  lands on top of them — where it paints over them, takes every click in their area (painting
+   *  order is hit order) and silently drops their punch-out, whose `j > i` gate only fires for a
+   *  child drawn above its container. None of that is a stacking choice anyone would make on
+   *  purpose, so the create path undoes it; `_addShape` then says so, reversibly.
+   *
+   *  Containment only, never partial overlap: two shapes that merely cross have no correct order,
+   *  and "drawn last is on top" is the right default there.
+   *
+   *  Deliberately NOT `reorderShape` — this runs INSIDE `_addShape`, between the create's own
+   *  `snapshot()` and its `render()`. Folding it into that one step is what makes Ctrl+Z remove the
+   *  shape outright instead of first restoring it to a position it never visibly occupied, and it
+   *  saves a second render of a shape that hasn't been drawn yet. Reads the array through
+   *  `_shapeList()`/`_shapePoly`, so rooms and siteplan hotspots get identical behaviour off one
+   *  implementation (§10 *Edit-menu lockstep*); an editor without layering (`_shapeList()` → null)
+   *  opts out along with everything else. */
+  _placeNewShape(shape) {
+    const arr = this._shapeList();
+    if (!arr) return 0;
+    const i = arr.indexOf(shape);
+    if (i < 0) return 0;
+    const inside = Geom.containedIndices(arr.map(s => this._shapePoly(s) || []), i);
+    const to = Editor._placedIndex(inside, i);
+    if (to === i) return 0;
+    arr.splice(i, 1);
+    arr.splice(to, 0, shape);
+    return inside.length;
+  }
+
+  /** Explain an automatic placement and offer the one-click reverse (ROOM-8) — the `_deleteToast`
+   *  shape (UX-17): the map moved something on the user's behalf, so say so and leave the decision
+   *  theirs.
+   *
+   *  'front' is the honest inverse: the placement's whole effect was to put this shape below the
+   *  ones it covers, and 'front' is the top of exactly that overlap group (every contained shape
+   *  overlaps it, ROOM-5). Routed through `_reorderShapeFromPanel` rather than `reorderShape` so the
+   *  panel opened by the create refreshes its "Layer N of M" — the reorder's only immediate feedback
+   *  while the shape is selected and therefore promoted to the active layer (§10). Reusing the
+   *  engine also means a shape deleted while the toast was still up just no-ops. */
+  _placedToast(shape, n) {
+    const { noun } = this._shapeTerms();
+    Toast.action(`Sent behind the ${n} ${noun}${n > 1 ? 's' : ''} it contains, so they stay clickable`,
+      'Keep on top', () => this._reorderShapeFromPanel(shape, 'front'));
   }
 
   /** Close the current polygon draft into a shape. A draft too short to be an area is
@@ -112,6 +185,93 @@ class Editor {
     const dp = this.draft.points;
     if (dp.length < 3) { this.draft = null; this.render(); return; }
     this._addShape(dp.slice());
+  }
+
+  /** Where the shape at index `i` lands under a CAD/Illustrator layering action (ROOM-4), scoped to
+   *  an overlap group (ROOM-5). `group` is the ascending list of indices the action may move among
+   *  — the selected shape's overlap group, from `_overlapGroup` below — and the answer is an index
+   *  into the SAME whole array, namely the target group member's own slot. So 'up' lands one step
+   *  above the next shape this one actually overlaps, hopping any non-overlapping shapes
+   *  interleaved between them, rather than swapping past a shape it can never occlude. Passing
+   *  every index makes it the plain whole-array arithmetic it was before.
+   *
+   *  Pure — the whole arithmetic of `reorderShape` below, split out so it can be pinned by the JS
+   *  unit tier without a constructed editor. `where` is 'front' | 'back' | 'up' | 'down'; the list
+   *  is bottom→top, so 'front' is the group's LAST member (painted last, therefore on top).
+   *  Returns `i` unchanged when the move isn't available — already at that end of its group, a
+   *  group of one, or an `i` outside the group — which is exactly what `reorderShape` reads as
+   *  "nothing moved".
+   *
+   *  Returning the member's own slot is right in BOTH directions because of the remove-then-insert
+   *  splice pair below: inserting at a HIGHER index lands the shape just above that member (the
+   *  removal has already shifted it down one), and at a LOWER one just below it. */
+  static _movedIndex(group, i, where) {
+    const r = group.indexOf(i);
+    if (r < 0) return i;
+    if (where === 'front') return group[group.length - 1];
+    if (where === 'back') return group[0];
+    if (where === 'up') return r + 1 < group.length ? group[r + 1] : i;
+    return r > 0 ? group[r - 1] : i;   // 'down'
+  }
+
+  /** The **live, stored** array a subclass's shapes live in, in stacking order (bottom→top) — the
+   *  seam the layering actions below splice. `null` (the default) means this editor doesn't offer
+   *  layering, and `layerButtons`/`reorderShape` no-op accordingly.
+   *
+   *  Deliberately NOT `polys()`: that one is the *snapping* accessor and a subclass is free to
+   *  return freshly-built `{id, polygon}` projections from it (`SiteplanEditor` does), which would
+   *  make a splice mutate a throwaway array and silently do nothing. This seam's contract is the
+   *  opposite — return the real array, or `null`. */
+  _shapeList() { return null; }
+
+  /** The overlap group of `arr[i]` — the ascending indices of the shapes it geometrically overlaps,
+   *  plus its own (ROOM-5). Both the layering row's readout and `reorderShape` scope to this, so
+   *  "Layer 2 of 3" and a Back/Down/Up/Front click always speak about the same three shapes.
+   *
+   *  Lives on the base and reads geometry through the `_shapePoly` seam, which is what makes one
+   *  implementation serve rooms (`polygon`) and siteplan hotspots (`poly`) alike (§10 *Edit-menu
+   *  lockstep*). Recomputed per call rather than cached: a vertex drag changes the answer, and the
+   *  two callers each run once per user action, never per frame. */
+  _overlapGroup(arr, i) {
+    return Geom.overlapGroup(arr.map(s => this._shapePoly(s) || []), i);
+  }
+
+  /** Restack one shape within `_shapeList()` — the shared bring-to-front / send-to-back / raise /
+   *  lower engine (ROOM-4). The array order IS the z-order: `_renderStatic` paints it in order and
+   *  SVG painting order is also hit order, so moving the element moves both what the user sees on
+   *  top and what receives the click. Nothing else needs to know.
+   *
+   *  The array stays the one global z-order, but the MOVE is scoped to the shape's overlap group
+   *  (ROOM-5): the four actions step it past the shapes it actually covers, hopping any
+   *  non-overlapping shapes lying between them, and a shape that overlaps nothing can't move at
+   *  all. Layering it against a shape it can never occlude would be a change with no meaning.
+   *
+   *  Follows the standard mutate pattern (`snapshot()` first, then `markDirty()` + `render()`,
+   *  mirroring FloorEditor.deleteRoom), so Ctrl+Z covers a layering change like any other edit —
+   *  the subclass snapshots its whole shape array, so the restored order comes back with it.
+   *  Returns whether anything actually moved, so a caller can skip a misleading toast. */
+  reorderShape(shape, where) {
+    const arr = this._shapeList();
+    if (!arr) return false;
+    const i = arr.indexOf(shape);
+    if (i < 0) return false;
+    const to = Editor._movedIndex(this._overlapGroup(arr, i), i, where);
+    if (to === i) return false;
+    this.snapshot();
+    arr.splice(i, 1);
+    arr.splice(to, 0, shape);
+    this.markDirty();
+    this.render();
+    return true;
+  }
+
+  /** Reorder from a shape panel's layering row, then re-open that panel so its "Layer N of M"
+   *  readout and its disabled-at-the-extremes buttons reflect the new position — the same
+   *  render-then-reopen idiom the panel's other mutating buttons use (e.g. the room panel's
+   *  Unbind). Skipped when nothing moved, so a click on an already-topmost shape doesn't
+   *  needlessly rebuild the panel. */
+  _reorderShapeFromPanel(shape, where) {
+    if (this.reorderShape(shape, where)) this._openShapePanel(shape);
   }
 
   /** Build off an existing shape: clone its (nudged) polygon as a new, unbound shape. The
@@ -415,6 +575,158 @@ class Editor {
     return nb;
   }
 
+  // ---- shared shape-editing drags (CAD-style) ----
+  // Armed by a subclass's body-press handler on its selected shape (where the vertex/midpoint
+  // circles' stopPropagation has already excluded node presses): `EditorPointer.edgeHit` picks
+  // between them — a press within the grab band of a side drags that whole edge, anything
+  // deeper translates the whole shape. Base implementations so every polygon-shaped editor
+  // (floor rooms, import floor regions) gets the identical interaction (§10 Edit-menu lockstep).
+
+  /** Snap a whole-shape / whole-edge translation *delta* (FLOOR-9). Pure — all the arithmetic of
+   *  `_snapDelta` below, split out so the JS tier can pin it (like `_movedIndex`): an off-by-one in
+   *  the correction, or a lost priority rule, silently moves a room a few px from where it snapped.
+   *
+   *  `pts` are the moving points' PRE-drag normalized positions, `others` the neighbouring polygons
+   *  (the dragged shape already excluded). Returns ONE `[dx, dy]` for all of them — the rigid-body
+   *  contract every caller depends on (no distortion; `_startShapeDrag`'s `onDelta` moves satellite
+   *  geometry by the same offset). What changes is only how that single delta is *chosen*, and it
+   *  mirrors `snapPoint`'s priority so a body drag snaps like a vertex drag:
+   *
+   *    1. neighbour **vertex** — the nearest moving-point→other-vertex pair within `snapPx` wins;
+   *       its offset corrects the whole delta, so the shape clicks corner-to-corner.
+   *    2. neighbour **edge** — else the nearest projection onto another shape's segment. The
+   *       correction is purely perpendicular, so the shape butts flat against the wall. With the
+   *       grid on, the contact point is then quantized ALONG the wall and re-projected — the same
+   *       idiom `snapPoint` uses, so a wall-snapped shape doesn't slide freely along it.
+   *    3. **grid** — else the delta itself is quantized to a grid multiple (offset 0 — a
+   *       displacement, not a position), so an on-grid shape with no neighbour in reach stays
+   *       on-grid, shifting by a whole number of cells exactly as it always has.
+   *
+   *  `ctx.snapPx` of 0 disables 1+2 (the Snap toggle off, or Alt held); `ctx.grid` of null disables
+   *  3 (the Grid toggle off, or Alt held). Both off returns the raw delta. Distances are measured in
+   *  displayed px — the normalized 0..1 space is non-uniform (iw≠ih), so a raw-normalized radius
+   *  would be an ellipse (§10 coordinates). */
+  static _snappedDelta(pts, dx, dy, others, ctx) {
+    const { W, H, iw, ih, snapPx, grid } = ctx;
+    // Each moving point's candidate position under the raw delta, in displayed px.
+    const cand = pts.map(p => [(p[0] + dx) * W, (p[1] + dy) * H]);
+    if (snapPx > 0) {
+      let best = snapPx, corr = null;
+      for (const [px, py] of cand)
+        for (const poly of others)
+          for (const v of poly) {
+            const d = Math.hypot(px - v[0] * W, py - v[1] * H);
+            if (d < best) { best = d; corr = [v[0] * W - px, v[1] * H - py]; }
+          }
+      if (corr) return [dx + corr[0] / W, dy + corr[1] / H];
+      let beste = snapPx, ecorr = null;
+      for (const [px, py] of cand)
+        for (const poly of others)
+          for (let i = 0; i < poly.length; i++) {
+            const a = poly[i], b = poly[(i + 1) % poly.length];
+            const ax = a[0] * W, ay = a[1] * H, bx = b[0] * W, by = b[1] * H;
+            const pr = Geom.projSeg(px, py, ax, ay, bx, by);
+            if (pr.d >= beste) continue;
+            beste = pr.d;
+            let [qx, qy] = [pr.x, pr.y];
+            // Keep the shape ON the wall but quantize where it sits ALONG the wall: grid-snap the
+            // contact point, then re-project that grid point back onto the winning segment.
+            if (grid) {
+              const g = Geom.projSeg(grid.snap(qx / W * iw, grid.ox) / iw * W,
+                                     grid.snap(qy / H * ih, grid.oy) / ih * H, ax, ay, bx, by);
+              [qx, qy] = [g.x, g.y];
+            }
+            ecorr = [qx - px, qy - py];
+          }
+      if (ecorr) return [dx + ecorr[0] / W, dy + ecorr[1] / H];
+    }
+    if (grid) return [grid.snap(dx * iw, 0) / iw, grid.snap(dy * ih, 0) / ih];
+    return [dx, dy];
+  }
+
+  /** Gather the live context for `_snappedDelta` above and run it. `exclude` is the dragged
+   *  polygon ARRAY, matched by identity rather than by shape id: both body drags are handed the
+   *  very array `polys()` exposes as `.polygon` (floor rooms pass `room.polygon`, import regions
+   *  pass `r.poly`), so identity needs no extra id threaded through the drag signatures — and a
+   *  shape must never snap to itself. `free` (Alt held) drops both snaps at once. Snap radius is
+   *  divided by the zoom scale, like `snapPoint`, so it feels the same at any zoom. */
+  _snapDelta(pts, dx, dy, exclude, free) {
+    if (free) return [dx, dy];
+    const [W, H] = this.dispSize(), [iw, ih] = this.dims;
+    const others = this.polys().filter(r => r.polygon !== exclude).map(r => r.polygon);
+    return Editor._snappedDelta(pts, dx, dy, others, {
+      W, H, iw, ih,
+      snapPx: this.snapOn ? SNAP_PX / this.viewport.scale : 0,
+      grid: this.grid.on ? this.grid : null,
+    });
+  }
+
+  /** Whole-shape translate: press inside the selected shape and drag to move every vertex of
+   *  `poly` by the same delta; drop commits. Rides the shared `dragItem` channel (like the
+   *  label/rack-marker whole-shape drags) rather than a bespoke slot, so it inherits the 4px
+   *  drag threshold (a plain select-click moves nothing and stays clean), the pre-drag undo
+   *  snapshot pushed on `pointerup` only when it moved, and `_suppressClick` on drop — none of
+   *  which needs a change to the base pointer cascade. The translation is a *single delta* applied
+   *  to every vertex, so the shape moves without distortion (each vertex is never snapped
+   *  independently) — but that delta is chosen by `_snapDelta`, which snaps the shape against
+   *  neighbouring shapes' vertices/edges first and only then quantizes to a grid multiple
+   *  (FLOOR-9), so a body drag can re-establish a shared wall the way a vertex drag can. Alt frees
+   *  both snaps. The delta is then clamped so the polygon's
+   *  bounding box stays within [0,1] — clamping each vertex independently would distort the
+   *  shape once one vertex hit an edge. `base` holds the pre-drag vertices so every frame
+   *  translates from the original press, never drifts; the vertices are written back IN PLACE,
+   *  so live references to the polygon array stay valid. `dirty()` marks whatever this editor
+   *  dirties; `onDelta(dx, dy)` (optional) lets a subclass translate satellite geometry by the
+   *  same clamped delta (the floor editor moves the room's rack/device markers with it). */
+  _startShapeDrag(e, poly, dirty, onDelta) {
+    if (e.button !== 0 || this.draft) return;
+    e.stopPropagation();
+    const [gx, gy] = this.evtNorm(e);
+    const base = poly.map(p => [p[0], p[1]]);
+    const b = Geom.bounds(base);
+    this.dragItem = { move: (nx, ny, ev) => {
+      // Raw displacement from the press point, snapped as one rigid offset for the whole shape.
+      let [dx, dy] = this._snapDelta(base, nx - gx, ny - gy, poly, !!(ev && ev.altKey));
+      dx = Math.max(-b.minX, Math.min(1 - b.maxX, dx));   // clamp after snap (safety net at a [0,1] edge)
+      dy = Math.max(-b.minY, Math.min(1 - b.maxY, dy));
+      base.forEach(([x, y], i) => { poly[i] = [+(x + dx).toFixed(5), +(y + dy).toFixed(5)]; });
+      if (onDelta) onDelta(dx, dy);
+      dirty(); this.renderActive();
+    } };
+    this.svg.setPointerCapture(e.pointerId);
+  }
+
+  /** Edge drag ("move a wall"): grab polygon side `i` and drag to translate BOTH its endpoints
+   *  by one delta, resizing the shape while the adjacent edges follow. Rides the shared
+   *  `dragEdge` channel (parallel to dragVertex/dragItem) so it inherits the same threshold /
+   *  undo-snapshot / click-guard behaviour as `_startShapeDrag` above. Like it, ONE delta moves
+   *  both endpoints (each vertex is NOT snapped independently, which would distort the edge) and
+   *  that delta comes from the same `_snapDelta`: the wall snaps onto a neighbouring shape's
+   *  vertex/edge when one is in reach (FLOOR-9 — this is what lets a wall be pushed back flush
+   *  against the room next door), else a near-axis drag rounds the perpendicular delta to 0 and the
+   *  edge stays grid-aligned. The delta is clamped so both moved endpoints
+   *  stay within [0,1]. Alt frees both snaps. `a0`/`b0` hold the pre-drag endpoints so every
+   *  frame translates from the original press and never drifts. */
+  _startEdgeDrag(e, poly, i, dirty) {
+    if (e.button !== 0 || this.draft) return;
+    e.stopPropagation();
+    const n = poly.length, j = (i + 1) % n;
+    const [gx, gy] = this.evtNorm(e);
+    const a0 = poly[i].slice(), b0 = poly[j].slice();
+    const minX = Math.min(a0[0], b0[0]), maxX = Math.max(a0[0], b0[0]);
+    const minY = Math.min(a0[1], b0[1]), maxY = Math.max(a0[1], b0[1]);
+    this.dragEdge = { move: (nx, ny, ev) => {
+      // Only the two grabbed endpoints move, so only they are snap candidates.
+      let [dx, dy] = this._snapDelta([a0, b0], nx - gx, ny - gy, poly, !!(ev && ev.altKey));
+      dx = Math.max(-minX, Math.min(1 - maxX, dx));   // clamp after snap (safety net at a [0,1] edge)
+      dy = Math.max(-minY, Math.min(1 - maxY, dy));
+      poly[i] = [+(a0[0] + dx).toFixed(5), +(a0[1] + dy).toFixed(5)];
+      poly[j] = [+(b0[0] + dx).toFixed(5), +(b0[1] + dy).toFixed(5)];
+      dirty(); this.renderActive();
+    } };
+    this.svg.setPointerCapture(e.pointerId);
+  }
+
   // ---- drawing lifecycle ----
   // `kind` is 'poly' (a closed polygon: rooms, hotspots), 'arrow' (an open
   // polyline: wayfinding routes), or 'note' (a single-point free-standing text
@@ -608,6 +920,15 @@ class Editor {
   // each subclass overrides this with its own rungs and falls through via `super.handleKey(e)`.
   handleKey(e) { this.pointer.handleKey(e); }
 
+  // The keyup companion, for bindings that are *held* rather than pressed (Space = hand tool).
+  // Deliberately not a ladder: no subclass has a held binding of its own, so there is nothing to
+  // override — a subclass that grows one overrides this exactly as it does `handleKey`.
+  handleKeyUp(e) { this.pointer.handleKeyUp(e); }
+
+  /** Release every held-key gesture, because the keyup that would end it will never arrive —
+   *  the window lost focus mid-hold (App wires this to `blur`). */
+  cancelHeldKeys() { this.pointer.cancelHeldKeys(); }
+
   /** Escape's first rung in both editors: leaving label-edit backs out to the shape's OWN panel
    *  rather than dropping the selection, so a label edit is one Escape from the thing it belongs to
    *  and two from nothing. `reopen` re-opens that panel — it runs after `editingLabel` is cleared
@@ -660,7 +981,8 @@ class Editor {
         ['+ / −', 'Zoom in / out'],
         ['0', 'Reset the zoom to fit'],
         ['Scroll', 'Zoom at the pointer'],
-        ['Drag background', 'Pan the map'],
+        ['Drag', 'Pan the map — from anywhere, including over a shape'],
+        ['Space + drag', 'Pan without selecting (hand tool)'],
         ['?', 'Open this list'],
       ] },
       { title: 'Drawing', rows: [

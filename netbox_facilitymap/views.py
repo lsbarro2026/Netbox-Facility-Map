@@ -18,6 +18,7 @@ from django.views import View
 from django.views.generic import TemplateView
 from netbox.plugins import get_plugin_config
 
+from dcim.choices import DeviceStatusChoices
 from dcim.models import DeviceRole
 
 from . import capabilities, facilities, health
@@ -137,32 +138,42 @@ class MapView(MapReadAccessMixin, TemplateView):
         # The to-do feature's install-wide switch (ADDON-4) — a general (non-write) add-on. Mirrored
         # to the browser so the SPA hides the to-do pages, the floor panel, and the compose icon when
         # off; every to-do endpoint re-checks it server-side (frontend_api.TodoFeatureGateMixin), so
-        # this is the UX mirror, like write_mode/ap_tool above.
+        # this is the UX mirror, like write_mode/device_tool above.
         context['todos'] = settings.todos
-        # Access-point tool configuration (DEV-3), mirrored to the browser so the Settings page can
-        # render its current state and the floor editor can decide whether to offer the tool. Every
-        # value is re-read/re-enforced server-side; this is the UX mirror, like `write_mode` above.
-        # `can_create_device` is the per-user half (`dcim.add_device`), the exact analogue of
-        # `can_create_location` — the AP tool's install-wide halves are `ap_tool` AND `write_mode`.
-        ap = settings.ap
-        context['ap_tool'] = ap['enabled']
-        context['ap_name_template'] = ap['name_template']
-        context['ap_count_scope'] = ap['count_scope']
+        # Device-placement tool configuration (DEV-3, generalized into presets by DEV-8), mirrored
+        # to the browser so the Settings page can render its current state and the floor editor can
+        # decide whether to offer the tool. Every value is re-read/re-enforced server-side; this is
+        # the UX mirror, like `write_mode` above. `can_create_device` is the per-user half
+        # (`dcim.add_device`), the exact analogue of `can_create_location` — the tool's
+        # install-wide halves are `device_tool` AND `write_mode`.
+        context['device_tool'] = settings.device_tool
         context['can_create_device'] = self.request.user.has_perm('dcim.add_device')
-        # Resolve the configured role id to {id,name} so the Settings combobox shows its label
-        # without a round-trip. A role that has since been deleted — or that this user may not see —
-        # resolves to None, i.e. "unconfigured": the picker opens empty and the tool stays hidden,
-        # which is the honest reading. `clamp_ap_device_role` deliberately doesn't check existence
-        # (a clamp can't ask the ORM); this is where that question gets answered.
+        # The stored presets — enabled AND disabled, since the settings editor must show both —
+        # each with its role resolved to {id,name} so the editor's combobox and the toolbar's
+        # dropdown need no per-preset round-trip. A role that has since been deleted — or that
+        # this user may not see — resolves to None, i.e. "unconfigured": the preset renders
+        # role-less and the toolbar skips it, which is the honest reading (`clamp_device_role`
+        # deliberately doesn't check existence — a clamp can't ask the ORM; this is where that
+        # question gets answered).
         #
-        # Passed as a dict, NOT pre-serialised with json.dumps + |safe like `capabilities`/
-        # `drawing_exts` above: those are fixed server-side vocabularies, whereas a role name (and
-        # `ap_name_template`) is operator-typed free text. JSON escaping does not escape `/`, so a
-        # name containing `</script>` would break out of the inline <script> block. The template
-        # renders both through `|escapejs`, which is the correct escaping for a JS string context.
-        role = (DeviceRole.objects.restrict(self.request.user, 'view')
-                .filter(pk=ap['device_role']).first() if ap['device_role'] else None)
-        context['ap_device_role'] = {'id': role.pk, 'name': role.name} if role else None
+        # Serialised to JSON here but rendered through `|escapejs` + JSON.parse in the template,
+        # NOT json.dumps + |safe like `capabilities`/`drawing_exts` above: those are fixed
+        # server-side vocabularies, whereas preset labels/templates are operator-typed free text.
+        # JSON escaping does not escape `/`, so a label containing `</script>` would break out of
+        # the inline <script> block; `|escapejs` is the correct escaping for a JS string context.
+        presets = settings.device_presets
+        role_ids = {p['device_role'] for p in presets if p['device_role']}
+        role_names = ({r.pk: r.name for r in DeviceRole.objects.restrict(self.request.user, 'view')
+                       .filter(pk__in=role_ids)} if role_ids else {})
+        context['device_presets_json'] = json.dumps([
+            {**p, 'role': ({'id': p['device_role'], 'name': role_names[p['device_role']]}
+                           if p['device_role'] in role_names else None)}
+            for p in presets])
+        # The dcim.Device status vocabulary, for presets that prompt for status — a fixed NetBox
+        # choice set, but its labels are translatable strings, so it rides the same
+        # escapejs + JSON.parse path as the presets rather than json.dumps + |safe.
+        context['device_statuses_json'] = json.dumps(
+            [[value, str(label)] for value, label in DeviceStatusChoices])
         # Default Location field the import wizard's floor-label picker starts on; the wizard
         # lets the user override it per import without editing PLUGINS_CONFIG.
         context['floor_label_field'] = _floor_label_field(settings)

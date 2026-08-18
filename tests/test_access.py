@@ -152,7 +152,7 @@ def _site_scoped_user(name, slugs):
     layer is what filters them."""
     from dcim.models import Site
     from utilities.testing import create_test_user
-    from tests.conftest import grant
+    from conftest import grant
 
     user = create_test_user(name)
     grant(user, Site, ['view'], constraints={'slug__in': list(slugs)})
@@ -284,7 +284,7 @@ def _room_viewer(name, slugs):
     withheld" assertion would pass vacuously. Granting it unconstrained is what makes the Site scope
     the only thing left doing the filtering."""
     from netbox_facilitymap.models import Room
-    from tests.conftest import grant
+    from conftest import grant
 
     user = _site_scoped_user(name, slugs)
     grant(user, Room, ['view'])
@@ -382,7 +382,7 @@ def test_siteplan_save_preserves_hidden_hotspots(client, workdir, monkeypatch):
     # POSTs back only the hotspots they were shown. Without the server-side merge that would delete
     # every hidden Site's hotspot; with it, `h-b` survives and the editor's own edit still lands.
     from netbox_facilitymap.models import FacilityMapBlob
-    from tests.conftest import grant
+    from conftest import grant
 
     _cfg(monkeypatch, 'scope_reads_to_sites', True)
     _seed_two_building_map(workdir)

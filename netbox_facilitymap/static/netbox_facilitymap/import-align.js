@@ -96,7 +96,7 @@ class ImportAlign {
     // saved arrangement — the same `floorLayout` geometry the map renders), the overlay features,
     // and the control-point pins. Normalized 0..1 coords scale by the layout size, exactly the
     // floor editor's convention, and the <svg> keeps the viewBox aspect so pointer→0..1 mapping
-    // is a plain getBoundingClientRect division (the `ImportRegions._attachAdd` technique).
+    // is a plain getBoundingClientRect division (the `ImportRegions._onBoxDrag` technique).
     const g = w.app.store.floorLayout(building.dir, floor.id);
     const svg = Dom.svg('svg', { viewBox: '0 0 ' + g.W + ' ' + g.H, class: 'imp-align-svg' });
     for (const cell of g.cells)
@@ -205,7 +205,7 @@ class ImportAlign {
    *  feature vertex drops a NEW pin there (src = that vertex's raw coordinate) and immediately
    *  drags its head, so pinning is one gesture — press the layer point, drag to its true spot.
    *  A press on empty plan does nothing (no accidental pins). Coordinates map pointer→0..1 via
-   *  the svg's live `getBoundingClientRect` (the `ImportRegions._attachAdd` technique — the svg
+   *  the svg's live `getBoundingClientRect` (the `ImportRegions._onBoxDrag` technique — the svg
    *  keeps the viewBox aspect, so there is no letterboxing to correct for). */
   _attachDrag(svg, ed) {
     svg.addEventListener('pointerdown', (e) => {

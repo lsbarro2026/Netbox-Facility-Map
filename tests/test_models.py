@@ -105,6 +105,37 @@ def test_migration_0009_backfills_floor_location():
     assert r_bad.floor_location_id is None
 
 
+def test_migration_0015_seeds_z_order_largest_room_first():
+    # ROOM-4 migration: existing rooms are seeded into stacking order by DESCENDING polygon area,
+    # per floor, so the largest sits at the bottom (z 0) and a room nested inside it lands above.
+    # That default is what preserves the ROOM-1/ROOM-2 contained-room punch, which only applies to a
+    # child drawn above its container — left on the uniform `0` default, nested pairs would order
+    # arbitrarily and roughly half of them would lose their punch on upgrade.
+    import importlib
+    from django.apps import apps as global_apps
+
+    big = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]          # area 1.0
+    mid = [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.5]]          # area 0.25
+    small = [[0.1, 0.1], [0.2, 0.1], [0.2, 0.2], [0.1, 0.2]]        # area 0.01
+
+    # Created smallest-first so a pass that merely preserved insertion order would fail.
+    Room.objects.create(floor_key='s/f1', room_id='small', polygon=small)
+    Room.objects.create(floor_key='s/f1', room_id='big', polygon=big)
+    Room.objects.create(floor_key='s/f1', room_id='mid', polygon=mid)
+    # A second floor is seeded independently — z_order is dense *per floor*, not globally.
+    Room.objects.create(floor_key='s/f2', room_id='only', polygon=mid)
+    # A degenerate ring has area 0, so it sorts to the top rather than crashing the shoelace.
+    Room.objects.create(floor_key='s/f2', room_id='line', polygon=[[0.1, 0.1], [0.2, 0.2]])
+
+    mod = importlib.import_module('netbox_facilitymap.migrations.0015_room_z_order')
+    mod.seed_z_order(global_apps, None)
+
+    assert {r.room_id: r.z_order for r in Room.objects.filter(floor_key='s/f1')} == {
+        'big': 0, 'mid': 1, 'small': 2}
+    assert {r.room_id: r.z_order for r in Room.objects.filter(floor_key='s/f2')} == {
+        'only': 0, 'line': 1}
+
+
 def test_migration_0012_shards_editor_blobs_by_floor():
     # CONC-1 migration: each whole-document editor blob (key='') splits into one row per floor
     # (key=floor_key); siteplan/settings are untouched. Reverse recombines into one key='' row.

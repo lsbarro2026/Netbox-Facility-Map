@@ -559,8 +559,9 @@ class ImportOcrSweep {
     }
   }
 
-  /** Fold a landed batch into the map step: the visible building's cards, the build gate, the
-   *  carousel labels, and the strip. The card grid is rebuilt **only when this batch changed it**
+  /** Fold a landed batch into the map step: the visible building's cards, the build gate (which
+   *  carries the overview panel's facility-wide counts with it — `_refreshBuildActions`, BUG-3),
+   *  the carousel labels, and the strip. The card grid is rebuilt **only when this batch changed it**
    *  — re-rendering under the operator every few seconds would be exactly the interruption a
    *  background sweep exists to avoid. A no-op away from the map step (the sweep keeps running;
    *  there is simply nothing of it on screen), which also keeps `_rerenderBuildingSection`'s

@@ -208,9 +208,13 @@ class NetBoxClient {
     return Api.get(`/api/netbox/device-types?q=${encodeURIComponent(q || '')}`);
   }
 
-  /** The name to pre-fill when an AP is dropped in a room (DEV-5) — the configured template
-   *  expanded, plus a `-NN` counter unless the counter is off. Returns { name }. Suggested, not
-   *  reserved: the user may edit it, and nothing holds it between here and the create.
+  /** The name to pre-fill when a preset's device is dropped in a room (DEV-5, per-preset since
+   *  DEV-8) — the preset's template expanded, plus a `-NN` counter unless its counter is off.
+   *  Returns { name }. Suggested, not reserved: the user may edit it, and nothing holds it
+   *  between here and the create.
+   *
+   *  `presetKey` names the stored preset; the server resolves the template, counter scope, and
+   *  role from it — none of those ride the request.
    *
    *  `assetTag` feeds the template's optional `{asset_tag}` placeholder (DEV-6). It is sent only
    *  when non-empty, so a template that doesn't use the token issues exactly the request it always
@@ -219,28 +223,31 @@ class NetBoxClient {
    *  is the server's rule to apply (it drops the token and one adjacent separator), not ours.
    *
    *  Gated server-side like the create below (a name is only useful to someone who could use it),
-   *  so the caller must first check `app.apTool && app.writeMode && app.canCreateDevice &&
-   *  app.apDeviceRole`. Throws (toastable `.message`) on a 400/403 — including when the room
-   *  Location can't be seen or no AP role is configured. */
-  async suggestDeviceName(locationId, assetTag = '') {
+   *  so the caller must first check `app.deviceTool && app.writeMode && app.canCreateDevice` and
+   *  hold an enabled preset with a resolved role. Throws (toastable `.message`) on a 400/403 —
+   *  including when the room Location can't be seen or the preset has no role configured. */
+  async suggestDeviceName(locationId, presetKey, assetTag = '') {
     const tag = (assetTag || '').trim();
     return Api.get(`/api/netbox/devices/suggest-name?location=${encodeURIComponent(locationId)}`
+      + `&preset=${encodeURIComponent(presetKey)}`
       + (tag ? `&asset_tag=${encodeURIComponent(tag)}` : ''));
   }
 
-  /** Create an unracked `dcim.Device` — an access point — in a room Location (DEV-5): the plugin's
-   *  second (and only other) NetBox *write*, alongside `createLocation`. Gated server-side on the
-   *  AP tool + write-mode switches and the `dcim.add_device` permission, so the caller must first
-   *  check the gates; all three are re-checked server-side.
+  /** Create an unracked `dcim.Device` in a room Location through a device-type preset (DEV-5,
+   *  generalized by DEV-8): the plugin's second (and only other) NetBox *write*, alongside
+   *  `createLocation`. Gated server-side on the device tool + write-mode switches and the
+   *  `dcim.add_device` permission, so the caller must first check the gates; all three are
+   *  re-checked server-side.
    *
-   *  Deliberately narrow: `role` is read from the settings blob server-side and never sent, `rack`
-   *  is always null, and `site` comes from the room — so a caller can't point any of them
-   *  elsewhere. `asset_tag` is optional (blank stores as NULL). Resolves to the trimmed new Device
-   *  `{id,name,url,role,device_type}` — the same shape the rack inventory returns, so a marker can
-   *  render it. Throws (toastable `.message`) on a 400 (duplicate name/asset tag, unknown type) or
-   *  a 403. */
-  async createDevice({ location, device_type, name, asset_tag }) {
-    return Api.post('/api/netbox/devices/create', { location, device_type, name, asset_tag });
+   *  Deliberately narrow: `role` is resolved from the stored preset server-side and never sent,
+   *  `rack` is always null, and `site` comes from the room — so a caller can't point any of them
+   *  elsewhere. Of the optional fields (`asset_tag`/`serial`/`description`/`status`) the server
+   *  reads ONLY the ones the preset prompts for; a blank `asset_tag` stores as NULL. Resolves to
+   *  the trimmed new Device `{id,name,url,role,device_type}` — the same shape the rack inventory
+   *  returns, so a marker can render it. Throws (toastable `.message`) on a 400 (duplicate
+   *  name/asset tag, unknown type/preset) or a 403. */
+  async createDevice(body) {
+    return Api.post('/api/netbox/devices/create', body);
   }
 
   /** Facility-wide room/rack/device search for the siteplan wayfinding finder's *unplaced* results

@@ -39,21 +39,23 @@
          style="{% if embed_aspect %}display:block;width:100%;height:100%{% else %}width:100%;height:auto{% endif %};border:1px solid var(--tblr-border-color,#ccc);background:#f4f5f7">
       {% include 'netbox_facilitymap/inc/floor_sheets.html' %}
       {% comment %}
-        Spotlight: on the cropped single-room embed, dim the floor outside the room's own
+        Spotlight: on the cropped room embed, dim the floor outside the embedded room's own
         polygon so it's unambiguous which room you're on (the zoomed crop shows neighbouring
         rooms in the raster image). A full-canvas dark rect, masked to a hole the shape of the
-        room. Only `spotlight` (the room's scaled path `d`) is set when cropping; the whole-floor
-        view never dims. Drawn over the sheets but under the green highlight + markers.
-        The lit hole is an evenodd `<path>` (not a plain polygon): its outer contour is the
+        room. Only `spotlight` (a scaled path `d` per embedded room) is set when cropping; the
+        whole-floor view never dims. Drawn over the sheets but under the green highlight + markers.
+        Each lit hole is an evenodd `<path>` (not a plain polygon): its outer contour is the
         room, and any smaller room contained within it is punched out as an inner contour — so
-        that contained area stays masked (dimmed), reading as "not part of this room".
+        that contained area stays masked (dimmed), reading as "not part of this room". A Location
+        traced as several rooms contributes one path each; the mask unions them (black over black),
+        which one concatenated evenodd path would not — its parity would re-mask any overlap.
       {% endcomment %}
       {% if spotlight %}
         <defs>
           <mask id="room-spotlight">
             <rect x="0" y="0" width="{{ vw }}" height="{{ vh }}" fill="#fff"/>
-            <path d="{{ spotlight }}" fill="#000" fill-rule="evenodd"/>
-          </mask>
+{% for d in spotlight %}            <path d="{{ d }}" fill="#000" fill-rule="evenodd"/>
+{% endfor %}          </mask>
         </defs>
         <rect x="0" y="0" width="{{ vw }}" height="{{ vh }}"
               fill="#000" opacity="0.45" mask="url(#room-spotlight)"/>

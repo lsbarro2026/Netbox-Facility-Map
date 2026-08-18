@@ -8,7 +8,9 @@
    A placement is `{id, kind:'rack'|'device', room, loc, x, y, w?, h?, rot?, label, uid,
    labelStyle?}` in the per-floor placement store, normalized 0..1 over the combined canvas like
    every other shape. It draws only for a room bound to a NetBox Location; a marker whose item is
-   absent from the latest sync renders `stale` rather than vanishing.
+   absent from the latest sync renders `stale` rather than vanishing. `room` is the polygon the
+   marker sits in and stays the drawing/geometry key; the rack panel's *placed-state* is
+   Location-scoped instead (`locationRoomIds`), matching the inventory it lists.
 
    Holds an editor back-ref (`this.ed`), the ImportAlign shape. `selectedPlacement`/`rackRoom`/
    `editingLabel` deliberately stay on FloorEditor — its deselect, handleKey, onPanelClosed,
@@ -29,6 +31,28 @@ const CHIP_PAD_X = 3, CHIP_PAD_Y = 1.5;   // chip padding around the text bbox (
 
 class FloorPlacements {
   constructor(editor) { this.ed = editor; }
+
+  /** Every room id on this floor bound to the same NetBox Location as `room`, `room.id` always
+   *  included — the scope the placement panel resolves **placed-state** over (DEV-12).
+   *
+   *  One physical room is sometimes traced as two polygons bound to one `dcim.Location` (a
+   *  supported state; ROOM-9 pins its server-side half). The panel's inventory is already
+   *  Location-scoped (`store.racksForLocation`), so scoping placed-state to a single polygon made
+   *  a device placed via polygon A read as *unplaced* in polygon B — and slipped past the
+   *  duplicate guard, placing it twice. Storage is untouched: a placement still records the
+   *  polygon it sits in (`p.room`); only this lookup widens.
+   *
+   *  Derived from the editor's rooms array, never from a placement's own `p.loc`: `loc` is written
+   *  by `placeItem`/`FloorDeviceTool`, but records predating it carry none, and a lookup that
+   *  silently misses those is this same bug again. An **unbound** room scopes to itself alone —
+   *  two rooms sharing "no Location" share nothing. Per-floor by construction (the caller passes
+   *  `data().rooms`), which matches the per-floor placement store. */
+  static locationRoomIds(rooms, room) {
+    const ids = new Set([room.id]);
+    if (!room.location) return ids;
+    for (const r of rooms || []) if (r.location && r.location.id === room.location.id) ids.add(r.id);
+    return ids;
+  }
 
   /** Live-load inventory for every bound room that has placements on this floor,
    *  so markers render with their real glyphs instead of the stale fallback. Each
@@ -62,16 +86,22 @@ class FloorPlacements {
 
   /** Draw a marker per placement. In racks mode markers are draggable (move
    *  clamped to the room polygon) and the selected one gets rotate + resize
-   *  handles; in view mode they are read-only links to NetBox. Each marker is a
+   *  handles; in view mode they are read-only links to NetBox, and only the categories the
+   *  toolbar's View filter has checked are drawn. Each marker is a
    *  `translate(center) rotate(rot)` group sized to (normalized) w×h. */
   drawPlacements(s, W, H, skipSelected) {
     const pdata = this.ed.store.placementData(this.ed.building.dir, this.ed.floor.id);
     const roomById = {};
     for (const r of this.ed.data().rooms) roomById[r.id] = r;
 
+    // A marker needs a bound room to draw at all; in VIEW mode it must also pass the toolbar's
+    // View category filter (VIEW-2). Edit and the racks sub-mode are exempt — a rack you can't see
+    // is a rack you can't move, so editing always shows the lot.
+    const filtering = !this.ed.editing();
     const visible = pdata.placements.filter(p => {
       const room = roomById[p.room];
-      return room && room.location;
+      if (!(room && room.location)) return false;
+      return !filtering || this.ed.viewFilter.shows(p);
     });
     // In plain edit the selected room is promoted to the active layer; its markers ride that
     // layer too (drawn in _renderActive), so skip them here to avoid a double-draw and let
@@ -126,11 +156,22 @@ class FloorPlacements {
     const box = DeviceShapes.box(type);
     const wpx = p.w != null ? p.w * W : box.w;
     const hpx = p.h != null ? p.h * H : box.h;
+    const isDevice = p.kind === 'device';
     const g = Dom.svg('g', {
-      class: 'rack-marker' + (p.kind === 'device' ? ' device' : '')
+      class: 'rack-marker' + (isDevice ? ' device' : '')
         + (stale ? ' stale' : '') + (selected ? ' selected' : ''),
       transform: `translate(${p.x * W},${p.y * H}) rotate(${p.rot || 0})`,
     });
+    // The role picks the marker's colour as well as its shape (DEV-10). It's a per-marker datum,
+    // so it rides inline custom properties the `.rack-marker.device` rules read — the same
+    // inline-paint route the wayfinding arrows and label colours take, not a generated per-role
+    // class. Left unset (stylesheet grey) for a rack, a roleless device, or a stale marker whose
+    // NetBox row didn't resolve; `ink` is the server's contrast answer, never recomputed here.
+    const role = isDevice && item ? item.role : null;
+    if (role && role.color) {
+      g.style.setProperty('--role-color', role.color);
+      g.style.setProperty('--role-ink', role.ink);
+    }
     for (const el of DeviceShapes.glyph(type, wpx, hpx)) g.append(el);
     const title = Dom.svg('title');
     title.textContent = (p.kind === 'rack' ? 'Rack: ' : 'Device: ') + (p.label || '?')
@@ -298,7 +339,9 @@ class FloorPlacements {
   }
 
   /** List the room's synced racks + unracked devices; click a row to place it
-   *  (or remove an already-placed one). */
+   *  (or remove an already-placed one). Both halves are scoped to the bound **Location** — the
+   *  inventory by `racksForLocation`, the placed-state by `locationRoomIds` — so the two agree
+   *  even when the room is traced as several polygons (DEV-12). */
   openRackPanel(room) {
     // Placing racks is nested in edit, so the room being configured stays the selected
     // (highlighted) room — keeping the toggle-on "keep the room selected" behaviour.
@@ -343,7 +386,10 @@ class FloorPlacements {
 
     const inv = this.ed.store.racksForLocation(room.location.id);
     const pdata = this.ed.store.placementData(this.ed.building.dir, this.ed.floor.id);
-    const mine = () => pdata.placements.filter(p => p.room === room.id);
+    // Placed-state spans every polygon on this Location, matching the Location-scoped inventory
+    // above — a device placed via a sibling polygon of the same room is placed, not missing.
+    const scope = FloorPlacements.locationRoomIds(this.ed.data().rooms, room);
+    const mine = () => pdata.placements.filter(p => scope.has(p.room));
     const placedKey = new Set(mine().map(p => p.kind + ':' + p.id));
 
     // Inventory has loaded by now (the not-yet-fetched case returned early above), so an empty
@@ -368,6 +414,15 @@ class FloorPlacements {
       'Click an item to drop it in the room, then drag to place. Click a placed (✓) item to '
       + 'select it, then drag to move it or edit its label. Use ✕ to remove it.'));
 
+    // The marker a placed row acts on. Prefers THIS polygon's own marker over a sibling's, which
+    // only bites on duplicates predating the Location-scoped guard in `placeItem` (both can exist
+    // there): the row then stays on the marker the user is looking at, and repeat ✕ clears the
+    // duplicate. With the guard fixed there is exactly one hit.
+    const pick = (kind, id) => {
+      const hits = mine().filter(p => p.kind === kind && p.id === id);
+      return hits.find(p => p.room === room.id) || hits[0];
+    };
+
     const section = (heading, items, kind) => {
       body.append(Dom.el('div', { class: 'field' }, Dom.el('label', {}, heading + ' (' + items.length + ')')));
       if (!items.length) { body.append(Dom.el('div', { class: 'hint' }, 'None.')); return; }
@@ -382,10 +437,11 @@ class FloorPlacements {
         const row = Dom.el('div', { class: 'room-item' + (placed ? ' bound has-remove' : '') }, [main]);
         // A placed row SELECTS its existing marker (never moves/recreates it); a distinct
         // ✕ control removes it, so a row click is no longer destructive. An unplaced row
-        // drops a new marker at the room centroid.
+        // drops a new marker at the room centroid. Both act on the marker wherever it sits —
+        // including a sibling polygon of this same room, which is the same room to the user.
         if (placed) {
-          row.onclick = () => this.selectPlacement(mine().find(p => p.kind === kind && p.id === it.id), room);
-          row.append(this._removeButton(() => mine().find(p => p.kind === kind && p.id === it.id), room));
+          row.onclick = () => this.selectPlacement(pick(kind, it.id), room);
+          row.append(this._removeButton(() => pick(kind, it.id), room));
         } else {
           row.onclick = () => this.placeItem(room, kind, it);
         }
@@ -421,7 +477,8 @@ class FloorPlacements {
 
   /** Placed items no longer present in the latest sync — offer removal. Shared by the
    *  empty-state and populated rack-panel paths so stale placements stay visible/removable
-   *  even when the Location's live inventory came back empty. */
+   *  even when the Location's live inventory came back empty. `mine` is the caller's
+   *  Location-scoped closure, so the list covers every polygon of the room, not just this one. */
   _appendStalePlacements(body, room, mine) {
     const stale = mine().filter(p => !this.cacheItem(p));
     if (!stale.length) return;
@@ -450,7 +507,10 @@ class FloorPlacements {
   /** Drop a marker for a rack/device at the room centroid (clamped inside it). */
   placeItem(room, kind, item) {
     const pdata = this.ed.store.placementData(this.ed.building.dir, this.ed.floor.id);
-    if (pdata.placements.some(p => p.room === room.id && p.kind === kind && p.id === item.id)) return;
+    // Guarded across every polygon on this Location, not just this one: one item is placed once
+    // per room, however many polygons that room is traced as (DEV-12).
+    const scope = FloorPlacements.locationRoomIds(this.ed.data().rooms, room);
+    if (pdata.placements.some(p => scope.has(p.room) && p.kind === kind && p.id === item.id)) return;
     this.ed.snapshot();
     const [cx, cy] = Geom.clampToPoly(...Geom.centroid(room.polygon), room.polygon);
     const p = { id: item.id, kind, room: room.id, loc: room.location.id,

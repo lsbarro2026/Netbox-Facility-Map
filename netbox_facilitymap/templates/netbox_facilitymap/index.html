@@ -74,12 +74,12 @@
                     the same shape a to-do's assignees arrive in, so ids compare directly). The
                     to-do surfaces sort a user's own to-dos first (TASK-3), which needs an identity
                     no round-trip could supply before the first sort.
-     apTool / apDeviceRole / apNameTemplate / apCountScope -> the access-point tool's
-                    configuration (DEV-3), from the settings blob via previews.ap_settings; the
-                    Settings page renders and writes it, and the floor editor offers the tool only
-                    when it is fully configured. apDeviceRole is {id,name} (or null when unset,
-                    deleted, or hidden from this user) so the role combobox shows a label with no
-                    round-trip. -->
+     deviceTool / devicePresets / deviceStatuses -> the device-placement tool's configuration
+                    (DEV-3, generalized into device-type presets by DEV-8), from the settings blob
+                    via previews.device_presets; the Settings page renders and writes it, and the
+                    floor editor offers the Add-device dropdown only for enabled presets whose
+                    `role` resolved to {id,name} (null = unset, deleted, or hidden from this
+                    user). -->
 <script>
   window.MAP = {
     api:    "{% url 'plugins:netbox_facilitymap:map' %}api/",
@@ -101,23 +101,25 @@
     overlayExts: {{ overlay_exts|safe }},   {# OVERLAY-role subset of drawingExts — gates the align-overlay affordance #}
     capabilities: {{ capabilities|safe }},   {# enabled optional capabilities (keys), from the server's capability registry #}
     roleGlyphs: {{ role_glyphs|safe }},   {# operator's extra device-role → glyph keywords (INTL-1), validated server-side by device_shapes.custom_rules #}
-    canCreateDevice: {% if can_create_device %}true{% else %}false{% endif %},   {# holds dcim.add_device — may create an access point inline (DEV-3); the install-wide gates are the AP tool + write mode #}
-    apTool: {% if ap_tool %}true{% else %}false{% endif %},   {# install-wide access-point tool on (DEV-3) — independent of write mode; both must be on to place an AP #}
+    canCreateDevice: {% if can_create_device %}true{% else %}false{% endif %},   {# holds dcim.add_device — may create a device inline (DEV-3); the install-wide gates are the device tool + write mode #}
+    deviceTool: {% if device_tool %}true{% else %}false{% endif %},   {# install-wide device-placement tool on (DEV-3/DEV-8) — independent of write mode; both must be on to place a device #}
     renderHq: {% if render_hq %}true{% else %}false{% endif %},   {# install-wide high-quality floor-plan rendering on (READ-1) — read by the import build, not the browser; this is the Settings toggle's initial state #}
     todos: {% if todos %}true{% else %}false{% endif %},   {# install-wide to-do feature on (ADDON-4) — a general (non-write) add-on; gates both to-do pages, the floor panel + compose icon. Re-checked server-side; this is the UX mirror #}
     {% comment %}
-    Role name + template are operator-typed free text, so they ride |escapejs (a JS *string*
-    context), not json.dumps|safe like the fixed vocabularies below — JSON leaves `/` alone, so
-    a `</script>` in either would otherwise close this block.
+    Preset labels/templates (and status labels) are operator-typed / translated free text, so the
+    lists ride |escapejs inside a JS *string* then JSON.parse — not json.dumps|safe like the fixed
+    vocabularies above — JSON leaves `/` alone, so a `</script>` in either would otherwise close
+    this block. devicePresets (DEV-8): every stored preset, enabled and disabled, each with its
+    role resolved to {id,name} (or null); deviceStatuses: the dcim.Device status vocabulary as
+    [value, label] pairs, for presets that prompt for status.
     {% endcomment %}
-    apDeviceRole: {% if ap_device_role %}{ id: {{ ap_device_role.id }}, name: "{{ ap_device_role.name|escapejs }}" }{% else %}null{% endif %},   {# the role new APs get, or null when unconfigured #}
-    apNameTemplate: "{{ ap_name_template|escapejs }}",   {# name template: {room}/{role_short} placeholders #}
-    apCountScope: "{{ ap_count_scope }}",   {# how far the suggested name's -NN counter scopes before it resets #}
+    devicePresets: JSON.parse("{{ device_presets_json|escapejs }}"),
+    deviceStatuses: JSON.parse("{{ device_statuses_json|escapejs }}"),
     floorLabelField: "{{ floor_label_field }}",   {# default Location field for a floor's label #}
     defaultFacility: "{{ default_facility }}",   {# pinned boot facility ('' = default facility), SET-2 #}
     {% comment %}
     The signed-in viewer (TASK-3) — the to-do surfaces sort their own to-dos first. Rides
-    |escapejs for the same reason apDeviceRole above does: a display name is user-entered free
+    |escapejs for the same reason devicePresets above does: a display name is user-entered free
     text, and a JS *string* context is what escapes `</script>` safely.
     {% endcomment %}
     user: { id: {{ map_user.id }}, username: "{{ map_user.username|escapejs }}",
@@ -197,8 +199,9 @@ viewers are told the data is intact and an administrator must reassign it. Suppr
      are tiny and their routes (#/settings, #/b/<dir>) are directly deep-linkable); the floor
      editor (device-shapes.js, floor-export.js,
      floor-todo.js, floor-editor.js) and the import flows (import-preview.js, import-uploader.js,
-     facility-change-modal.js, import-build-review.js, import-regions.js, import-align.js,
-     import-bulk.js, import-diff.js, import-match.js, import-organize.js, import-topology.js,
+     facility-change-modal.js, import-build-review.js, import-region-editor.js (an Editor
+     subclass, so it rides a lazy bundle whose base class loaded eagerly), import-regions.js,
+     import-align.js, import-bulk.js, import-diff.js, import-match.js, import-organize.js, import-topology.js,
      import-bind.js, import-cards.js, import-ocr-sweep.js, import-overview.js, import-flow.js,
      fresh-import-flow.js, edit-import-flow.js)
      are fetched on
@@ -220,9 +223,10 @@ viewers are told the data is intact and an administrator must reassign it. Suppr
      after it because App.showTodo picks between the pair and both must be resolvable by then. Eager
      for todo-page.js's own reason, and one more: the choice is made at mount time from a matchMedia
      read, so a lazy fetch here would put a network round-trip in front of the phone entry path only.
-     ap-settings-page.js follows settings-page.js on both counts: it SUBCLASSES SettingsPage (so
-     dependency order is not optional here), and #/settings/access-points is deep-linkable like its
-     parent route, so showApSettings() stays synchronous too. -->
+     device-settings-page.js follows settings-page.js because it SUBCLASSES SettingsPage (so
+     dependency order is not optional here); #/settings/devices is deep-linkable like its parent
+     route, though showDeviceSettings() also ensures the lazy device-shapes.js first (its icon
+     picker draws from the shared library). -->
 <script src="{% static_versioned 'netbox_facilitymap/lib.js' %}"></script>
 <script src="{% static_versioned 'netbox_facilitymap/todo-model.js' %}"></script>
 <script src="{% static_versioned 'netbox_facilitymap/todo-chips.js' %}"></script>
@@ -240,7 +244,7 @@ viewers are told the data is intact and an administrator must reassign it. Suppr
 <script src="{% static_versioned 'netbox_facilitymap/editor.js' %}"></script>
 <script src="{% static_versioned 'netbox_facilitymap/siteplan-editor.js' %}"></script>
 <script src="{% static_versioned 'netbox_facilitymap/settings-page.js' %}"></script>
-<script src="{% static_versioned 'netbox_facilitymap/ap-settings-page.js' %}"></script>
+<script src="{% static_versioned 'netbox_facilitymap/device-settings-page.js' %}"></script>
 <script src="{% static_versioned 'netbox_facilitymap/floor-view-menu.js' %}"></script>
 <script src="{% static_versioned 'netbox_facilitymap/app.js' %}"></script>
 </body>

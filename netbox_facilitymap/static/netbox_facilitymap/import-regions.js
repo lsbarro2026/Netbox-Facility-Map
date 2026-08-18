@@ -1,6 +1,5 @@
 'use strict';
-/* import-regions.js — ImportRegions: the import wizard's box-drawing surfaces, which share a
-   viewport, a zoom bar, and the drag-a-normalized-box gesture:
+/* import-regions.js — ImportRegions: the import wizard's region-marking surfaces:
      - codeSection()       the GLOBAL code region as a SUMMARY, in the merged Site plan step
                            (IMPORT-37): the current box shown as the crop it produces, plus a way
                            into the editor below. That one box is applied as a crop to every floor
@@ -8,16 +7,20 @@
                            the only place the floor-code reader looks.
      - openPick(b, opts)   the code-region EDITOR, for one outlier building's `codeRegion` override
                            or — with a null building — for the global region itself (IMPORT-63).
-                           A detour off whichever step called it.
-     - openSplit(b, p)     mark SEVERAL boxes on one drawing (FLOOR-4), each its own
-                           floor, so a split-level sheet fans into several floors at build.
+                           A detour off whichever step called it. Draws with the
+                           drag-a-normalized-box gesture (`_onBoxDrag`) in a widen-canvas zoom
+                           viewport (the `ImportPreview.zoomBar` mechanism, shared with the align
+                           editor).
+     - openSplit(b, p)     mark SEVERAL regions on one drawing (FLOOR-4), each its own floor, so a
+                           split-level sheet fans into several floors at build. Since FLOOR-6 this
+                           screen draws through the map editors' own engine (`ImportRegionEditor`,
+                           a minimal `Editor` subclass with PanZoom), not the box-drag gesture.
 
    Holds a wizard back-ref (`this.w`), the ImportUploader shape: the editors render through the
    flow's `_stage`, persist through `_saveDraft`, and return to `_stepMap`. Boxes are stored
    normalized 0..1 over the drawing image, the same convention as everything else in the map
    (architecture §10 coordinates) — the overlay shares the <img>'s box, so pointer positions map
-   straight to image space via `getBoundingClientRect()` at any zoom. The shared −/Fit/+ zoom bar
-   lives on `ImportPreview` (it also serves the align editor).
+   straight to image space via `getBoundingClientRect()` at any zoom.
 
    A code-crop box also records the **page geometry of the sheet it was marked on** (`pageSize`), so
    `adapt` can re-anchor it onto a differently-shaped sheet instead of stretching fractions across a
@@ -424,115 +427,151 @@ class ImportRegions {
     return { img, sel, els: [ImportPreview.zoomBar(canvas, this.w._regionZoom), viewport] };
   }
 
-  /** Region-split editor: draw one or more boxes over a single drawing and give each its own
-   *  floor, so the page fans into several floors at build (`_resolveFloors` emits the
-   *  `[{token, region}]` shape `preprocess._page_entries` consumes). Follows the `openPick`
-   *  precedent — the drawing sits in a scrollable, zoomable viewport — but supports *several* boxes,
-   *  each a floor. The image renders at the card's straightening `angle`, so a box is marked in the
-   *  same straightened space the backend crops (crop-after-rotate). Boxes + per-region assignments
-   *  live on `b.regions[p.stem]` and persist in the draft. Reached from a card's "Split into
-   *  floors…" button; empty the list (Clear all / removing every region) to fall back to one
-   *  whole-page floor. */
+  /** Region-split editor: draw one or more floor regions over a single drawing and give each its
+   *  own floor, so the page fans into several floors at build (`_resolveFloors` emits the
+   *  `[{token, region}]` shape `preprocess._page_entries` consumes). Since FLOOR-6 the drawing
+   *  surface is the map editors' own engine — an `ImportRegionEditor` (a minimal `Editor`
+   *  subclass) mounted on the main `.map-viewport`/`.map-wrap` DOM shape — so regions are drawn as
+   *  freeform polygons (or rectangle-tool boxes) with the same snapping, vertex/edge/whole-shape
+   *  editing, PanZoom, and Ctrl+Z the map editors have, rather than a bespoke box-drag. The
+   *  build's crop contract is still a rectangle, so each region's `box` rides as its polygon's
+   *  bounding box (see ImportRegionEditor), which the screen says. The image renders at the card's
+   *  straightening `angle`, so a region is marked in the same straightened space the backend crops
+   *  (crop-after-rotate). Regions + per-region assignments live on `b.regions[p.stem]` and persist
+   *  in the draft (autosaved — debounced through the editor, flushed on every way out). Reached
+   *  from a card's "Split into floors…" button; empty the list (Clear all / removing every region)
+   *  to fall back to one whole-page floor. */
   openSplit(b, p) {
     const w = this.w;
     const view = w._stage('Split ' + p.file + ' into floors');
-    w._detourBack(view, '← Back to floor mapping', () => w._stepMap());
     view.append(Dom.el('p', { class: 'hint' },
-      'Drag a box around each part of this drawing that is its own floor, then assign a floor to '
-      + 'each box below. One plan can map to several floors this way (e.g. a split-level sheet). '
-      + 'Zoom in if the drawing is dense; scroll to pan. Each box is added as soon as you release '
-      + 'the mouse; remove one with its Remove button.'));
+      'Draw a shape around each part of this drawing that is its own floor, then assign a floor '
+      + 'to each region below. One plan can map to several floors this way (e.g. a split-level '
+      + 'sheet). Add a region with the tools above the drawing, click a region to select it, then '
+      + 'drag its corners, edges, or body to adjust — right-click a corner removes it, Ctrl+Z '
+      + 'undoes. Scroll to zoom; drag the background to pan.'));
+    // The build crops a rectangle (the FLOOR-2/3 contract), so a freeform region is honest about
+    // what it marks but not about what it crops — say so rather than letting the shape imply a
+    // pixel-exact cut.
+    view.append(Dom.el('p', { class: 'hint' },
+      'Each floor is cut out as the upright rectangle around its region shape, so a slanted or '
+      + 'L-shaped region still crops the box that contains it.'));
     // The counterpart of the code picker's own orientation note (IMPORT-63). These two editors look
     // alike and are NOT in the same space: this one draws on the STRAIGHTENED drawing, because the
     // build crops after rotating, while the code pickers draw on the unrotated render the reader
     // crops. Only shown once there is a rotation to be confused by.
-    if ((b.angle[p.stem] && b.angle[p.stem].deg) || 0)
+    const deg = (b.angle[p.stem] && b.angle[p.stem].deg) || 0;
+    if (deg)
       view.append(Dom.el('p', { class: 'hint' },
-        'This is the drawing straightened by the rotation you set on its card — boxes here are '
+        'This is the drawing straightened by the rotation you set on its card — regions here are '
         + 'marked in that upright orientation, unlike the floor-code region, which is marked on '
         + 'the drawing as uploaded.'));
 
-    const deg = (b.angle[p.stem] && b.angle[p.stem].deg) || 0;
-    const img = Dom.el('img', { class: 'imp-region-img', src: ImportPreview.previewUrl(p.pdf, p.page, deg) });
-    const overlay = Dom.el('div', { class: 'imp-region-overlay' });
-    const canvas = Dom.el('div', { class: 'imp-region-canvas' }, [img, overlay]);
-    const viewport = Dom.el('div', { class: 'imp-region-view' }, [canvas]);
+    const img = Dom.el('img', { src: ImportPreview.previewUrl(p.pdf, p.page, deg), alt: p.file });
+    const svg = Dom.svg('svg', { preserveAspectRatio: 'none' });
+    const wrap = Dom.el('div', { class: 'map-wrap' }, [img, svg]);
+    const viewport = Dom.el('div', { class: 'map-viewport' }, [wrap]);
     const list = Dom.el('div', { class: 'imp-region-list' });
 
-    // Repaint the numbered box overlay + the per-region floor-assignment list from the current
-    // model, without rebuilding the image — so an add / remove / floor pick never disturbs the
-    // zoom or scroll position.
+    // The drawing engine: the map editors' base class, specialized to the draft's region model
+    // (FLOOR-6). `redraw` below is its list hook, so a selection/add/undo made on the canvas
+    // re-syncs the rows; `ed` is assigned before any closure can run.
+    let ed;
+    ImportRegionEditor.materialize(b.regions[p.stem]);
+
+    // Rebuild the per-region floor-assignment list from the current model, without touching the
+    // canvas — so an add / remove / floor pick never disturbs the editor's pan/zoom.
     const redraw = () => {
       const regions = b.regions[p.stem];
-      overlay.innerHTML = '';
-      regions.forEach((r, i) => {
-        const boxEl = Dom.el('div', { class: 'imp-region-box' }, String(i + 1));
-        boxEl.style.left = (r.box.x * 100) + '%'; boxEl.style.top = (r.box.y * 100) + '%';
-        boxEl.style.width = (r.box.w * 100) + '%'; boxEl.style.height = (r.box.h * 100) + '%';
-        overlay.append(boxEl);
-      });
       list.innerHTML = '';
       if (!regions.length) {
-        list.append(Dom.el('p', { class: 'hint' }, 'No regions yet — drag a box on the drawing above.'));
+        list.append(Dom.el('p', { class: 'hint' },
+          'No regions yet — add one with the tools above the drawing.'));
         return;
       }
       regions.forEach((r, i) => {
-        list.append(Dom.el('div', { class: 'imp-region-row' }, [
-          Dom.el('span', { class: 'imp-region-rownum' }, 'Region ' + (i + 1)),
-          w.cards._floorButtons(b, r.assign, () => { w._saveDraft(); redraw(); }),
+        // Undo covers a floor pick too: capture the pre-pick state before the button's own click
+        // handler mutates `r.assign` (capture phase runs first). A press that changes nothing
+        // pushes a no-op snapshot, which is harmless.
+        const floors = w.cards._floorButtons(b, r.assign, () => { w._saveDraft(); redraw(); });
+        floors.addEventListener('click', (e) => { if (e.target.closest('button')) ed.snapshot(); }, true);
+        const row = Dom.el('div', {
+          class: 'imp-region-row' + (ed.selected === r.id ? ' selected' : '') }, [
+          Dom.el('button', { class: 'imp-region-rownum',
+            title: 'Select this region on the drawing',
+            onclick: () => { ed.selected = r.id; ed.render(); redraw(); } }, 'Region ' + (i + 1)),
+          floors,
           Dom.el('button', { class: 'imp-floor', onclick: () => {
-            regions.splice(i, 1); w._saveDraft(); redraw();
+            ed.snapshot();
+            regions.splice(i, 1);
+            if (ed.selected === r.id) ed.selected = null;
+            ed.markDirty(); ed.render(); redraw();
+            ed._deleteToast('Region removed');
           } }, 'Remove'),
-        ]));
+        ]);
+        list.append(row);
+        if (ed.selected === r.id) row.scrollIntoView({ block: 'nearest' });
       });
     };
 
-    this._attachAdd(img, b, p, redraw);
-    view.append(ImportPreview.zoomBar(canvas, w._regionZoom));
+    ed = new ImportRegionEditor(w.app, w, b, p, redraw);
+    view.append(Dom.el('div', { class: 'imp-region-tools' }, [
+      ed.toolbar.drawShapeButton(), ed.toolbar.rectShapeButton(), ed.toolbar.undoButton(),
+      ed.toolbar.snapButton(), ed.toolbar.orthoButton(),
+    ]));
     view.append(viewport);
     view.append(list);
-    ImportPreview.applyZoom(canvas, w._regionZoom);
+
+    // The wizard steps are not Editors, so App's keyboard dispatch never reaches this screen —
+    // route keys here (Enter/Backspace/Esc/Ctrl+Z/±/0/?), with App's own typing guard, and tear
+    // the listener down with the screen. `app.current` stays the ImportFlow (it owns the
+    // navigation-refusal guard), which is why this is a listener and not a `current` swap.
+    const onKey = (e) => {
+      // Self-disarm if the screen was left by a route the leave funnel doesn't cover (a hash
+      // navigation, the settings gear): a key must never drive a torn-down editor.
+      if (!view.isConnected) { document.removeEventListener('keydown', onKey); ed.detach(); return; }
+      if (e.target.matches('input, textarea, select')) return;
+      ed.handleKey(e);
+    };
+    document.addEventListener('keydown', onKey);
+
+    // Every way out funnels through here: drop the key listener + ResizeObserver and flush any
+    // edit still sitting in the autosave debounce window before the screen is torn down.
+    const leave = async () => {
+      document.removeEventListener('keydown', onKey);
+      ed.detach();
+      await ed.flushSave();
+      w._stepMap();
+    };
+    w._detourBack(view, '← Back to floor mapping', () => leave());
+
+    // Mount once the render is in: `attach()` needs the image's intrinsic size for `dims`, and
+    // with it loaded the fit runs immediately. A failed render still mounts (fallback dims) so
+    // the screen isn't dead — the operator can back out or retry via Back.
+    const mount = () => ed.attach(img, svg, [img.naturalWidth || 1, img.naturalHeight || 1]);
+    if (img.complete) mount();
+    else {
+      img.addEventListener('load', mount);
+      img.addEventListener('error', () => { Toast.show('Preview failed to render', true); mount(); });
+    }
     redraw();
 
     view.append(Dom.el('div', { class: 'imp-actions' }, [
-      Dom.el('button', { class: 'primary',
-        onclick: async () => { await w._saveDraft(); w._stepMap(); } }, 'Done'),
+      Dom.el('button', { class: 'primary', onclick: () => leave() }, 'Done'),
       Dom.el('button', { onclick: async () => {
         if (b.regions[p.stem].length && !confirm('Remove all regions from this drawing?')) return;
-        b.regions[p.stem] = []; await w._saveDraft(); w._stepMap();
+        b.regions[p.stem] = []; await w._saveDraft(); leave();
       } }, 'Clear all'),
-      Dom.el('button', { onclick: () => w._stepMap() }, 'Cancel'),
+      Dom.el('button', { onclick: () => leave() }, 'Cancel'),
     ]));
   }
 
-  /** Drag on the split editor's canvas to add a region box (FLOOR-4): a press-drag-release marks a
-   *  new normalized 0..1 box, appended to `b.regions[p.stem]` as a fresh `unassigned` floor. Shares
-   *  the `_onBoxDrag` gesture with the code-crop picker, drawing into its own preview element that
-   *  is cleared on release (the committed box is repainted by `onAdd`, which also refreshes the
-   *  region list). */
-  _attachAdd(img, b, p, onAdd) {
-    const preview = Dom.el('div', { class: 'imp-region-sel hidden' });
-    img.parentElement.append(preview);
-    const draw = (r) => {
-      preview.classList.remove('hidden');
-      preview.style.left = (r.x * 100) + '%'; preview.style.top = (r.y * 100) + '%';
-      preview.style.width = (r.w * 100) + '%'; preview.style.height = (r.h * 100) + '%';
-    };
-    ImportRegions._onBoxDrag(img, draw, (box) => {
-      b.regions[p.stem].push(
-        { box, assign: { type: 'unassigned', num: 1, token: null, label: '' } });
-      this.w._saveDraft();
-      onAdd();
-    }, () => preview.classList.add('hidden'));
-  }
-
-  /** The shared press-drag-release gesture behind both editors: track a normalized 0..1 box over
-   *  `img`, calling `draw(box)` live, and `commit(box)` on release. Pointer coordinates map
+  /** The code pickers' press-drag-release gesture: track a normalized 0..1 box over `img`,
+   *  calling `draw(box)` live, and `commit(box)` on release. Pointer coordinates map
    *  straight to image space via the image's live `getBoundingClientRect()`, so the box is correct
    *  at any zoom, and are clamped to 0..1 so a drag off the edge still yields a valid box. A
-   *  too-small drag (< 0.5% on either axis) is ignored, so a stray click marks nothing. `onEnd`
-   *  (optional) runs on every release, committed or not — the split editor hides its live preview. */
-  static _onBoxDrag(img, draw, commit, onEnd) {
+   *  too-small drag (< 0.5% on either axis) is ignored, so a stray click marks nothing. */
+  static _onBoxDrag(img, draw, commit) {
     img.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       const rect = img.getBoundingClientRect();
@@ -548,7 +587,6 @@ class ImportRegions {
       const up = () => {
         img.removeEventListener('pointermove', move);
         img.removeEventListener('pointerup', up);
-        if (onEnd) onEnd();
         if (ImportRegions.isUsableBox(pending)) commit(pending);
       };
       img.addEventListener('pointermove', move);

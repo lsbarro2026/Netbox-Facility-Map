@@ -1,8 +1,8 @@
 'use strict';
 /* app.js — App: top-level orchestrator and entry point. Owns the singletons
    (Store, NetBoxClient, GridController), cross-view UI state (edit/view mode,
-   siteplan-edit flag, siteplan-label visibility, view-mode highlight mode
-   (all rooms / rooms-with-devices / none, default all), the hash
+   siteplan-edit flag, siteplan-label visibility, the floor view-mode category
+   filter (`viewCategories`, default "all"), the hash
    router, and global chrome
    (breadcrumbs, toolbar, side panel, keyboard). Loaded LAST. */
 
@@ -34,7 +34,7 @@ class App {
     ['Editor', () => typeof Editor !== 'undefined'],
     ['SiteplanEditor', () => typeof SiteplanEditor !== 'undefined'],
     ['SettingsPage', () => typeof SettingsPage !== 'undefined'],
-    ['ApSettingsPage', () => typeof ApSettingsPage !== 'undefined'],
+    ['DeviceSettingsPage', () => typeof DeviceSettingsPage !== 'undefined'],
     ['FloorViewMenu', () => typeof FloorViewMenu !== 'undefined'],
   ];
 
@@ -45,10 +45,21 @@ class App {
     this.mode = 'view';                 // floor editor: 'edit' | 'view' (showFloor resets to view per entry); rack placement is FloorEditor.placingRacks, a sub-mode of edit
     this.siteEdit = false;              // siteplan: editing building areas
     this.siteLabels = false;            // siteplan: show building name labels (hidden by default)
-    this.highlight = 'all';             // floor view-mode highlight: 'all' rooms (default) | 'placements' (rooms with devices) | 'none'
+    // Floor view-mode filter (VIEW-2): which placement categories the floor shows. `all` (the
+    // default) highlights every room and draws every marker; with it off only the checked
+    // categories' markers draw and only the rooms holding one highlight; nothing checked is a bare
+    // plan. `roles` holds NetBox device roles appended through the menu's "+ Add role…" picker,
+    // each `{id, name, slug, on}`. A plain object because App is eager and `FloorViewFilter` — which
+    // owns what this MEANS (its statics decide every match) and edits it — rides the lazy floor
+    // bundle. This default is only the pre-load fallback: it persists across reloads via
+    // `localStorage` (VIEW-3), loaded once by `showFloor` the first time a floor is shown — `App`'s
+    // constructor can't call `FloorViewFilter.load()` itself since that class isn't defined yet
+    // this early (it rides the lazy bundle, loaded after app.js).
+    this.viewCategories = { all: true, racks: false, aps: false, roles: [] };
+    this._viewCategoriesLoaded = false;
     this.current = null;                // active Editor (or null on building view)
     this._stagePage = null;             // active non-Editor page mounted into #stage (SettingsPage/
-                                         // ApSettingsPage/TodoPage/MobileTodoPage/ImportFlow) —
+                                         // DeviceSettingsPage/TodoPage/MobileTodoPage/ImportFlow) —
                                          // cleared, and given its optional detach(), by
                                          // `_detachCurrent`; also where `_navRefusal` asks whether
                                          // the page refuses to be navigated away from right now
@@ -83,7 +94,7 @@ class App {
     // Install-wide "write mode" (LOC-2): the runtime, admin-controlled MASTER GATE on everything the
     // plugin writes into NetBox core, replacing the old redeploy-time `location-create` capability.
     // Since SET-5 it gates and nothing more — each write add-on carries its own switch on top
-    // (inlineRoomCreation below, apTool further down). Seeded from the server's settings blob
+    // (inlineRoomCreation below, deviceTool further down). Seeded from the server's settings blob
     // (previews.write_mode_enabled → window.MAP.writeMode) and held live here so the Settings toggle
     // flips it without a reload. UX only — every write endpoint re-checks it server-side.
     this.writeMode = !!(window.MAP && window.MAP.writeMode);
@@ -92,16 +103,22 @@ class App {
     // re-checked server-side in NbLocationCreateView. Note it is seeded from a server reader that
     // DEFAULTS ON for a blob predating SET-5, so an upgrader keeps the tile write mode used to imply.
     this.inlineRoomCreation = !!(window.MAP && window.MAP.inlineRoomCreation);
-    // Whether this user holds `dcim.add_device`, the per-user half of the access-point tool's gate
-    // (DEV-3) — the exact analogue of canCreateLocation. UX only; re-checked server-side.
+    // Whether this user holds `dcim.add_device`, the per-user half of the device-placement tool's
+    // gate (DEV-3) — the exact analogue of canCreateLocation. UX only; re-checked server-side.
     this.canCreateDevice = !!(window.MAP && window.MAP.canCreateDevice);
-    // The access-point tool's install-wide configuration (DEV-3), seeded from the settings blob
-    // (previews.ap_settings → window.MAP) and held live so the Settings page's saves apply without a
-    // reload, like writeMode/floorLabelField. `apTool` is the feature's own switch, stored SEPARATELY
-    // from writeMode (the master gate) exactly as inlineRoomCreation is — placing an AP needs apTool
-    // AND writeMode AND canCreateDevice AND a configured apDeviceRole ({id,name}, or null when
-    // unset/deleted/hidden). All re-enforced server-side; these are the UX mirror.
-    this.apTool = !!(window.MAP && window.MAP.apTool);
+    // The device-placement tool's install-wide configuration (DEV-3, generalized into device-type
+    // presets by DEV-8), seeded from the settings blob (previews.device_presets → window.MAP) and
+    // held live so the Settings page's saves apply without a reload, like writeMode/
+    // floorLabelField. `deviceTool` is the feature's own switch, stored SEPARATELY from writeMode
+    // (the master gate) exactly as inlineRoomCreation is — placing a device needs deviceTool AND
+    // writeMode AND canCreateDevice AND an enabled preset whose `role` resolved ({id,name}, null
+    // when unset/deleted/hidden). All re-enforced server-side; these are the UX mirror.
+    // `devicePresets` is the stored preset list — enabled AND disabled, since the settings editor
+    // renders both; the toolbar filters (FloorDeviceTool.presets). `deviceStatuses` is the fixed
+    // dcim.Device status vocabulary, for presets that prompt for status.
+    this.deviceTool = !!(window.MAP && window.MAP.deviceTool);
+    this.devicePresets = (window.MAP && window.MAP.devicePresets) || [];
+    this.deviceStatuses = (window.MAP && window.MAP.deviceStatuses) || [];
     // High-quality floor-plan rendering (READ-1). Held live for the same reason as the switches
     // above — so the Settings page's save is reflected without a reload — but nothing in the
     // browser reads it otherwise: the render it controls runs in the import subprocess, and it
@@ -109,13 +126,10 @@ class App {
     this.renderHq = !!(window.MAP && window.MAP.renderHq);
     // The to-do feature's install-wide switch (ADDON-4), a general (non-write) add-on seeded from the
     // settings blob (previews.todos_enabled → window.MAP.todos) and held live so the Settings toggle
-    // flips it without a reload, like writeMode/apTool. Read by showTodo (the #/todo page) and
+    // flips it without a reload, like writeMode/deviceTool. Read by showTodo (the #/todo page) and
     // FloorEditor (the per-floor panel + compose "+"). UX only — every to-do endpoint re-checks it
     // server-side (frontend_api.TodoFeatureGateMixin).
     this.todos = !!(window.MAP && window.MAP.todos);
-    this.apDeviceRole = (window.MAP && window.MAP.apDeviceRole) || null;
-    this.apNameTemplate = (window.MAP && window.MAP.apNameTemplate) || '{room}-{role_short}';
-    this.apCountScope = (window.MAP && window.MAP.apCountScope) || 'none';
     // The enabled optional capabilities (keys), from the server's capability registry (the add-on
     // framework). hasCapability(key) gates a capability's lazy-loaded tool on its presence — the
     // detect-and-enable model, the frontend mirror of window.MAP.drawingExts. Absent (non-plugin
@@ -176,6 +190,17 @@ class App {
    *  tool only wires itself up when its key is present. */
   hasCapability(key) {
     return this.capabilities.includes(key);
+  }
+
+  /** The access-point roles the device presets configure — each enabled preset with the `ap` icon
+   *  contributes its resolved role (`{id,name}`). What `FloorViewFilter`'s "Access points"
+   *  category matches by role (its glyph-based signal covers the rest), replacing the single
+   *  pre-DEV-8 `apDeviceRole`. Empty when no preset qualifies, which the filter treats as
+   *  "no role signal", not "no APs". */
+  apRoles() {
+    return this.devicePresets
+      .filter(p => p.enabled && p.icon === 'ap' && p.role)
+      .map(p => p.role);
   }
 
   /** Await the facility list, fetching it if `init()`'s boot load never ran or failed. `init()`
@@ -333,7 +358,7 @@ class App {
    *  and again in `FloorViewMenu`, which had no teardown hook of any kind. Closing centrally here
    *  covers both, and every popover added later, whether or not its owner is a stage page.
    *
-   *  The outgoing non-`Editor` stage page (`SettingsPage`/`ApSettingsPage`/`TodoPage`/
+   *  The outgoing non-`Editor` stage page (`SettingsPage`/`DeviceSettingsPage`/`TodoPage`/
    *  `MobileTodoPage`) is also given a `detach()` if it defines one — a general hook rather than an
    *  `instanceof` special case, for page-level teardown that isn't a popover. No page needs it
    *  today; it stays as the seam for one that does. */
@@ -556,7 +581,10 @@ class App {
     // state, and that distinction is deliberate: a tab is a view of the same page, a sub-page is a
     // place. An unrecognised segment degrades to the settings page rather than a dead end.
     if (parts[0] === 'settings') {
-      return parts[1] === 'access-points' ? this.showApSettings() : this.showSettings();
+      // `access-points` is the pre-DEV-8 name for the same sub-page — redirect rather than 404 a
+      // bookmark, since the page it named still exists, generalized.
+      if (parts[1] === 'access-points') return this.go('/settings/devices');
+      return parts[1] === 'devices' ? this.showDeviceSettings() : this.showSettings();
     }
     if (parts[0] === 'todo') return this.showTodo();
     if (parts[0] === 'b') return this.renderBuilding(decodeURIComponent(parts[1]));
@@ -581,7 +609,7 @@ class App {
     this._detachCurrent(); this.current = null;
     if (!this.canImport) return this.showNoImport();
     this.ensureScripts(['import-preview.js', 'import-uploader.js', 'facility-change-modal.js',
-      'import-build-review.js', 'import-regions.js', 'import-align.js', 'import-bulk.js',
+      'import-build-review.js', 'import-region-editor.js', 'import-regions.js', 'import-align.js', 'import-bulk.js',
       'import-diff.js', 'import-match.js', 'import-organize.js', 'import-topology.js',
       'import-bind.js', 'import-cards.js', 'import-ocr-sweep.js', 'import-overview.js',
       'import-flow.js', 'fresh-import-flow.js', 'edit-import-flow.js'])
@@ -632,24 +660,32 @@ class App {
     this._stagePage.mount(stage);
   }
 
-  /** The access point add-on's configuration sub-page (SET-6) — same shape as `showSettings()`,
-   *  delegating to `ApSettingsPage`, which subclasses `SettingsPage` (see ap-settings-page.js). The
-   *  linked `Settings` crumb is the way back, so the page carries no back control of its own; the
-   *  `#settings-gear` stays lit here and closes out to wherever settings was opened from
-   *  (`_settingsReturn`, MOBILE-3), since both it and `router()` key their settings-ness off
-   *  `parts[0]` alone.
+  /** The device-placement add-on's configuration sub-page (SET-6 / DEV-8) — same shape as
+   *  `showSettings()`, delegating to `DeviceSettingsPage`, which subclasses `SettingsPage` (see
+   *  device-settings-page.js). The linked `Settings` crumb is the way back, so the page carries no
+   *  back control of its own; the `#settings-gear` stays lit here and closes out to wherever
+   *  settings was opened from (`_settingsReturn`, MOBILE-3), since both it and `router()` key
+   *  their settings-ness off `parts[0]` alone.
+   *
+   *  The preset editor's icon picker draws from `DeviceShapes`' library, which rides the lazy
+   *  floor bundle — so that one file is ensured first, exactly as `showFloor` loads it (a no-op
+   *  when a floor already did).
    *
    *  Unreachable in practice without import permission — the row carrying the `Configure` button
    *  that leads here is `canImport`-gated — but a typed URL lands on a page whose every row is
    *  likewise gated, so it renders empty rather than offering controls that would 403. */
-  showApSettings() {
+  showDeviceSettings() {
     this._detachCurrent(); this.current = null;
     this.crumbs([{ label: this.homeCrumbLabel(), hash: '/' }, { label: 'Settings', hash: '/settings' },
-      { label: 'Access points' }]);
+      { label: 'Devices' }]);
     this.setToolbar([]);
-    const stage = Dom.$('#stage'); stage.innerHTML = '';
-    this._stagePage = new ApSettingsPage(this);
-    this._stagePage.mount(stage);
+    this.ensureScripts(['device-shapes.js'])
+      .then(() => {
+        const stage = Dom.$('#stage'); stage.innerHTML = '';
+        this._stagePage = new DeviceSettingsPage(this);
+        this._stagePage.mount(stage);
+      })
+      .catch(e => Toast.show('Could not load the device settings: ' + e.message, true));
   }
 
   /** The facility-wide to-do page (no editor active) — every building's and floor's work rolled up
@@ -725,12 +761,16 @@ class App {
     try {
       await Promise.all([
         this.ensureScripts(['device-shapes.js', 'label-nudge.js', 'floor-arrange.js',
-          'floor-todo-add.js', 'floor-ap-tool.js', 'floor-annotations.js', 'floor-placements.js',
-          'floor-export.js', 'floor-todo.js', 'floor-editor.js']),
+          'floor-todo-add.js', 'floor-device-tool.js', 'floor-annotations.js', 'floor-placements.js',
+          'floor-view-filter.js', 'floor-export.js', 'floor-todo.js', 'floor-editor.js']),
         this.ensureFloorData().catch(e => Toast.show('Could not load floor data: ' + e.message, true)),
       ]);
     } catch (e) { Toast.show('Could not load the floor view: ' + e.message, true); return; }
     finally { this._setBusy(false); }
+    // One-time load of the persisted View filter (VIEW-3), now that the bundle above guarantees
+    // `FloorViewFilter` is defined. Only once per page load — later floor/building navigations
+    // keep whatever the user has set in-session rather than re-reading storage over it.
+    if (!this._viewCategoriesLoaded) { this.viewCategories = FloorViewFilter.load(); this._viewCategoriesLoaded = true; }
     this.mode = 'view';   // every floor entry lands in view; reset so a prior floor's edit doesn't carry over
     // Recorded only once the floor is certain to render (past the guards and the bundle load), so a
     // navigation that bailed can't leave a floor the user never saw marked "Current" on the to-do
@@ -1059,6 +1099,19 @@ class App {
       if (!this.interactive) return;   // non-interactive embed: no keyboard zoom/shortcuts
       if (e.target.matches('input, textarea, select')) return;
       if (this.current instanceof Editor) this.current.handleKey(e);
+    });
+    // The keyup companion, for the bindings that are *held* (Space = the map's hand tool). Same
+    // guards as the keydown above, so the two can never disagree about which events reach an
+    // editor — a keydown that engaged a held mode must get its matching keyup.
+    document.addEventListener('keyup', (e) => {
+      if (!this.interactive) return;
+      if (e.target.matches('input, textarea, select')) return;
+      if (this.current instanceof Editor) this.current.handleKeyUp(e);
+    });
+    // Losing focus mid-hold (alt-tab, a devtools window) delivers the keyup somewhere else
+    // entirely, so a held mode would stay engaged for a map nobody is pressing a key over.
+    window.addEventListener('blur', () => {
+      if (this.current instanceof Editor) this.current.cancelHeldKeys();
     });
     // Re-fit the toolbar labels whenever the room in the bar changes. The region is flex:1, so
     // this catches both window resizes and breadcrumb-width changes; _fitToolbar toggling

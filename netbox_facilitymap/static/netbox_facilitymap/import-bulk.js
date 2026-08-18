@@ -308,7 +308,7 @@ class ImportBulk {
    *  `B2` means *basement 2*, and letting its digit reach `floorNumber` would cheerfully resolve it
    *  to a Location called "Level 2".
    *
-   *  That asymmetry is why this is only the **first** rung of `_suggestFrom`'s three (IMPORT-52),
+   *  That asymmetry is why this is only the **first** rung of `_suggestFrom`'s four (IMPORT-52),
    *  not the whole story. A level names a storey absolutely; ground and basement carry an *origin*
    *  question no single caption can answer — whether this building calls its ground storey `Floor
    *  0` or `Floor 1` — so they deliberately fall through to the whole-building alignment before
@@ -332,10 +332,11 @@ class ImportBulk {
    *  the wizard's one "no answer yet" marker (`_normalizeToLocations`/`_dropUnanchoredTokens` write
    *  it); every other assignment is somebody's answer. Testing it — rather than the looser "has no
    *  token" — is what stops a re-bind from re-running this over a floor the operator picked by hand
-   *  from the floor-type vocabulary, which has no token to protect it. A deliberate `(none)` and a
-   *  region-split drawing (one page, several floors — no single stem names them) are skipped for the
-   *  same reason. Every write is flagged `suggested` so `_floorButtons` can present it as a pre-fill
-   *  awaiting confirmation rather than a decision.
+   *  from the floor-type vocabulary, which has no token to protect it. A deliberate `(none)`, the
+   *  chosen site plan, and a region-split drawing (one page, several floors — no single stem names
+   *  them) are skipped via `eligible`, the same gate the OCR sweep's `targets()` uses, so the two
+   *  producers agree on what's fair game. Every write is flagged `suggested` so `_floorButtons` can
+   *  present it as a pre-fill awaiting confirmation rather than a decision.
    *
    *  Called from `_loadFloors` right after `_normalizeToLocations`, which is the case that matters:
    *  entering Location mode leaves every untouched drawing `unassigned`, and this is what turns that
@@ -345,7 +346,7 @@ class ImportBulk {
     for (const p of b.pdfs) {
       const a = b.assign[p.stem];
       if (!a || a.type !== 'unassigned') continue;
-      if (b.regions[p.stem] && b.regions[p.stem].length) continue;
+      if (!this.eligible(b, p)) continue;
       const g = ImportBulk.floorFromStem(p.stem);
       if (!g) continue;
       targets.push({ a, guess: g, done: false });
@@ -353,7 +354,7 @@ class ImportBulk {
     return this._suggestFrom(b, targets, 'filename').filled;
   }
 
-  /** Turn one building's parsed floor reads into suggestions, through three rungs in the order
+  /** Turn one building's parsed floor reads into suggestions, through four rungs in the order
    *  that keeps the strongest evidence on top (IMPORT-52). Shared by both producers — the filename
    *  pass (`suggestFloors`) and the OCR sweep (`ImportOcrSweep.applyResults`) — so a caption and a
    *  stem resolve identically. `targets` is `[{a, guess, done}]`; returns `{filled, aligned}`.
@@ -364,6 +365,8 @@ class ImportBulk {
    *  2. **Whole-building alignment** (`_alignGuesses`) — the reads matched *as a set*, by order.
    *  3. **The absolute ordinal**, per caption, for whatever is still blank — `GROUND` reaching a
    *     Location called `Floor 0` when there was no alignable set to say otherwise.
+   *  4. **The sole candidate** (`_soleFloorMatch`, IMPORT-72) — one drawing, one floor Location,
+   *     paired whatever the two are called, since no other pairing exists on either side.
    *
    *  Rung 2 outranks rung 3 on purpose, and the reporter's own set is why. Three drawings reading
    *  BASEMENT / GROUND / SECOND FLOOR against `Floor 0` / `Floor 1` / `Floor 2`: rung 3 would take
@@ -378,7 +381,7 @@ class ImportBulk {
    *  The exception is `opts.accept` (IMPORT-63), the hook the floor-code sweep passes to take a
    *  confident read outright. It is offered **only on rung 1, and only when that rung matched
    *  literally** — `_resolveFloor`'s own trailing-ordinal fallback stamps `matchedBy`, and a patch
-   *  carrying one is an inference like rungs 2 and 3, so it stays a suggestion no matter how
+   *  carrying one is an inference like rungs 2, 3 and 4, so it stays a suggestion no matter how
    *  confident the read was. That asymmetry is the point: a recognition score measures how clearly
    *  the pixels said `LEVEL 2`, and says nothing at all about whether this building's `Floor 1` is
    *  its ground storey. Returns `{filled, aligned, accepted}`; `accepted` counts toward `filled`,
@@ -415,7 +418,44 @@ class ImportBulk {
       const loc = ImportBulk._uniqueByOrdinal(b.nbFloors, ImportBulk.floorOrdinal(t.guess));
       if (loc) fill(t, { type: 'level', token: loc.slug, label: loc.name, matchedBy: 'ordinal' });
     }
+    const sole = this._soleFloorMatch(b, targets);
+    if (sole) fill(sole.t, { type: 'level', token: sole.loc.slug, label: sole.loc.name,
+      matchedBy: 'sole' });
     return { filled, aligned, accepted };
+  }
+
+  /** Rung 4: the building's **only** drawing paired with its **only** floor Location, whatever the
+   *  two are called (IMPORT-72). Returns `{t, loc}`, or null when the shape isn't that.
+   *
+   *  The case none of the text rungs can reach — a drawing reading `Floor 1` against a building
+   *  whose one floor Location is named `Floor 0`. Rung 1 finds neither the name nor the number,
+   *  rung 2 refuses a single read outright (one read carries no order to align), and rung 3 wants
+   *  ordinal *equality*, which 1 and 0 are not. Yet with one drawing on one side and one floor on
+   *  the other there is no second pairing to be wrong about: whichever storey each of them is
+   *  trying to name, it is the same storey. The evidence is the two counts, not the text — the
+   *  guess is read only as far as getting the drawing into `targets` at all.
+   *
+   *  **Last, and a suggestion.** Last because with a single Location on the board any earlier rung
+   *  that matched matched *that* Location, so this only ever speaks for a drawing nothing else
+   *  answered — purely additive, exactly like `_alignGuesses`' corroboration rule makes rung 2.
+   *  A suggestion because `opts.accept` is consulted on rung 1 alone (IMPORT-63): certainty about
+   *  the counts is not a reading of the sheet, and a rung that ignores the floor code by
+   *  construction is the last one that should commit on a recognition score. `matchedBy: 'sole'`
+   *  is what says so on the card.
+   *
+   *  **Deliberately not the general "last remaining pair".** Every precondition is exactly one, and
+   *  narrowing them that far is what keeps the claim structural rather than statistical. Inside a
+   *  taller building the last unmatched drawing and the last unclaimed floor are what the rungs
+   *  above *declined* to pair; pairing them anyway would be borrowing confidence from the other
+   *  floors' success, which says nothing about these two. */
+  _soleFloorMatch(b, targets) {
+    if (!(Array.isArray(b.nbFloors) && b.nbFloors.length === 1)) return null;
+    if (b.pdfs.length !== 1 || targets.length !== 1) return null;
+    const t = targets[0];
+    // The one target has to be the one drawing's own assignment — the tie that makes "one drawing"
+    // and "one read" a single statement rather than two that merely share a count.
+    if (t.done || b.assign[b.pdfs[0].stem] !== t.a) return null;
+    return { t, loc: b.nbFloors[0] };
   }
 
   /** Match a building's floor reads against its floor Locations **as a set**, by rank: sort both

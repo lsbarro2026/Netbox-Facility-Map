@@ -65,6 +65,57 @@ class EditorToolbar {
       onclick: () => this.ed.duplicateShape(shape),
       html: Icons.dup + `<span>Duplicate as new ${noun}</span>` });
   }
+  /** The shape panel's layering controls — bring to front / raise / lower / send to back, the
+   *  CAD/Illustrator convention (ROOM-4). Lives here beside `duplicateButton` for the same reason:
+   *  the reorder engine is on the base (`Editor.reorderShape`), so both editors can offer the
+   *  identical action off one implementation (§10 *Edit-menu lockstep*). `FloorEditor`'s room
+   *  panel and `SiteplanEditor`'s hotspot panel (SITE-1) both call it.
+   *
+   *  Position matters more than the buttons here: the selected shape is promoted to the
+   *  `.active-layer` and therefore always draws on top while selected (§10 *Rendering layers*), so
+   *  a reorder has no visible effect until the user deselects. The "Layer N of M" readout is what
+   *  makes the change legible in the meantime, and the buttons disable at the extremes so the stack
+   *  position is never ambiguous. The caller re-opens the panel after acting (the `Unbind` idiom),
+   *  which is what refreshes both.
+   *
+   *  Both the count and the buttons are scoped to the shape's **overlap group** — itself plus the
+   *  shapes it geometrically covers — not to the whole floor/siteplan (ROOM-5). Stacking only means
+   *  anything between shapes that cover each other, so a room overlapping nothing reads "Layer 1 of
+   *  1" with every button dead, rather than claiming an arbitrary rank among rooms it can never
+   *  occlude and offering moves that change nothing visible. */
+  layerButtons(shape) {
+    const { noun } = this.ed._shapeTerms();
+    const arr = this.ed._shapeList();
+    if (!arr) return null;   // editor hasn't opted into layering; Dom.el skips a falsy child
+    const i = arr.indexOf(shape);
+    // A shape not in the list (mid-teardown) has no group, which lands on the same inert, honest
+    // readout ("Layer 0 of 0", every button dead) rather than controls that would silently no-op —
+    // `reorderShape` returns false for it anyway.
+    const group = i < 0 ? [] : this.ed._overlapGroup(arr, i);
+    const at = group.indexOf(i) + 1;   // 1-based rank within the group; 0 when absent
+    // `disabled` is set as a property, not through `Dom.el`'s attrs: any *present* `disabled`
+    // attribute disables a button, so passing a falsy one through `setAttribute` would disable
+    // every button instead of none.
+    const btn = (where, title, label, disabled) => {
+      const b = Dom.el('button', { title,
+        onclick: () => this.ed._reorderShapeFromPanel(shape, where) }, label);
+      if (disabled) b.disabled = true;
+      return b;
+    };
+    return Dom.el('div', { class: 'field' }, [
+      Dom.el('label', { title: `Position among the ${noun}s this one overlaps` },
+        `Layer ${at} of ${group.length}`),
+      Dom.el('div', { class: 'row' }, [
+        btn('back', `Send this ${noun} behind every overlapping one`, 'Back', at <= 1),
+        btn('down', `Move this ${noun} down past the next overlapping ${noun}`, 'Down', at <= 1),
+        btn('up', `Move this ${noun} up past the next overlapping ${noun}`, 'Up',
+          at < 1 || at >= group.length),
+        btn('front', `Bring this ${noun} in front of every overlapping one`, 'Front',
+          at < 1 || at >= group.length),
+      ]),
+    ]);
+  }
+
   snapButton() {
     const b = Dom.el('button', { class: 'icononly' + (this.ed.snapOn ? ' active' : ''), title: 'Snap to nearby vertices/edges', html: Icons.snap + '<span>Snap</span>' });
     b.onclick = () => { this.ed.snapOn = !this.ed.snapOn; b.classList.toggle('active', this.ed.snapOn); };

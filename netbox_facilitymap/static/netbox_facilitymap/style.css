@@ -300,6 +300,13 @@ button:disabled { opacity: .45; cursor: default; }
 }
 svg.draw-active { cursor: crosshair; }
 svg.panning { cursor: grabbing; }
+/* The Space-held hand tool (EditorPointer._setForcePan): every press pans, so the whole map must
+   read as grabbable — including over the shapes whose own cursor says otherwise. `!important` and
+   the descendant selector are both load-bearing here: the selected room's polygon, the vertex /
+   label / rack handles and the copy-link targets all set `style.cursor` INLINE from JS, which no
+   plain stylesheet rule can beat. Nothing else may set a cursor on these two classes. */
+svg.force-pan, svg.force-pan * { cursor: grab !important; }
+svg.force-pan.panning, svg.force-pan.panning * { cursor: grabbing !important; }
 
 /* Arrange mode: drag whole sheets between grid cells (FloorEditor._drawArrange). */
 .sheet-grid { fill: none; stroke: var(--border-strong); stroke-dasharray: 6 6;
@@ -1365,12 +1372,24 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
 /* rack / device markers placed inside rooms. The glyph (DeviceShapes)
    is built from classed primitives: `dev-body` (the unit outline), `dev-line`
    (rails / bays / brick courses), `dev-port` (ports / outlets), `dev-led` (status
-   dots). Racks are accent-blue, unracked devices grey; stale = faded + dashed. */
+   dots). Racks are accent-blue; a device wears its NetBox DeviceRole colour, falling back to
+   grey; stale = faded + dashed.
+
+   `--role-color`/`--role-ink` are set inline per marker by FloorPlacements.drawPlacement
+   (DEV-10) — a NetBox datum, not a theme token, so it is identical in light and dark like the
+   rest of the over-the-drawing layer. `--role-ink` is the server's contrast answer for the glyph
+   detail, which would otherwise vanish white-on-white over a pale role colour. Both fall back to
+   the pre-DEV-10 literals, so a rack or a roleless device is unchanged.
+
+   The state rules below (:hover / .stale / .selected) share these rules' specificity, so it is
+   SOURCE ORDER that lets them keep winning — never move them above the role paint. */
 .rack-marker .dev-body { fill: var(--accent); stroke: #fff; stroke-width: 1.5; }
 .rack-marker .dev-line { fill: none; stroke: #fff; stroke-width: 1; stroke-linecap: round; }
 .rack-marker .dev-port { fill: #fff; stroke: none; }
 .rack-marker .dev-led  { fill: var(--success); stroke: none; }
-.rack-marker.device .dev-body { fill: var(--text2); }
+.rack-marker.device .dev-body { fill: var(--role-color, var(--text2)); stroke: var(--role-ink, #fff); }
+.rack-marker.device .dev-line { stroke: var(--role-ink, #fff); }
+.rack-marker.device .dev-port { fill: var(--role-ink, #fff); }
 .rack-marker:hover .dev-body { stroke: var(--warn); stroke-width: 2; }
 .rack-marker.stale .dev-body { fill: var(--neutral-bg); stroke: var(--faint); stroke-dasharray: 3 3; }
 .rack-marker.stale .dev-line, .rack-marker.stale .dev-port { stroke: var(--muted); fill: var(--muted); }
@@ -1683,6 +1702,28 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
   font-family: inherit; font-size: 12.5px; padding: 6px; cursor: pointer; }
 .view-reset:hover { border-color: var(--accent); color: var(--accent); }
 
+/* The floor toolbar's View *filter* (FloorViewFilter, VIEW-2) reuses the popover above wholesale
+   and adds only what a checkbox list of appendable categories needs: an added role's row (whose
+   `<label>` covers just the name + checkbox, so the ✕ beside it doesn't activate the label and
+   toggle the box it removes), and a full-width row for the role picker (`.fm-combo-input`'s own
+   200px would otherwise sit narrower than the 240px panel). */
+.view-role-label { flex: 1 1 auto; min-width: 0; display: flex; align-items: center;
+  justify-content: space-between; gap: 12px; cursor: pointer; }
+.view-role-remove { width: 18px; height: 18px; padding: 0; line-height: 1; background: none;
+  border: none; border-radius: var(--radius); color: var(--muted); font-size: 11px; cursor: pointer; }
+.view-role-remove:hover { color: var(--danger); background: var(--danger-tint); }
+.view-filter-add { padding-bottom: 4px; }
+.view-filter-add .fm-combo, .view-filter-add .fm-combo-input { width: 100%; }
+.view-filter-add .fm-combo-input { padding-right: 8px; }   /* no ✕ here (allowClear: false) */
+
+/* The edit toolbar's Add-device preset dropdown (FloorDeviceTool, DEV-8) — the same popover,
+   its rows full-width buttons (icon + preset label) rather than checkbox rows. */
+.device-preset-row { width: 100%; background: none; border: none; border-radius: var(--radius);
+  justify-content: flex-start; gap: 10px; font-family: inherit; cursor: pointer; text-align: left; }
+.device-preset-row:hover { background: var(--hover); color: var(--accent); }
+.device-preset-row .ico { flex: 0 0 auto; }
+.device-preset-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* ---- Settings view ---- */
 .settings-view { max-width: 640px; margin: 24px auto; padding: 0 16px; }
 .settings-view h2 { font-size: 18px; margin: 0 0 16px; }
@@ -1750,10 +1791,10 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
 .settings-control .fm-text { font-family: var(--mono); }
 
 /* Reference list on a settings sub-page (SET-6): term ⟷ explanation, rendered under the rows it
-   documents by ApSettingsPage._sections (the AP name placeholders and counter scopes). This is the
-   content a one-line row tooltip couldn't hold, and having somewhere to put it is why the sub-page
-   exists. A two-column grid keeps the terms a scannable left rail, stacking when the column would
-   crowd the prose. */
+   documents by DeviceSettingsPage._sections (the name placeholders and counter scopes). This is
+   the content a one-line row tooltip couldn't hold, and having somewhere to put it is why the
+   sub-page exists. A two-column grid keeps the terms a scannable left rail, stacking when the
+   column would crowd the prose. */
 .settings-ref { display: grid; grid-template-columns: max-content 1fr; gap: 9px 14px;
   margin: 0; font-size: 12.5px; }
 .settings-ref dt { color: var(--text2); font-weight: 600; }
@@ -1763,6 +1804,47 @@ svg.grid-adjust .clickzone, svg.grid-adjust .arrow-hit { pointer-events: none; }
   .settings-ref { grid-template-columns: 1fr; gap: 3px 0; }
   .settings-ref dd { margin: 0 0 9px; }
 }
+
+/* The device-preset editor (DeviceSettingsPage, DEV-8): one bordered card per preset — a header
+   strip (icon button, label input, reorder, delete) over ordinary `.settings-row`s driven by the
+   base control builders. A `<fieldset>` so write-mode-off disables every control natively
+   (matching the main page's enabled-gating of the write add-on rows). */
+.preset-list { display: flex; flex-direction: column; gap: 14px; margin: 12px 0; }
+.preset-card { margin: 0; padding: 4px 14px 10px; border: 1px solid var(--line);
+  border-radius: var(--radius-lg); background: var(--panel); min-width: 0; }
+.preset-card:disabled { opacity: .55; }
+.preset-head { display: flex; align-items: center; gap: 10px; padding: 10px 0;
+  border-bottom: 1px solid var(--line2); }
+.preset-head .fm-text { flex: 1 1 auto; min-width: 0; font-weight: 600; }
+.preset-icon-btn { width: 34px; height: 34px; flex: 0 0 auto; display: inline-flex;
+  align-items: center; justify-content: center; background: var(--panel);
+  border: 1px solid var(--border-strong); border-radius: var(--radius); color: var(--text);
+  cursor: pointer; }
+.preset-icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+.preset-move, .preset-delete { width: 26px; height: 26px; flex: 0 0 auto; padding: 0;
+  background: none; border: none; border-radius: var(--radius); color: var(--muted);
+  font-size: 13px; cursor: pointer; }
+.preset-move:hover:not(:disabled) { color: var(--accent); background: var(--hover); }
+.preset-move:disabled { opacity: .35; cursor: default; }
+.preset-delete:hover { color: var(--danger); background: var(--danger-tint); }
+.preset-naming { display: flex; align-items: center; gap: 8px; }
+.preset-naming .fm-text { flex: 1 1 auto; min-width: 0; }
+.preset-fields { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px;
+  font-size: 12.5px; }
+.preset-fields-fixed { color: var(--muted); }
+.preset-field { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.preset-add-row { margin: 4px 0 18px; }
+
+/* The grouped icon picker the preset card's icon button opens: a wrapping grid of icon cells,
+   the selected one outlined in the accent. */
+.fm-modal-panel.fm-icon-picker { width: min(520px, 92vw); max-height: 78vh; overflow-y: auto; }
+.icon-grid { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 12px; }
+.icon-cell { width: 38px; height: 38px; display: inline-flex; align-items: center;
+  justify-content: center; background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); color: var(--text); cursor: pointer; }
+.icon-cell:hover { border-color: var(--accent); color: var(--accent); }
+.icon-cell.selected { border-color: var(--accent); color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent); }
 
 /* Searchable single-select (Combo, lib.js): an input plus an absolutely-positioned result list.
    The wrapper is the positioning context; the list is hidden until JS adds `.open`.
@@ -2223,11 +2305,19 @@ button.wide { width: 100%; margin-bottom: 6px; justify-content: center; }
 .imp-overview { margin: 14px 0 6px; padding: 10px 12px; background: var(--panel2);
   border: 1px solid var(--line); border-radius: var(--radius-lg); }
 .imp-overview summary { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--text2); }
-.imp-overview-bar { height: 6px; margin: 10px 0; background: var(--neutral-bg);
+/* Three segments, in order: finished, not-checked-yet, and the outstanding remainder the track
+   itself shows through (BUG-3). The middle one is deliberately faint — it is an absence of
+   information, not a second kind of progress, and must never read as nearly-done. */
+.imp-overview-bar { height: 6px; margin: 10px 0; display: flex; background: var(--neutral-bg);
   border: 1px solid var(--neutral-border); border-radius: 999px; overflow: hidden; }
-.imp-overview-fill { display: block; height: 100%; background: var(--success); }
+.imp-overview-fill { display: block; height: 100%; flex: none; background: var(--success); }
+.imp-overview-fill-unknown { display: block; height: 100%; flex: none; background: var(--muted);
+  opacity: .3; }
 .imp-overview-tools { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .imp-overview-fields { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+/* The undo slot is always in the row so its count can be restated in place; drop it out of the
+   flex flow entirely when it holds no button, or it would spend a `gap` saying nothing. */
+.imp-overview-undo:empty { display: none; }
 .imp-overview-tools .hint { margin: 0; }
 .imp-overview-find { min-width: 14em; }
 /* The row list is capped and scrolls: at 150 buildings an uncapped list would push the cards it
@@ -2532,18 +2622,31 @@ button.wide { width: 100%; margin-bottom: 6px; justify-content: center; }
    marked — is all the crop half needs of its own. */
 .imp-region-state { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   margin-bottom: 12px; }
-/* Region-split editor (FLOOR-4): several numbered boxes over one plan, each its own floor. The
-   overlay covers the canvas but never intercepts the pointer, so a drag always reaches the image
-   beneath to add a new box; each box is labelled with its 1-based number (matching the list rows). */
-.imp-region-overlay { position: absolute; inset: 0; pointer-events: none; }
-.imp-region-box { position: absolute; border: 2px solid var(--accent, #2f80ed);
-  background: rgba(47, 128, 237, .14); color: #fff; font-size: 12px; font-weight: 700;
-  line-height: 1; padding: 2px 4px; box-sizing: border-box;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, .7); }
-/* One assignment row per region: its number, the reused floor buttons, and a Remove. */
+/* Region-split editor (FLOOR-4; rebuilt on the map editors' engine, FLOOR-6): the shared draw
+   tools above a `.map-viewport` hosted in document flow (the map views size theirs absolutely via
+   `#stage > .map-viewport`, so the wizard-hosted one needs its own height), with SVG region
+   shapes numbered to match the list rows. Strokes hold their on-screen width under PanZoom
+   (non-scaling-stroke), and the number counter-scales via --inv-scale like the node markers. */
+.imp-region-tools { display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  margin: 0 0 10px; }
+.import-view .map-viewport { height: 70vh; border: 1px solid var(--line);
+  border-radius: var(--radius); background: var(--image-matte); margin-bottom: 12px; }
+.imp-region-shape { fill: rgba(47, 128, 237, .14); stroke: var(--accent, #2f80ed);
+  stroke-width: 2; vector-effect: non-scaling-stroke; cursor: pointer; }
+/* While a draft/rectangle is being drawn, existing regions must not swallow the placement
+   clicks — the same rule the map editors apply to .room/.hotspot in draw mode. */
+.draw-active .imp-region-shape { pointer-events: none; }
+.imp-region-shape:hover { fill: rgba(47, 128, 237, .22); }
+.imp-region-shape.selected { fill: rgba(47, 128, 237, .26); stroke-width: 2.5; }
+.imp-region-shape-num { fill: #fff; font-size: calc(13px * var(--inv-scale, 1)); font-weight: 700;
+  paint-order: stroke; stroke: rgba(0, 0, 0, .7); stroke-width: calc(3px * var(--inv-scale, 1));
+  pointer-events: none; user-select: none; }
+/* One assignment row per region: its number (a button — clicking selects the region on the
+   drawing), the reused floor buttons, and a Remove. The selected region's row echoes it. */
 .imp-region-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
 .imp-region-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   padding: 8px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.imp-region-row.selected { border-color: var(--accent); }
 .imp-region-rownum { font-weight: 600; font-size: 12.5px; min-width: 5.5em; }
 /* Card affordances: the opt-in "Split into floors…" link under the whole-page buttons, and the
    read-only summary shown once a drawing is split. */

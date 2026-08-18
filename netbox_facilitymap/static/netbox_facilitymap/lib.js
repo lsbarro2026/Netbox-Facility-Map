@@ -447,45 +447,209 @@ class Geom {
     return subs.join(' ');
   }
 
+  /** One ring's containment inputs — the ring itself plus its area and bbox — precomputed so the
+   *  scans below compare cheap records instead of re-deriving both per pair. `null` for a
+   *  degenerate (< 3 point) ring, which is how both callers skip one. */
+  static _containEntry(ring) {
+    return (ring && ring.length >= 3)
+      ? { ring, area: Geom.polyArea(ring), b: Geom.bounds(ring) } : null;
+  }
+
+  /** Is `inner` **strictly inside** `outer` (both `_containEntry` records)? The one containment
+   *  predicate behind `containedMap` and `containedIndices` below — extracted so the two can never
+   *  drift apart on either the test or its epsilon, which is a documented parity pair with the
+   *  server-side `previews.contained_map` (§10 *rendering-export-editing*).
+   *
+   *  Strictly-smaller area, then a bbox pre-check, then every vertex inside. See `containedMap` for
+   *  why "inside" is boundary-inclusive within `tol` (`polyDist(...) >= -tol`, never a bare
+   *  `pointInPoly`) and why `tol` is ten coordinate quanta rather than one. */
+  static _containsEntry(inner, outer, tol) {
+    if (inner === outer || inner.area >= outer.area) return false;
+    // The bbox pre-check carries the same slack as the vertex test — a shared wall puts the two
+    // bboxes flush on that side, so a strict compare here would reject before the loop even runs.
+    if (inner.b.minX < outer.b.minX - tol || inner.b.minY < outer.b.minY - tol
+      || inner.b.maxX > outer.b.maxX + tol || inner.b.maxY > outer.b.maxY + tol) return false;
+    return inner.ring.every(([x, y]) => Geom.polyDist(x, y, outer.ring) >= -tol);
+  }
+
   /** Map each room's `id` → the rings of its **directly** contained smaller rooms, so a larger
    *  room's fill can punch those areas out (via an evenodd `<path>`) instead of double-painting
-   *  over them. A render-time, derived relationship — stacking isn't modelled and stored geometry
-   *  is untouched; recomputed each render from the other rooms' polygons. Mirrors the server-side
+   *  over them. The subtraction is render-time and derived — stored geometry is untouched,
+   *  recomputed each render from the other rooms' polygons. Mirrors the server-side
    *  `previews.contained_map` (which the NetBox embeds use), keyed here by the frontend `room.id`.
+   *
+   *  **`rooms` must arrive in paint order, bottom→top** (ROOM-4): a room punches out only the
+   *  contained children painted **above** it, so sending a nested room behind its container drops
+   *  the punch and lets the container paint and hit-test over it. The default stacking (largest at
+   *  the bottom) keeps a contained child above its container, so the common case is unchanged.
    *
    *  Containment is **strict**: strictly-smaller area **and** every vertex inside (with a bbox
    *  pre-check), so a room straddling another's boundary is out of scope (partial overlap would
    *  need true polygon clipping). Only **direct** children are returned — a room contained in `A`
    *  but also in another room itself inside `A` is punched out at that intermediate level, keeping
-   *  the evenodd parity correct at any nesting depth. `rooms` is any iterable exposing `.id` and
-   *  `.polygon` ([[nx,ny],...] 0..1). */
-  static containedMap(rooms) {
+   *  the evenodd parity correct at any nesting depth; the z-order gate applies to that already-pruned
+   *  set, never to the containment test itself (the pruning needs the full descendant tree, or a
+   *  mixed-z grandparent would list a grandchild and break that parity). `rooms` is any iterable
+   *  exposing `.id` and `.polygon` ([[nx,ny],...] 0..1).
+   *
+   *  "Inside" is **boundary-inclusive** within `tol` — `polyDist(...) >= -tol`, never a bare
+   *  `pointInPoly` (ROOM-6), for the reason `polysOverlap` gives below: the ray-cast has no boundary
+   *  tolerance and answers a vertex sitting *on* an edge asymmetrically (on a left or bottom wall it
+   *  reads inside, on a right or top wall outside). A nested room almost always shares a wall with
+   *  the space it was carved out of, so without the tolerance the punch silently dropped for half of
+   *  them and the container painted over the child. `tol` is a whole **ten** coordinate quanta rather
+   *  than the one `polysOverlap` budgets: vertices are written at 5 dp, but `FloorArrange`'s grid
+   *  remap and `ImportDiff`'s sheet remap *recompute* them through scaling arithmetic and re-round,
+   *  so two rooms snapped flush before a remap can drift further than a quantum apart afterwards. It
+   *  can still only widen containment, which already demands a strictly smaller area and a contained
+   *  bbox. **Keep this epsilon identical to `previews.contained_map`'s** — the two are a parity pair
+   *  (§10 *rendering-export-editing*), and a client that punches where the server doesn't shows the
+   *  editor and the NetBox embed disagreeing about the same floor. */
+  static containedMap(rooms, tol = 1e-4) {
     // Precompute each room's ring, area and bbox once (O(n·v)); the containment scan is then O(n²).
     const entries = [];
     for (const room of rooms) {
-      const ring = room.polygon || [];
-      if (ring.length < 3) continue;
-      entries.push({ id: room.id, ring, area: Geom.polyArea(ring), b: Geom.bounds(ring) });
+      const e = Geom._containEntry(room.polygon || []);
+      if (!e) continue;
+      e.id = room.id;
+      entries.push(e);
     }
     const n = entries.length;
-    const isContained = (inner, outer) => {
-      if (inner === outer || inner.area >= outer.area) return false;
-      if (inner.b.minX < outer.b.minX || inner.b.minY < outer.b.minY
-        || inner.b.maxX > outer.b.maxX || inner.b.maxY > outer.b.maxY) return false;
-      return inner.ring.every(([x, y]) => Geom.pointInPoly(x, y, outer.ring));
-    };
     // contains[i] = indices of the rooms strictly inside entries[i] (all descendants, any depth).
-    const contains = entries.map(outer =>
-      new Set(entries.map((inner, j) => (isContained(inner, outer) ? j : -1)).filter(j => j >= 0)));
+    const contains = entries.map(outer => new Set(
+      entries.map((inner, j) => (Geom._containsEntry(inner, outer, tol) ? j : -1)).filter(j => j >= 0)));
     const result = new Map();
     for (let i = 0; i < n; i++) {
       const children = [...contains[i]];
       // Keep only direct children: drop a descendant `j` that another child `k` of `i` also
-      // contains (so `j` is punched out by `k`, one level down, not by `i`).
-      const direct = children.filter(j => !children.some(k => k !== j && contains[k].has(j)));
+      // contains (so `j` is punched out by `k`, one level down, not by `i`). Then keep only those
+      // painted ABOVE `i` (`j > i` — `entries` preserves the caller's bottom→top order), so a
+      // child sent behind its container stops being punched out of it (ROOM-4).
+      const direct = children.filter(j => j > i && !children.some(k => k !== j && contains[k].has(j)));
       if (direct.length) result.set(entries[i].id, direct.map(j => entries[j].ring));
     }
     return result;
+  }
+
+  /** The ascending indices of the rings **strictly inside** `polys[i]` — the one-vs-rest accessor to
+   *  the same containment test `containedMap` runs, with the same default `tol`, so "does this shape
+   *  contain that one" always answers identically to "would the punch apply to it".
+   *
+   *  Used by `Editor._placeNewShape` to decide where a brand-new shape belongs in the z-order
+   *  (ROOM-8): a shape drawn *around* existing ones is appended on top of them, where it paints
+   *  over them, swallows their clicks and drops the punch-out entirely, so the create path drops it
+   *  below them instead.
+   *
+   *  Two deliberate differences from `containedMap`. There is **no z-order gate** — the caller is
+   *  deciding what the order should *be*, so reading the order it is about to change would be
+   *  circular. And there is **no direct-child pruning**: it reports every descendant at any depth,
+   *  because a grandchild sitting *lower* in the array than its parent would otherwise go unseen and
+   *  end up above the new shape — precisely the occlusion the placement exists to prevent. Neither
+   *  applies to `containedMap`'s job (evenodd parity at one nesting level), which is why they live
+   *  here rather than in `_containsEntry`. */
+  static containedIndices(polys, i, tol = 1e-4) {
+    const outer = Geom._containEntry(polys[i]);
+    if (!outer) return [];
+    const inside = [];
+    for (let j = 0; j < polys.length; j++) {
+      if (j === i) continue;
+      const inner = Geom._containEntry(polys[j]);
+      if (inner && Geom._containsEntry(inner, outer, tol)) inside.push(j);
+    }
+    return inside;
+  }
+
+  /** Do segments p→q and r→s **properly cross** — meet at a point interior to both? Orientation
+   *  test on each pair, strict on both sides, so collinear segments and a segment merely ending on
+   *  the other are NOT crossings.
+   *
+   *  That strictness is the whole point (ROOM-5): vertex/edge snapping makes rooms drawn wall to
+   *  wall share their boundary *exactly*, so counting a shared wall as a crossing would report
+   *  every adjacent room as overlapping. The cross product scales with |a→b|, so it is divided back
+   *  out before the comparison — `tol` is then a plain distance in the caller's (normalized) units
+   *  rather than a raw cross-product magnitude, and means the same thing here as in `polysOverlap`. */
+  static segsIntersect(p, q, r, s, tol = 1e-5) {
+    const side = (a, b, c) => {
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      const cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+      const d = len ? cross / len : 0;          // signed distance from c to the line a→b
+      return Math.abs(d) <= tol ? 0 : Math.sign(d);
+    };
+    return side(p, q, r) * side(p, q, s) < 0 && side(r, s, p) * side(r, s, q) < 0;
+  }
+
+  /** A ring's vertices **plus its edge midpoints** — the sample points `polysOverlap` probes
+   *  against the other polygon. The midpoints are not padding: grid- and wall-snapped rooms
+   *  routinely share a boundary *line* (two rooms of equal height side by side, a nested room
+   *  flush against a wall), and in exactly that configuration every corner sits ON the other ring
+   *  while the edge between two of them runs straight through its interior. Probing corners alone
+   *  would call those pairs non-overlapping. */
+  static _ringProbes(ring) {
+    const pts = [];
+    for (let i = 0; i < ring.length; i++) {
+      const a = ring[i], b = ring[(i + 1) % ring.length];
+      pts.push(a, [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]);
+    }
+    return pts;
+  }
+
+  /** Do two normalized rings **share interior area**? True for partial, edge-crossing overlap and
+   *  for full containment either way round; false for disjoint, corner-touching and wall-sharing
+   *  shapes. The general test `containedMap` deliberately doesn't do — that one detects full
+   *  containment only — used to scope a shape's layering controls to the shapes it actually covers
+   *  (ROOM-5). It is a **predicate**, not a clipper: it answers whether two rings overlap, never
+   *  what the overlapping region is (§10 *Partial overlap composites; it is not clipped*).
+   *
+   *  Four passes, cheapest first: separated (or merely touching) bounding boxes reject outright;
+   *  then any properly-crossing edge pair; then any probe point of either ring strictly inside the
+   *  other; then all-vertices-inside-or-on, which picks up the one remaining shared-area case —
+   *  exactly coincident rings, where nothing crosses and nothing is strictly interior.
+   *
+   *  Interiority is `polyDist(...) > tol`, never a bare `pointInPoly`: the ray-cast has no boundary
+   *  tolerance and answers a point sitting *on* an edge asymmetrically (a point on a left edge
+   *  reads inside, the same point on a right edge outside), so two rooms snapped flush along a
+   *  shared wall would read as overlapping about half the time. `tol` is **one coordinate quantum**
+   *  — vertices are written at 5 dp (`toFixed(5)`) throughout the editors, so a flush wall lands
+   *  within that of coincident and anything deeper is a real overlap. */
+  static polysOverlap(a, b, tol = 1e-5) {
+    if (!a || !b || a.length < 3 || b.length < 3) return false;
+    const ba = Geom.bounds(a), bb = Geom.bounds(b);
+    if (ba.minX >= bb.maxX - tol || bb.minX >= ba.maxX - tol
+      || ba.minY >= bb.maxY - tol || bb.minY >= ba.maxY - tol) return false;
+    for (let i = 0; i < a.length; i++) {
+      const a1 = a[i], a2 = a[(i + 1) % a.length];
+      for (let j = 0; j < b.length; j++)
+        if (Geom.segsIntersect(a1, a2, b[j], b[(j + 1) % b.length], tol)) return true;
+    }
+    const anyInside = (ring, poly) =>
+      Geom._ringProbes(ring).some(([x, y]) => Geom.polyDist(x, y, poly) > tol);
+    if (anyInside(a, b) || anyInside(b, a)) return true;
+    // Nothing crosses and nothing is strictly interior: the rings are disjoint, merely touching, or
+    // exactly coincident. Only the last shares area, and it is the only one where EVERY vertex of a
+    // ring lies on (or inside) the other — a shared wall or a touched corner leaves the rest of the
+    // ring well outside.
+    const within = (ring, poly) => ring.every(([x, y]) => Geom.polyDist(x, y, poly) >= -tol);
+    return within(a, b) || within(b, a);
+  }
+
+  /** The **overlap group** of `polys[i]`: the indices whose ring overlaps it, plus `i` itself, in
+   *  ascending (= array, therefore z-order) order. What the shape panel's layering row counts and
+   *  what its Back/Down/Up/Front buttons restack within (ROOM-5) — stacking only means anything
+   *  between shapes that actually cover each other, so a shape overlapping nothing gets a group of
+   *  one and no moves at all.
+   *
+   *  Membership is **direct, not transitive**: a shape joins because it overlaps `polys[i]`, not
+   *  because it overlaps something that does. The group is therefore relative to `i` and recomputed
+   *  per selected shape — which is the point, since the question being answered is "where does THIS
+   *  shape sit among the ones it actually collides with". A degenerate (<3 point) ring simply never
+   *  joins a group; `i` itself is always present, so the caller's shape is never missing from its
+   *  own group. */
+  static overlapGroup(polys, i, tol = 1e-5) {
+    const target = polys[i];
+    const group = [];
+    for (let j = 0; j < polys.length; j++)
+      if (j === i || Geom.polysOverlap(target, polys[j], tol)) group.push(j);
+    return group;
   }
 }
 
@@ -809,7 +973,7 @@ class Modal {
  *  Options are `{id, name}` objects; `value` is one of them or null. Construct it, append `.el`:
  *
  *      const combo = new Combo({
- *        value: app.apDeviceRole,                 // {id,name} | null
+ *        value: preset.role,                      // {id,name} | null
  *        load: (q) => netbox.deviceRoles(q).then(r => r.roles),
  *        onPick: (opt) => this._saveRole(opt),    // may return a Promise
  *      });

@@ -59,7 +59,13 @@ def compose_annotations(blob_data, user, request, facility='', viewable=None):
     rooms. The default facility '' resolves to every ungrouped site (all sites on a single-facility
     install), preserving today's whole-document shape."""
     doc = {fkey: dict(floor) for fkey, floor in (blob_data or {}).items()}
-    rooms = Room.objects.restrict(user, 'view').select_related('location')
+    # Ordered by the explicit stacking order (ROOM-4), NOT the alphabetical `Room.Meta.ordering`
+    # this queryset would otherwise inherit: the frontend paints and hit-tests each floor's rooms in
+    # the order this list arrives in, so the composed array order *is* the z-order the user chose.
+    # `room_id` breaks ties deterministically — rooms sharing a `z_order` are only ever rows a REST
+    # client created (they keep the `0` default until the next editor save re-indexes the floor).
+    rooms = (Room.objects.restrict(user, 'view').select_related('location')
+             .order_by('z_order', 'room_id'))
     # The facility→site-slug mapping bounds which floors belong to the facility; it is not itself
     # permission-sensitive (the rooms stay `.restrict(user,'view')`), so resolve it unscoped so an
     # editor lacking Site-view permission still sees their facility's rooms.
@@ -104,6 +110,12 @@ def sync_rooms(rooms_by_floor, user=None, facility='', *, sweep_absent=True):
     including a room authored out-of-band through the REST API (it carries a `room_id` the editor
     never emitted, so it isn't in `seen`); see the sweep-on-save caveat in `api/serializers.py`.
 
+    A posted floor is authoritative for its **stacking order** too (ROOM-4): each room's `z_order` is
+    rewritten from its array position in the posted list, so the order the editor sends is the order
+    `compose_annotations` reads back. That makes the posted array the one representation of z-order —
+    the wire room object carries no `z` key of its own — and it re-densifies the column on every save,
+    so a REST-created row's `0` default is absorbed rather than colliding forever.
+
     `sweep_absent` governs the cross-floor pass. When `True` (the trusted, whole-facility
     `facilitymap_import` command) rooms of the facility's floors that are absent *entirely* from
     the document are also removed — an authoritative-over-the-whole-facility save. When `False`
@@ -132,6 +144,9 @@ def sync_rooms(rooms_by_floor, user=None, facility='', *, sweep_absent=True):
         floor_loc = resolve_floor_location(fkey)
         floor_defaults = {'floor_location': floor_loc} if floor_loc is not None else {}
         seen = []
+        # `z` counts only the rooms actually written, so the stored order stays dense (0..n-1) even
+        # when the posted list carries an id-less entry the loop skips.
+        z = 0
         for room in rooms:
             rid = room.get('id')
             if not rid:
@@ -147,9 +162,14 @@ def sync_rooms(rooms_by_floor, user=None, facility='', *, sweep_absent=True):
                     'label': room.get('label') or '',
                     'alias': room.get('alias') or '',
                     'polygon': room.get('polygon') or [],
+                    # The posted list's **array position** is the room's stacking order (ROOM-4) —
+                    # the frontend paints its `rooms` array in order and carries no separate `z`
+                    # key, so there is one representation and it cannot disagree with itself.
+                    'z_order': z,
                     'location_id': loc_id,
                     **floor_defaults,
                 })
+            z += 1
         del_qs.filter(floor_key=fkey).exclude(room_id__in=seen).delete()
     if not sweep_absent:
         return

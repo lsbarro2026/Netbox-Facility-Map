@@ -83,14 +83,17 @@ class FloorExport {
     const ed = this.editor, app = ed.app;
     const g = Dom.svg('g');
     ed.svg.append(g);
-    const saved = { mode: app.mode, highlight: app.highlight, selected: ed.selected,
+    const saved = { mode: app.mode, viewCategories: app.viewCategories, selected: ed.selected,
       selectedArrow: ed.selectedArrow, selectedNote: ed.selectedNote,
       selectedPlacement: ed.selectedPlacement, draft: ed.draft, placingRacks: ed.placingRacks };
     try {
       // Force the neutral annotated view (all rooms shown, nothing selected) regardless of
       // the mode the user is actually in. `placingRacks` is cleared too — it (not `app.mode`)
       // gates the racks render path, and while set it would suppress wayfinding arrows/notes.
-      app.mode = 'view'; app.highlight = 'all'; ed.placingRacks = false;
+      // The View filter is swapped for a fresh show-everything selection (never mutated in place —
+      // `saved` still holds the user's own object), so an export renders the FULL floor however the
+      // user has the toolbar filtered (VIEW-2).
+      app.mode = 'view'; app.viewCategories = FloorViewFilter.everything(); ed.placingRacks = false;
       ed.selected = null; ed.selectedArrow = null; ed.selectedNote = null;
       ed.selectedPlacement = null; ed.draft = null;
       // Overlays render beneath the annotations in the live view (grid < overlay < static),
@@ -100,7 +103,7 @@ class FloorExport {
       this._inlineStyles(g);
       return g.cloneNode(true);
     } finally {
-      Object.assign(app, { mode: saved.mode, highlight: saved.highlight });
+      Object.assign(app, { mode: saved.mode, viewCategories: saved.viewCategories });
       ed.selected = saved.selected; ed.selectedArrow = saved.selectedArrow;
       ed.selectedNote = saved.selectedNote;
       ed.selectedPlacement = saved.selectedPlacement; ed.draft = saved.draft;

@@ -1,8 +1,10 @@
 """Shared pytest fixtures for the plugin test suite.
 
 The tests live outside the `netbox_facilitymap` package (so they aren't shipped in the wheel)
-and hook NetBox's Django settings via pytest-django — see the repo README's "Running the tests"
-for the run recipe (it passes the machine-specific PYTHONPATH on the CLI).
+and hook NetBox's Django settings via pytest-django (see `[tool.pytest.ini_options]` in
+`pyproject.toml`). Run with `pip install -e '.[dev]'`, then from this directory:
+`PYTHONPATH=/path/to/netbox/netbox pytest --reuse-db` (the machine-specific PYTHONPATH points at
+the NetBox source tree and isn't committed anywhere).
 
 Fixtures here fall into two groups:
   * `make_pdf` / `workdir` / `backupdir` — filesystem/config plumbing, no DB needed.

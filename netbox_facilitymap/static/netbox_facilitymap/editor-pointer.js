@@ -13,7 +13,7 @@
 // Draft kinds that are a single point rather than a run of them: the first click both places
 // and finishes them (see the click handler in bind()). A subclass opts a tool in by
 // drafting one of these kinds — FloorEditor's text note and access-point tools do.
-const SINGLE_POINT_KINDS = new Set(['note', 'ap']);
+const SINGLE_POINT_KINDS = new Set(['note', 'device']);
 
 // A vertex/marker/pan press only becomes a drag once the pointer travels this far (screen px);
 // below it the press is a select/inspect click and must not move geometry or the viewport.
@@ -32,6 +32,7 @@ class EditorPointer {
     this._dragDown = null;         // { x, y, moved } press origin for the vertex/item drag threshold
     this._suppressClick = false;   // swallow the click that ends a left-button pan drag
     this._gestureSnap = null;      // pre-drag snapshot, committed to history only if the drag mutates
+    this._forcePan = false;        // Space held: the hand tool, forcing every left press into a pan
   }
 
   /** Wire pointer interactions onto the editor's svg. Called once per mount (Editor.attach). */
@@ -64,6 +65,18 @@ class EditorPointer {
       if (this._pointers.size < 2) this._suppressClick = false;
       this._dragDown = { x: e.clientX, y: e.clientY, moved: false };
       this._gestureSnap = ed._snapshotState();
+      // The Space-held hand tool takes the press outright: while it is on, a left press pans
+      // whatever it landed on. This lives in the CAPTURE listener precisely so it can stop the
+      // event ahead of every shape's own pointerdown (vertex, midpoint, marker, selected-room
+      // body, sheet tile) — one touchpoint instead of a `_forcePan` check re-derived on each of
+      // them. It must be stopIMMEDIATEPropagation, not stopPropagation: a press on the empty
+      // background targets the svg itself, where the plain-arm listener below is a same-node
+      // listener that would otherwise still run and re-arm the pan without `forced`.
+      // preventDefault suppresses the text/image drag a press over a shape would start.
+      if (this._forcePan && e.button === 0) {
+        e.preventDefault(); e.stopImmediatePropagation();
+        this._armPan(e, true).forced = true;
+      }
     }, true);
     s.addEventListener('click', (e) => {
       if (this.gestureClick()) return;
@@ -89,21 +102,20 @@ class EditorPointer {
         ed.gridDrag = { x: e.clientX, y: e.clientY, ox: ed.grid.ox, oy: ed.grid.oy };
         s.setPointerCapture(e.pointerId); return;
       }
-      // Pan: middle button anywhere, or left button on empty map background
-      // (the svg itself or the transparent catcher — never a shape or vertex).
+      // The map background is the svg itself or the transparent catcher; anything else the
+      // press can land on is a shape (a room/hotspot fill, a vertex, a marker).
       const onBackground = e.target === s || e.target.classList.contains('catcher');
-      // Rectangle tool: a left-button background press begins a box drag (takes the
-      // background gesture that would otherwise pan).
-      if (ed.rectMode && e.button === 0 && onBackground && ed.editing() && !ed.grid.adjust) {
+      const intent = EditorPointer.pressIntent({ button: e.button, onBackground,
+        rectMode: ed.rectMode, editing: ed.editing(), gridAdjust: ed.grid.adjust });
+      // Rectangle tool: a left-button press begins a box drag wherever it lands, on
+      // background or on top of a shape (takes the gesture that would otherwise pan).
+      if (intent === 'rect') {
         const start = ed.snapPoint(...ed.evtNorm(e)).pt;
         ed.rectDraft = { a: start, b: start };
         s.setPointerCapture(e.pointerId);
         return;
       }
-      if (e.button === 1 || (e.button === 0 && onBackground)) {
-        ed.pan = { x: e.clientX, y: e.clientY, moved: false, btn: e.button };
-        s.setPointerCapture(e.pointerId);
-      }
+      if (intent) this._armPan(e, intent === 'pan');
     });
     s.addEventListener('pointermove', (e) => {
       if (this._pointers.has(e.pointerId)) this._pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -111,6 +123,10 @@ class EditorPointer {
       if (ed.pan) {
         const dx = e.clientX - ed.pan.x, dy = e.clientY - ed.pan.y;
         if (!ed.pan.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+        // The press has just become a real pan, so a shape-origin pan takes its deferred
+        // pointer capture now (see `_armPan`): from here the drag must keep tracking after the
+        // pointer leaves the shape it started on — or the svg entirely.
+        if (ed.pan.grab != null) { s.setPointerCapture(ed.pan.grab); ed.pan.grab = null; }
         ed.pan.moved = true; ed.pan.x = e.clientX; ed.pan.y = e.clientY;
         s.classList.add('panning'); ed.viewport.panBy(dx, dy); return;
       }
@@ -170,8 +186,10 @@ class EditorPointer {
       // A sheet drag ends here: commit the move (which re-renders) and swallow the
       // trailing click so it doesn't deselect/draw.
       if (ed.dragSheet) { this._suppressClick = true; const d = ed.dragSheet; ed.dragSheet = null; d.drop(); return; }
-      // A left-button pan is followed by a click event — swallow that one click.
-      if (ed.pan && ed.pan.moved && ed.pan.btn === 0) this._suppressClick = true;
+      // A left-button pan is followed by a click event — swallow that one click. A *forced*
+      // (Space-held) pan swallows it even when the press never moved: the hand tool exists to
+      // click through nothing, so it must not select a shape or place a draft point either.
+      if (ed.pan && ed.pan.btn === 0 && (ed.pan.moved || ed.pan.forced)) this._suppressClick = true;
       // A vertex/handle/edge press or drag also ends with a synthetic click on the svg;
       // swallow it so it doesn't fall through to the background-click deselect,
       // keeping the shape selected for the next node edit.
@@ -189,6 +207,12 @@ class EditorPointer {
     });
     s.addEventListener('pointerleave', () => {
       if (ed.draft && ed.draft.cursor) { ed.draft.cursor = null; ed.render(); }
+      // A pan still holding a *deferred* capture (a shape-origin press that hasn't passed the
+      // drag threshold) can no longer be tracked once the pointer leaves the svg — its
+      // pointerup lands on some other element and never reaches us, leaving the channel armed
+      // to pan on a later button-less hover. Drop it; the gesture panned nothing anyway. A pan
+      // that already took its capture never sees pointerleave, so this only ever catches that.
+      if (ed.pan && ed.pan.grab != null) ed.pan = null;
     });
     // A cancelled pointer (the browser reclaimed the gesture) never fires pointerup —
     // forget it and unwind any pinch/pan so the next touch starts clean.
@@ -205,6 +229,50 @@ class EditorPointer {
       if (ed.grid.adjust && ed.gridActive()) { ed.grid.resize(e.deltaY); ed.render(); return; }
       ed.viewport.zoomBy(e.deltaY < 0 ? ZOOM_STEP_WHEEL : 1 / ZOOM_STEP_WHEEL, { x: e.clientX, y: e.clientY });
     }, { passive: false });
+  }
+
+  /** What a `pointerdown` on the map arms, decided from the press alone. Pure and static so the
+   *  one rule that used to be spelled inline in `bind()` can be unit-tested (`bind()` itself is
+   *  all DOM and can't be). `onBackground` is true for the svg or the transparent `.catcher`,
+   *  false for any shape the press landed on.
+   *
+   *  - `'rect'`         — the rectangle tool lays out a box; wins **wherever the press lands**
+   *                       (FLOOR-8 — same reasoning as the pan rule below: `beginRect` always
+   *                       clears the selection, so no shape owns a competing `pointerdown` while
+   *                       the tool is armed), taking precedence over the pan.
+   *  - `'pan'`          — pan the viewport, taking pointer capture immediately.
+   *  - `'pan-deferred'` — pan the viewport, but WITHOUT capturing yet (see `_armPan`).
+   *  - `null`           — nothing; the press belongs to whatever it landed on.
+   *
+   *  A left press arms a pan **wherever it lands**, including on top of a room or hotspot
+   *  (FLOOR-7): on a floor whose polygons tile the whole view there is otherwise no background
+   *  left to grab, and the map can't be dragged at all. What keeps that from eating the shape's
+   *  click is the drag threshold, not the hit test — below `DRAG_THRESHOLD_PX` the press stays a
+   *  plain click. Shapes owning a left-drag of their own (vertex, midpoint, marker, the selected
+   *  room's body, a sheet tile) `stopPropagation()` on `pointerdown`, so those gestures never
+   *  reach the listener that calls this. */
+  static pressIntent({ button, onBackground, rectMode, editing, gridAdjust }) {
+    if (rectMode && button === 0 && editing && !gridAdjust) return 'rect';
+    if (button === 1) return 'pan';
+    if (button === 0) return onBackground ? 'pan' : 'pan-deferred';
+    return null;
+  }
+
+  /** Open the pan channel for this press, and return the record so a caller can flag it.
+   *
+   *  `capture` decides WHEN the svg takes the pointer, which is the whole reason a press that
+   *  started on a shape can still be a click: pointer capture retargets the trailing `click` to
+   *  the capture element (Pointer Events L3 — it is why a vertex drag "ends with a synthetic
+   *  click on the svg", see pointerup). Capturing here for a shape-origin press would therefore
+   *  steal every room/hotspot click and break navigation. So the capture is **deferred** to the
+   *  moment `pointermove` crosses the drag threshold and the press becomes a genuine pan;
+   *  a background or middle-button press has no shape click to protect and captures at once. */
+  _armPan(e, capture) {
+    const ed = this.ed;
+    ed.pan = { x: e.clientX, y: e.clientY, moved: false, btn: e.button };
+    if (capture) ed.svg.setPointerCapture(e.pointerId);
+    else ed.pan.grab = e.pointerId;
+    return ed.pan;
   }
 
   /** True when this click is the tail of a gesture that already did its job — a pan, a pinch, or
@@ -322,6 +390,15 @@ class EditorPointer {
       e.preventDefault(); ed.draft ? ed.undoNode() : ed.undo(); return;
     }
     if (e.key === 'Backspace' && ed.draft) { e.preventDefault(); ed.undoNode(); return; }
+    // Hold Space for the hand tool (the Figma/CAD convention): while held, a left press pans
+    // whatever it lands on. The escape hatch for the places the pointer alone can't reach the
+    // map — the selected room's body, which owns its press to drag the room — and the one that
+    // is discoverable, unlike the middle button no trackpad has. Released in `handleKeyUp`.
+    if (e.key === ' ') {
+      if (EditorPointer._isControlTarget(e.target)) return;   // Space is that control's own activation key
+      e.preventDefault();                                     // ...and the page's scroll key everywhere else
+      this._setForcePan(true); return;
+    }
     if (e.key === '+' || e.key === '=') { ed.viewport.zoomBy(ZOOM_STEP); return; }
     if (e.key === '-' || e.key === '_') { ed.viewport.zoomBy(1 / ZOOM_STEP); return; }
     if (e.key === '0') { ed.viewport.fit(); return; }
@@ -333,5 +410,29 @@ class EditorPointer {
       // floor's extra selection channels) instead of each editor re-deriving it in `handleKey`.
       else if (ed.selected) ed.deselect();
     }
+  }
+
+  /** The keyup half of the dispatch above (reached through `Editor.handleKeyUp`), for the one
+   *  binding that is *held* rather than pressed: releasing Space puts the hand tool away. */
+  handleKeyUp(e) { if (e.key === ' ') this._setForcePan(false); }
+
+  /** Drop any held-key gesture state. Called when the window loses focus: the keyup that would
+   *  release the hand tool is delivered to whatever took focus and never arrives here, and a
+   *  hand tool stuck on would swallow every subsequent click on the map. */
+  cancelHeldKeys() { this._setForcePan(false); }
+
+  /** Engage/disengage the hand tool, mirroring it onto the svg as `.force-pan` so the cursor can
+   *  advertise it (style.css). Idempotent — Space auto-repeats while held. */
+  _setForcePan(on) {
+    if (this._forcePan === on) return;
+    this._forcePan = on;
+    if (this.ed.svg) this.ed.svg.classList.toggle('force-pan', on);
+  }
+
+  /** True when a key event landed on a control that owns Space as its activation key. `App`'s
+   *  document-level keydown only filters `input, textarea, select`, so a focused toolbar button
+   *  still reaches us — and swallowing its Space would leave it unusable from the keyboard. */
+  static _isControlTarget(t) {
+    return !!(t && t.closest && t.closest('button, a[href], summary, [role="button"], [contenteditable]'));
   }
 }

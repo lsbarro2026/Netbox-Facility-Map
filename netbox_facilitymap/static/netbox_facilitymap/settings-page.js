@@ -84,9 +84,9 @@
    revert contracts, and gating as the main page — and since a sub-page's descriptors declare no
    `tab`, they land in one tab and the strip omits itself.
 
-   `ApSettingsPage` (ap-settings-page.js, `#/settings/access-points`) is the first: the AP add-on
-   keeps its on/off switch here, and its options — device role, name template, name counter — live
-   there, reached by the `Configure` companion on that switch's row.
+   `DeviceSettingsPage` (device-settings-page.js, `#/settings/devices`) is the first: the
+   device-creation add-on keeps its on/off switch here, and its options — the device-type preset
+   list (DEV-8) — live there, reached by the `Configure` companion on that switch's row.
    ─────────────────────────────────────────────────────────────────────────────── */
 
 // Per-browser flag recording that this browser's user has seen and accepted the one-time write-mode
@@ -95,12 +95,13 @@
 // per browser, independent of the install-wide `write_mode` setting it gates.
 const WRITE_MODE_CONSENT_KEY = 'fm-write-mode-consent';
 
-// Per-browser flag recording that this browser's user has seen the one-time note shown when access
-// point creation is switched on (SET-6), pointing them at its configuration page. Keyed like
+// Per-browser flag recording that this browser's user has seen the one-time note shown when
+// device creation is switched on (SET-6), pointing them at its configuration page. Keyed like
 // WRITE_MODE_CONSENT_KEY above and for the same reason — a note explaining a page is worth showing
 // once per person, not once per install — but it records only that the note was *seen*: unlike
-// write mode's, this modal is informational and cannot veto the switch.
-const AP_CONFIGURE_NOTE_KEY = 'fm-ap-configure-note';
+// write mode's, this modal is informational and cannot veto the switch. The stored value keeps
+// its pre-DEV-8 name deliberately: a browser that saw the access-point note has seen this page.
+const DEVICE_CONFIGURE_NOTE_KEY = 'fm-ap-configure-note';
 
 // The tab a descriptor lands in when it declares no `tab` (SET-4). Every pre-tabs setting predates
 // the field and belongs here, so defaulting keeps the registry free of boilerplate — only the rows
@@ -122,6 +123,21 @@ class SettingsPage {
     // than reaching into its DOM. Every other control type answers to a plain `.disabled`. Dies
     // with this instance — `App.showSettings` builds a fresh SettingsPage per mount.
     this._combos = new Map();
+    // True while the IMPORT-74 rebuild is on the wire, which is the one thing this page refuses to
+    // be navigated away from (`navRefusal`). Cleared in `_runRebuild`'s `finally`, so the refusal is
+    // bounded by the request itself and can never strand the operator on this page.
+    this._rebuilding = false;
+  }
+
+  /** Refuse to be navigated out of Settings while a rebuild is in flight (IMPORT-74) — the same
+   *  `App._navRefusal` stage-page hook the import wizard answers (IMPORT-61), for the same reason:
+   *  the toast narrating the run belongs to this page, and leaving mid-render hides the outcome of
+   *  the most consequential thing this page can start. Bounded by construction (see `_rebuilding`).
+   *  Returns the message to show, or null to allow the navigation. */
+  navRefusal() {
+    return this._rebuilding
+      ? 'A rebuild is running. Wait for it to finish before leaving Settings.'
+      : null;
   }
 
   /** Build the settings view into `stage` (App.showSettings clears it first). Panels are built once
@@ -337,25 +353,25 @@ class SettingsPage {
         get: () => app.inlineRoomCreation,
         set: (v) => this._saveInlineRoomCreation(v),
       },
-      // Access point creation sits under Add-ons ▸ Write add-ons (SET-4): it is an add-on that
-      // creates real NetBox Device records, which is what that section collects. Since SET-6 it is
-      // **one switch** here, like its inline-room-creation sibling above — its options (device role,
-      // name template, name counter) had more to say than a row's tooltip could hold, so they live
-      // on ApSettingsPage, reached by the Configure companion. A general (non-writing) add-ons
+      // Device creation sits under Add-ons ▸ Write add-ons (SET-4): it is an add-on that creates
+      // real NetBox Device records, which is what that section collects. Since SET-6 it is **one
+      // switch** here, like its inline-room-creation sibling above — its options (the device-type
+      // presets, DEV-8) had more to say than a row's tooltip could hold, so they live on
+      // DeviceSettingsPage, reached by the Configure companion. A general (non-writing) add-ons
       // section joins this one later.
       {
         tab: 'Add-ons',
         category: 'Write add-ons',
-        label: 'Access point creation',
-        tooltip: 'Add a floor-editor tool that creates an unracked access point in NetBox where you click. Also needs the add-Device permission.',
+        label: 'Device creation',
+        tooltip: 'Add a floor-editor tool that creates an unracked NetBox device where you click, through admin-defined device presets. Also needs the add-Device permission.',
         type: 'toggle',
         // Install-wide, admin-tier: gated on import permission like the other persisted settings.
         // Stored separately from write mode, but only reachable behind it (SET-5) — so the tool can
         // no longer be switched on into a state where it silently wouldn't appear.
         show: () => app.canImport,
         enabled: () => app.writeMode,
-        get: () => app.apTool,
-        set: (v) => this._saveApTool(v),
+        get: () => app.deviceTool,
+        set: (v) => this._saveDeviceTool(v),
         // The way to the add-on's own page. A companion rather than a row of its own: switching the
         // add-on on and saying how it behaves are one decision, made with two inputs — which is
         // exactly what a companion is for. Shown only while the add-on is on (there is nothing to
@@ -364,8 +380,8 @@ class SettingsPage {
         companion: {
           type: 'action',
           button: 'Configure',
-          visible: () => app.apTool,
-          run: () => app.go('/settings/access-points'),
+          visible: () => app.deviceTool,
+          run: () => app.go('/settings/devices'),
         },
       },
       // A general (non-writing) add-ons section (ADDON-4), separate from Write add-ons above: these
@@ -623,13 +639,20 @@ class SettingsPage {
 
   /** Persist the high-quality floor-plan rendering switch (READ-1). Nothing re-renders on save —
    *  the setting is read by the import subprocess when a build next runs — so the toast says so
-   *  rather than implying the plans just got sharper. */
+   *  rather than implying the plans just got sharper, and the rebuild that would actually apply it
+   *  is offered right here (IMPORT-74) instead of being left to be rediscovered through the import
+   *  editor's map step.
+   *
+   *  The offer opens **after** the save and cannot veto it, the `_saveDeviceTool` shape: `_switch`
+   *  has already flipped the knob and only `.catch`es, so awaiting a modal here neither reverts nor
+   *  lies. Declining leaves the setting saved and nothing rebuilt — the pre-IMPORT-74 behaviour. */
   async _saveRenderHq(enabled) {
     await Api.post('/api/settings/render-hq', { render_hq: enabled });
     this.app.renderHq = enabled;
     Toast.show(enabled
       ? 'High quality rendering on — applies to the next import or rebuild.'
       : 'High quality rendering off — applies to the next import or rebuild.');
+    await this._offerRebuild(enabled);
   }
 
   /** Persist the to-do feature's on/off switch (ADDON-4) — a general (non-writing) add-on, so it is
@@ -655,12 +678,12 @@ class SettingsPage {
     Toast.show(enabled ? 'Inline room creation enabled.' : 'Inline room creation disabled.');
   }
 
-  /** Persist the access-point creation add-on's on/off switch (DEV-3). The feature's own install-wide
-   *  switch, stored separately from write mode — it answers "is this feature in play?", not "may this
-   *  install write to NetBox at all?". Since SET-5 the row is `enabled`-gated on write mode, so unlike
-   *  its DEV-3 self this can no longer be switched on into a state where the tool would be inertly
-   *  absent (which is what the old write-mode nudge existed to explain). A failed POST propagates to
-   *  `_switch`, which reverts.
+  /** Persist the device-creation add-on's on/off switch (DEV-3, generalized by DEV-8). The
+   *  feature's own install-wide switch, stored separately from write mode — it answers "is this
+   *  feature in play?", not "may this install write to NetBox at all?". Since SET-5 the row is
+   *  `enabled`-gated on write mode, so unlike its DEV-3 self this can no longer be switched on into
+   *  a state where the tool would be inertly absent (which is what the old write-mode nudge existed
+   *  to explain). A failed POST propagates to `_switch`, which reverts.
    *
    *  Flipping it changes its own row: the `Configure` companion is `visible` only while the add-on is
    *  on, so a successful save refreshes in place (SET-6). Switching it **on** for the first time in
@@ -669,31 +692,32 @@ class SettingsPage {
    *  veto the switch. Its answer only decides whether we navigate there now; either way the add-on
    *  stays on. Awaiting it is safe: `_switch` has already flipped the knob and only `.catch`es, so a
    *  promise left pending on an open modal neither reverts nor lies. */
-  async _saveApTool(enabled) {
-    await Api.post('/api/settings/ap-tool', { ap_tool: enabled });
-    this.app.apTool = enabled;
+  async _saveDeviceTool(enabled) {
+    await Api.post('/api/settings/device-tool', { device_tool: enabled });
+    this.app.deviceTool = enabled;
     this._refreshRows();
-    Toast.show(enabled ? 'Access point creation enabled.' : 'Access point creation disabled.');
-    if (enabled && localStorage.getItem(AP_CONFIGURE_NOTE_KEY) !== '1') {
-      localStorage.setItem(AP_CONFIGURE_NOTE_KEY, '1');
-      if (await this._noteApConfigure()) this.app.go('/settings/access-points');
+    Toast.show(enabled ? 'Device creation enabled.' : 'Device creation disabled.');
+    if (enabled && localStorage.getItem(DEVICE_CONFIGURE_NOTE_KEY) !== '1') {
+      localStorage.setItem(DEVICE_CONFIGURE_NOTE_KEY, '1');
+      if (await this._noteDeviceConfigure()) this.app.go('/settings/devices');
     }
   }
 
-  /** The one-time note shown when access point creation is first switched on in this browser
-   *  (SET-6), resolving `true` to open its configuration page / `false` to stay. It is
-   *  **informational, not consent**: there is no Cancel, because there is nothing to cancel — the
-   *  add-on is already on and stays on however this is dismissed. It exists because the tool needs a
-   *  device role before it will appear, so switching the add-on on and stopping there looks like
-   *  nothing happened. Backdrop, Escape, or "Not now" resolves `false`. */
-  _noteApConfigure() {
+  /** The one-time note shown when device creation is first switched on in this browser (SET-6),
+   *  resolving `true` to open its configuration page / `false` to stay. It is **informational, not
+   *  consent**: there is no Cancel, because there is nothing to cancel — the add-on is already on
+   *  and stays on however this is dismissed. It exists because the tool needs at least one device
+   *  preset (with a role) before it will appear, so switching the add-on on and stopping there
+   *  looks like nothing happened. Backdrop, Escape, or "Not now" resolves `false`. */
+  _noteDeviceConfigure() {
     return Modal.confirm({
-      title: 'Access point creation is on',
-      body: 'Before the tool appears in the floor editor, it needs a NetBox device role to create '
-        + 'access points with. You can also set how their suggested names are built.',
-      hint: 'Everything is on the access points page, reachable any time from Configure on this row.',
+      title: 'Device creation is on',
+      body: 'Before the Add-device tool appears in the floor editor, it needs at least one device '
+        + 'preset — the kind of device it creates, its NetBox role, its map icon, and how its '
+        + 'suggested names are built.',
+      hint: 'Everything is on the devices page, reachable any time from Configure on this row.',
       cancelLabel: 'Not now',
-      confirmLabel: 'Configure access points',
+      confirmLabel: 'Configure device presets',
     });
   }
 
@@ -881,5 +905,115 @@ class SettingsPage {
     }
     Toast.show('All facility-map data deleted. Reloading…');
     window.location.reload();
+  }
+
+  // ---- Rebuild floor plans (IMPORT-74) ----
+
+  /** Offer to apply a just-saved render setting by rebuilding the facility now. Silent on an
+   *  install with nothing imported yet (`hasContent()`, the same read the router's home fallback
+   *  uses): there are no floor plans to re-render, and the next import picks the setting up anyway.
+   *
+   *  Deliberately a plain two-button question, not a warning: what it offers is a **re-render of the
+   *  map that is already live**, and `_rebuildNow` proves that before it fires. Everything that
+   *  could put a drawn room at risk is refused there and handed to the editor instead. */
+  async _offerRebuild(enabled) {
+    if (!this.app.store.hasContent()) return;
+    const go = await Modal.confirm({
+      title: 'Rebuild floor plans now?',
+      body: 'The setting is saved either way, but the plans on the map keep their current renders '
+        + 'until the facility is rebuilt. Rebuilding re-renders every floor plan '
+        + (enabled ? 'at the higher quality' : 'at the standard quality') + ' from the drawings '
+        + 'already imported.',
+      hint: 'Nothing about the map changes — the same buildings, floors and rooms, redrawn. It can '
+        + 'take a minute, and your existing map stays active until it succeeds.',
+      cancelLabel: 'Later',
+      confirmLabel: 'Rebuild now',
+    });
+    if (go) await this._rebuildNow();
+  }
+
+  /** Check that a rebuild really would be a pure re-render, then run it.
+   *
+   *  This page has no room-safety review and no post-build reconciliation — those live in the import
+   *  wizard (`ImportBuildReview` over `ImportDiff`'s findings, then `ImportFlow._afterBuild`). So
+   *  rather than asking the operator to consent to consequences it cannot then apply, it **refuses**
+   *  anything that isn't provably consequence-free: `ImportDiff.rerenderOnly` compares the live
+   *  import map against the live manifest, and only an exact match (same floors, same orientations,
+   *  same site plan) is rebuilt from here. Anything else means the facility holds import changes
+   *  that were never built, which is exactly the case the editor's reviewed Rebuild exists for.
+   *
+   *  `ImportDiff` rides the lazy import bundle, so it is ensured first — the `showDeviceSettings`
+   *  /`device-shapes.js` shape, and the reason the key convention isn't copied onto this page. */
+  async _rebuildNow() {
+    let saved;
+    try {
+      await this.app.ensureScripts(['import-diff.js']);
+      saved = await Api.get('/api/import/map');
+    } catch (e) {
+      Toast.show('Could not check the saved import map: ' + e.message, true);
+      return;
+    }
+    // No saved map: a facility imported before the map was retained, so there is nothing to
+    // re-render from. Say so plainly instead of letting the rebuild fail with a raw error.
+    if (!saved.ok) {
+      return this._rebuildElsewhere(
+        'This facility has no saved import map, so its plans can’t be re-rendered from here.',
+        'Re-import its drawings from the import editor to pick the new setting up.');
+    }
+    if (!ImportDiff.rerenderOnly(saved.map, this.app.store.manifest)) {
+      return this._rebuildElsewhere(
+        'This facility has import changes that haven’t been built yet, so rebuilding would do more '
+        + 'than re-render the plans — it could move or remove rooms already drawn.',
+        'The import editor’s Rebuild reviews exactly what that does to your rooms first.');
+    }
+    await this._runRebuild();
+  }
+
+  /** The two "not from here" outcomes above: explain, and offer the one place that can do it. Not a
+   *  failure — nothing was attempted — so it reads as a redirection, with staying put the default. */
+  async _rebuildElsewhere(body, hint) {
+    const go = await Modal.confirm({
+      title: 'Rebuild from the import editor',
+      body, hint,
+      cancelLabel: 'Not now',
+      confirmLabel: 'Open editor',
+    });
+    if (go) this.app.go('/import');
+  }
+
+  /** POST the rebuild and report it. The server re-renders from the `import-map.json` already on
+   *  disk (writing none), under the same render lock and isolated subprocess every build uses.
+   *
+   *  Three outcomes are shaped deliberately. A **409** means something else holds the render lock, so
+   *  it names that rather than reading as a failure. A **render failure** comes back `{ok:false}` on
+   *  a 200 and never deletes anything — `build` overwrites the manifest only on success, atomically,
+   *  and the store was never reloaded — so the toast leads with that reassurance (mirroring
+   *  `ImportFlow._build`) and appends the server's own actionable hint when it named one (an HQ
+   *  render that outgrew `render_mem_mb`/`render_timeout_s`, HEALTH-3). On **success** the store is
+   *  reloaded, which re-stamps `manifest.built` and so cache-busts every image URL (`Store.mediaUrl`)
+   *  — without it the browser would keep serving the old renders from cache. */
+  async _runRebuild() {
+    this._rebuilding = true;
+    Toast.show('Rebuilding floor plans… this can take a minute.');
+    try {
+      const r = await Api.post('/api/import/rebuild', {});
+      if (!r.ok) { const err = new Error(r.error || 'rebuild failed'); err.hint = r.hint; throw err; }
+      await this.app.store.load();
+      Toast.show('Floor plans rebuilt.');
+    } catch (e) {
+      console.error('Facility rebuild failed', e);
+      if (e && e.status === 409) {
+        Toast.show('A build is already running. Try again once it finishes.', true);
+        return;
+      }
+      let msg = 'Rebuild failed. Your existing map is unchanged and still active. Nothing was lost.';
+      if (e && e.hint) msg += ' ' + e.hint;
+      // A validation refusal (the map vanished between the check above and this call) names its own
+      // reason and is worth repeating; a render traceback is not, and never carries a 400.
+      else if (e && e.status === 400) msg += ' ' + e.message;
+      Toast.show(msg, true);
+    } finally {
+      this._rebuilding = false;
+    }
   }
 }

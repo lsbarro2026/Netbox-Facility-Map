@@ -322,8 +322,11 @@ class ImportFlow {
     return !!a && typeof a === 'object' && typeof a.type === 'string';
   }
 
-  /** A persisted region-split entry is `{ box:{x,y,w,h}, assign }`; validate the box numerics and
-   *  the nested assign so a corrupt draft can't strand `ImportRegions.openSplit`/`_resolveFloors`. */
+  /** A persisted region-split entry is `{ box:{x,y,w,h}, assign }` — since FLOOR-6 also carrying
+   *  the drawn `poly` + `id`, which ride along untouched here (`ImportRegionEditor.materialize`
+   *  repairs/backfills them when the split editor opens; `box` stays the build's crop contract).
+   *  Validate the box numerics and the nested assign so a corrupt draft can't strand
+   *  `ImportRegions.openSplit`/`_resolveFloors`. */
   static _validRegion(r) {
     const box = r && r.box;
     return !!box && ['x', 'y', 'w', 'h'].every(k => typeof box[k] === 'number')
@@ -1372,12 +1375,21 @@ class ImportFlow {
 
   /** Swap in a fresh build-action row in place, preserving page scroll. Assigning the last
    *  unassigned drawing opens the build gate, so a floor edit must refresh this row without the
-   *  full-stage `_stepMap()` re-render (IMPORT-2). No-op before the map step has rendered it. */
+   *  full-stage `_stepMap()` re-render (IMPORT-2). No-op before the map step has rendered it.
+   *
+   *  **The overview panel rides along** (BUG-3), because the two report the same facility-wide
+   *  numbers — this row's gate, suggestion and automatic-floor counts, the panel's progress line —
+   *  and every in-place refresh path on this step already funnels through here: a card's floor edit
+   *  (`ImportCards`), a bulk action and `_rerenderBuildingSection`, and each landed floor-code batch
+   *  (`ImportOcrSweep._repaint`, both of its branches). Refreshing one and not the other is what let
+   *  the panel sit on first-paint numbers until the operator happened to click Next. `refresh()`
+   *  restates the panel in place, so it costs nothing when the panel isn't on screen. */
   _refreshBuildActions() {
     if (!this._buildActionsRow) return;
     const fresh = this._buildActions();
     this._buildActionsRow.replaceWith(fresh);
     this._buildActionsRow = fresh;
+    this.overview.refresh();
   }
 
   /** Scroll-preserving re-render of just the visible building's section (card grid + header),
@@ -1588,6 +1600,29 @@ class ImportFlow {
    *  is review on request rather than review demanded. */
   _attentionCount(b) {
     return this._unassignedCount(b) + this._lowConfidenceCount(b);
+  }
+
+  /** Whether the wizard is yet in a position to say what building `b` needs (BUG-3) — the question
+   *  `_attentionCount` cannot answer about itself, and the reason the overview panel used to report
+   *  a facility nobody had opened as finished.
+   *
+   *  Two things have to have happened before a zero count means "nothing to do" rather than "nothing
+   *  known". Its floor Locations must be loaded, since only `_loadFloors` runs
+   *  `_normalizeToLocations` — before that every drawing sits at `_defaultAssign`'s blind Level 1..N
+   *  or a filename guess, both real `type` values that no count flags. And the floor-code sweep must
+   *  not still owe it reads, since a landing batch can fill or flag its drawings without anyone
+   *  touching them; `ImportOcrSweep.coverage` already draws exactly that line, so ask it rather than
+   *  re-deriving it. `off`, `no-region` and `done` all settle a building: the first two mean nothing
+   *  more is coming, the third that it has arrived.
+   *
+   *  **Read by `ImportOverview` only, and deliberately not by the build gate or the carousel
+   *  label.** `_unassignedBuildings` waving an unvisited building through is what keeps the lazy
+   *  per-building load from blocking Build on a facility the operator has every right to build
+   *  as-is; this is the *progress* question, which has the opposite honest default. */
+  _buildingSettled(b) {
+    if (!Array.isArray(b.nbFloors)) return false;
+    const state = this.ocr.coverage(b).state;
+    return state !== 'pending' && state !== 'reading';
   }
 
   /** How many of building `b`'s floors the sweep set by itself and nobody has confirmed since
@@ -1984,12 +2019,18 @@ class ImportFlow {
    *  `_applyThumbSize` and `_refreshBuildActions` with it). `_stepMap` assigns
    *  `_buildingSectionEl` synchronously, before this promise can settle, so the section is always
    *  captured by the time we get here — and `_rerenderBuildingSection` falls back to a full render
-   *  if it somehow isn't. */
+   *  if it somehow isn't.
+   *
+   *  A load that lands for a building the carousel has since paged away from still refreshes the
+   *  step's facility-wide chrome (BUG-3): this load is precisely what settles that building's
+   *  overview row (`_buildingSettled`), so dropping it on the floor left the panel reporting a
+   *  building it now knows about as unchecked. The branch mirrors `ImportOcrSweep._repaint`'s. */
   _ensureFloors(b) {
     if (b.nbFloors !== undefined) return;
     this._loadFloors(b).then(() => {
-      if (this._mapView && this._mappableBuildings()[this._bIdx] === b)
-        this._rerenderBuildingSection(b);
+      if (!this._mapView) return;
+      if (this._mappableBuildings()[this._bIdx] === b) this._rerenderBuildingSection(b);
+      else this._refreshBuildActions();
     });
   }
 

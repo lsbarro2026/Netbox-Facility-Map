@@ -181,6 +181,18 @@ class Room(NetBoxModel):
     # placed index (`Store.searchTargets`) and the server `NbInventoryView` unplaced search.
     alias = models.TextField(blank=True, default='')
     polygon = models.JSONField(default=list)  # [[nx, ny], ...] normalized 0..1
+    # Stacking order within a floor — the room's paint AND hit-test position (ROOM-4). 0 = bottom;
+    # the highest `z_order` paints last and therefore wins a click where two rooms overlap (SVG
+    # painting order *is* hit order). Dense (0..n-1 per floor) and **rewritten wholesale by
+    # `frontend_api.sync_rooms` on every editor save** from the posted room list's array position:
+    # the frontend's `rooms` array order is the single source of truth, so the wire format carries
+    # no separate `z` key that could disagree with it. A row created out-of-band through REST keeps
+    # the `0` default until the next editor save re-indexes the floor.
+    #
+    # `Meta.ordering` below is deliberately NOT changed to include this: it drives the NetBox
+    # object-list table and the REST list default, which have no reason to move. The render paths
+    # that DO care order explicitly (`compose_annotations`, `template_content`) — see ROOM-4 in §10.
+    z_order = models.PositiveIntegerField(default=0)
     # The bound *room* Location (a child of the floor Location). Null = unbound.
     location = models.ForeignKey(
         'dcim.Location', on_delete=models.SET_NULL, null=True, blank=True,

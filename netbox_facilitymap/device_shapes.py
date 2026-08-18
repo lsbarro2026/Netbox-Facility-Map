@@ -64,12 +64,168 @@ _TYPE_RULES = [
 _CAMEL_RE = re.compile(r'([a-z0-9])([A-Z])')
 _SEP_RE = re.compile(r'[\W_]+')
 
-# Every glyph type `box`/`glyph` accept — the allow-list `custom_rules` validates against, so a
-# typo'd type in `PLUGINS_CONFIG` is dropped loudly rather than silently drawing nothing.
-GLYPH_TYPES = frozenset((
+# The glyph types that predate the icon library (DEV-8): rendered by their own bespoke schematic
+# branches (or the `_LUCIDE` chip table) in `glyph()`. Their `_LIBRARY` entries carry `paths` for
+# the frontend settings picker ONLY — `_chip_paths` never chip-renders one of these, so their
+# markers keep drawing exactly as they always have. Lockstep with the JS `BUILTIN_GLYPH_TYPES`.
+_BUILTIN_GLYPH_TYPES = frozenset((
     'rack', 'server', 'router', 'firewall', 'storage', 'ups',
     'switch', 'accessswitch', 'patchpanel', 'pdu', 'outlet', 'ap', 'generic',
 ))
+
+# The admin-pickable device icon library (DEV-8) — the 1:1 mirror of the JS `DEVICE_ICON_LIBRARY`
+# (device-shapes.js): same ids, order, labels, and path data, or the map and the server-rendered
+# embeds draw a preset's marker differently. `id` doubles as the glyph type a placement's explicit
+# `icon` stores; `paths` are stroke path `d` strings on Lucide's native 24×24 viewBox. Entries
+# without `paths` are the pre-existing `_LUCIDE` chip types. Lucide-sourced paths are inlined
+# verbatim from the vendored SVGs under `static/netbox_facilitymap/icons/` (see icons/NOTICE);
+# the rest are bespoke drawings in the same convention. `rack` is deliberately absent — the
+# Add-device tool places devices, not racks.
+_LIBRARY = (
+    {'group': 'Network', 'icons': (
+        {'id': 'ap', 'label': 'Wireless access point', 'paths': (
+            'M12 20h.01', 'M2 8.82a15 15 0 0 1 20 0', 'M5 12.859a10 10 0 0 1 14 0',
+            'M8.5 16.429a5 5 0 0 1 7 0')},
+        {'id': 'switch', 'label': 'Switch', 'paths': (
+            'M4 7h16a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z',
+            'M6 12h.01', 'M10 12h.01', 'M14 12h.01', 'M18 12h.01')},
+        {'id': 'accessswitch', 'label': 'Access switch', 'paths': (
+            'M4 7h16a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z',
+            'M6 13h.01', 'M10 13h.01', 'M14 13h.01', 'M18 10h.01')},
+        {'id': 'patchpanel', 'label': 'Patch panel', 'paths': (
+            'M4 5h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z',
+            'M7 10h.01', 'M12 10h.01', 'M17 10h.01', 'M7 14h.01', 'M12 14h.01', 'M17 14h.01')},
+        {'id': 'router', 'label': 'Router'},
+        {'id': 'firewall', 'label': 'Firewall'},
+        {'id': 'server', 'label': 'Server'},
+        {'id': 'storage', 'label': 'Storage'},
+        {'id': 'ups', 'label': 'UPS'},
+        {'id': 'pdu', 'label': 'PDU / power strip', 'paths': (
+            'M3.5 9h17a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-17A1.5 1.5 0 0 1 2 13.5v-3A1.5 1.5 0 0 1 3.5 9z',
+            'M6 12h.01', 'M10 12h.01', 'M14 12h.01', 'M18 12h.01')},
+        {'id': 'outlet', 'label': 'Power outlet', 'paths': (
+            'M7 3h10a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z',
+            'M10 9v3', 'M14 9v3', 'M12 16h.01')},
+        {'id': 'jack', 'label': 'Network jack', 'paths': (
+            'M10 8v1', 'M14 8v1', 'M18 8v1',
+            'M19 17a2 2 0 00-1.765 1.059l-.47.882A2 2 0 0115 20H9a2 2 0 01-1.765-1.059l-.47-.882A2 2 0 005 17H4a2 2 0 01-2-2V6a2 2 0 012-2h16a2 2 0 012 2v9a2 2 0 01-2 2z',
+            'M6 8v1')},
+        {'id': 'antenna', 'label': 'Antenna / DAS', 'paths': (
+            'M2 12 7 2', 'm7 12 5-10', 'm12 12 5-10', 'm17 12 5-10', 'M4.5 7h15', 'M12 16v6')},
+        {'id': 'beacon', 'label': 'BLE beacon', 'paths': ('m7 7 10 10-5 5V2l5 5L7 17',)},
+    )},
+    {'group': 'AV', 'icons': (
+        {'id': 'speaker', 'label': 'Speaker / PA', 'paths': (
+            'M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z',
+            'M16 9a5 5 0 0 1 0 6', 'M19.364 18.364a9 9 0 0 0 0-12.728')},
+        {'id': 'mic', 'label': 'Microphone', 'paths': (
+            'M12 19v3', 'M19 10v2a7 7 0 0 1-14 0v-2',
+            'M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z')},
+        {'id': 'intercom', 'label': 'Intercom / call box', 'paths': (
+            'M8 2h8a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z',
+            'M9 7h6', 'M9 10h6', 'M10.5 16a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0-3 0')},
+        {'id': 'projector', 'label': 'Projector', 'paths': (
+            'M5 7 3 5', 'M9 6V3', 'm13 7 2-2', 'M6 13a3 3 0 1 0 6 0a3 3 0 1 0 -6 0',
+            'M11.83 12H20a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h2.17',
+            'M16 16h2')},
+        {'id': 'display', 'label': 'Display / TV', 'paths': (
+            'm17 2-5 5-5-5',
+            'M4 7h16a2 2 0 0 1 2 2v11a2 2 0 0 1 -2 2h-16a2 2 0 0 1 -2 -2v-11a2 2 0 0 1 2 -2z')},
+        {'id': 'signage', 'label': 'Digital signage', 'paths': (
+            'M2 3h20', 'M21 3v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V3', 'm7 21 5-5 5 5')},
+        {'id': 'whiteboard', 'label': 'Interactive whiteboard', 'paths': (
+            'M4 3h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z',
+            'M6 10c2-3 4 3 6 0s4-3 6 0', 'm7 21 2-5', 'm17 21-2-5')},
+        {'id': 'deskphone', 'label': 'Desk phone', 'paths': (
+            'M13.832 16.568a1 1 0 0 0 1.213-.303l.355-.465A2 2 0 0 1 17 15h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2A18 18 0 0 1 2 4a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v3a2 2 0 0 1-.8 1.6l-.468.351a1 1 0 0 0-.292 1.233 14 14 0 0 0 6.392 6.384',)},
+    )},
+    {'group': 'Safety & security', 'icons': (
+        {'id': 'camera-dome', 'label': 'Camera (dome)', 'paths': (
+            'M3 5h18', 'M6 5a6 6 0 0 0 12 0', 'M10.5 8a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0-3 0')},
+        {'id': 'camera-bullet', 'label': 'Camera (bullet)', 'paths': (
+            'M16.75 12h3.632a1 1 0 0 1 .894 1.447l-2.034 4.069a1 1 0 0 1-1.708.134l-2.124-2.97',
+            'M17.106 9.053a1 1 0 0 1 .447 1.341l-3.106 6.211a1 1 0 0 1-1.342.447L3.61 12.3a2.92 2.92 0 0 1-1.3-3.91L3.69 5.6a2.92 2.92 0 0 1 3.92-1.3z',
+            'M2 19h3.76a2 2 0 0 0 1.8-1.1L9 15', 'M2 21v-4', 'M7 9h.01')},
+        {'id': 'card-reader', 'label': 'Card reader', 'paths': (
+            'M9 2h6a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z',
+            'M10 7h4', 'M12 11h.01', 'M10.5 15h.01', 'M13.5 15h.01')},
+        {'id': 'door-strike', 'label': 'Door strike', 'paths': (
+            'M10 12h.01', 'M18 20V6a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v14', 'M2 20h20')},
+        {'id': 'motion-sensor', 'label': 'Motion / occupancy sensor', 'paths': (
+            'M19.07 4.93A10 10 0 0 0 6.99 3.34', 'M4 6h.01', 'M2.29 9.62A10 10 0 1 0 21.31 8.35',
+            'M16.24 7.76A6 6 0 1 0 8.23 16.67', 'M12 18h.01', 'M17.99 11.66A6 6 0 0 1 15.77 16.67',
+            'M10 12a2 2 0 1 0 4 0a2 2 0 1 0 -4 0', 'm13.41 10.59 5.66-5.66')},
+        {'id': 'smoke-detector', 'label': 'Smoke detector', 'paths': (
+            'M11 21c0-2.5 2-2.5 2-5', 'M16 21c0-2.5 2-2.5 2-5',
+            'm19 8-.8 3a1.25 1.25 0 0 1-1.2 1H7a1.25 1.25 0 0 1-1.2-1L5 8',
+            'M21 3a1 1 0 0 1 1 1v2a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V4a1 1 0 0 1 1-1z',
+            'M6 21c0-2.5 2-2.5 2-5')},
+        {'id': 'pull-station', 'label': 'Fire-alarm pull station', 'paths': (
+            'M6 3h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z',
+            'M9 8h6a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z', 'M12 13v5')},
+        {'id': 'fire-strobe', 'label': 'Fire strobe / horn', 'paths': (
+            'M7 18v-6a5 5 0 1 1 10 0v6',
+            'M5 21a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-1a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2z',
+            'M21 12h1', 'M18.5 4.5 18 5', 'M2 12h1', 'M12 2v1', 'm4.929 4.929.707.707',
+            'M12 12v6')},
+        {'id': 'emergency-phone', 'label': 'Emergency phone', 'paths': (
+            'M13 2a9 9 0 0 1 9 9', 'M13 6a5 5 0 0 1 5 5',
+            'M13.832 16.568a1 1 0 0 0 1.213-.303l.355-.465A2 2 0 0 1 17 15h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2A18 18 0 0 1 2 4a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v3a2 2 0 0 1-.8 1.6l-.468.351a1 1 0 0 0-.292 1.233 14 14 0 0 0 6.392 6.384')},
+        {'id': 'aed', 'label': 'AED cabinet', 'paths': (
+            'M2 9.5a5.5 5.5 0 0 1 9.591-3.676.56.56 0 0 0 .818 0A5.49 5.49 0 0 1 22 9.5c0 2.29-1.5 4-3 5.5l-5.492 5.313a2 2 0 0 1-3 .019L5 15c-1.5-1.5-3-3.2-3-5.5',
+            'M3.22 13H9.5l.5-1 2 4.5 2-7 1.5 3.5h5.27')},
+        {'id': 'leak-sensor', 'label': 'Water / leak sensor', 'paths': (
+            'M12 22a7 7 0 0 0 7-7c0-2-1-3.9-3-5.5s-3.5-4-4-6.5c-.5 2.5-2 4.9-4 6.5C6 11.1 5 13 5 15a7 7 0 0 0 7 7z',)},
+    )},
+    {'group': 'Building & facilities', 'icons': (
+        {'id': 'clock', 'label': 'Clock', 'paths': (
+            'M2 12a10 10 0 1 0 20 0a10 10 0 1 0 -20 0', 'M12 6v6l4 2')},
+        {'id': 'time-clock', 'label': 'Time clock', 'paths': (
+            'M4 13a8 8 0 1 0 16 0a8 8 0 1 0 -16 0', 'M12 9v4l2 2', 'M5 3 2 6', 'm22 6-3-3',
+            'M6.38 18.7 4 21', 'M17.64 18.67 20 21')},
+        {'id': 'thermostat', 'label': 'Thermostat', 'paths': (
+            'M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z',)},
+        {'id': 'hvac', 'label': 'HVAC unit', 'paths': (
+            'M10.827 16.379a6.082 6.082 0 0 1-8.618-7.002l5.412 1.45a6.082 6.082 0 0 1 7.002-8.618l-1.45 5.412a6.082 6.082 0 0 1 8.618 7.002l-5.412-1.45a6.082 6.082 0 0 1-7.002 8.618l1.45-5.412Z',
+            'M12 12v.01')},
+        {'id': 'light', 'label': 'Light fixture', 'paths': (
+            'M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5',
+            'M9 18h6', 'M10 22h4')},
+        {'id': 'light-control', 'label': 'Lighting controller', 'paths': (
+            'M8 12a4 4 0 1 0 8 0a4 4 0 1 0 -8 0', 'M12 4h.01', 'M20 12h.01', 'M12 20h.01',
+            'M4 12h.01', 'M17.657 6.343h.01', 'M17.657 17.657h.01', 'M6.343 17.657h.01',
+            'M6.343 6.343h.01')},
+        {'id': 'electric-panel', 'label': 'Electrical panel', 'paths': (
+            'M7 2h10a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z',
+            'm13 6.5-3 5h4l-3 5')},
+        {'id': 'generator', 'label': 'Generator', 'paths': (
+            'M4 8h16a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6a2 2 0 0 1 2-2z',
+            'm11 9.5-2 3.5h4l-2 3.5', 'M16 11v4', 'M19 11v4', 'M6 21v-3', 'M18 21v-3')},
+        {'id': 'env-sensor', 'label': 'Environmental sensor', 'paths': (
+            'm12 14 4-4', 'M3.34 19a10 10 0 1 1 17.32 0')},
+        {'id': 'printer', 'label': 'Printer / MFP', 'paths': (
+            'M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2',
+            'M6 9V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v6',
+            'M7 14h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1z')},
+        {'id': 'kiosk', 'label': 'Kiosk', 'paths': (
+            'M8 2h8a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z',
+            'M12 11v10', 'M8 21h8')},
+    )},
+    {'group': 'Other', 'icons': (
+        {'id': 'generic', 'label': 'Generic device', 'paths': (
+            'M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z',
+            'M12 12h.01')},
+    )},
+)
+
+# The library index, `id -> entry` — mirror of the JS `_libIndex()` memo.
+_LIB_INDEX = {icon['id']: icon for group in _LIBRARY for icon in group['icons']}
+
+# Every glyph type `box`/`glyph` accept — the allow-list `custom_rules` validates against (so a
+# typo'd type in `PLUGINS_CONFIG` is dropped loudly rather than silently drawing nothing), and
+# what a device preset's `icon` / a placement's explicit `icon` must name. Derived from the
+# library so the two can never drift: every library id plus the non-pickable `rack`.
+GLYPH_TYPES = frozenset(_LIB_INDEX) | {'rack'}
 
 # Memo for `custom_rules`, as `(setting fingerprint, normalized rules)`. `type_for` runs once per
 # placement, so the validation is cached — but keyed on the setting's *value* rather than computed
@@ -152,12 +308,15 @@ class DeviceShapes:
 
     @staticmethod
     def type_for(p, item=None):
-        """Resolve a placement to a glyph type. Racks are always ``'rack'``; a device is keyed
-        off its NetBox role (slug/name), then its own name, then the marker label, by
-        case-insensitive keyword over a *normalized* haystack (`_normalize` folds camelCase and
-        separators to spaces, so 'AccessPoint'/'access-point'/'ACCESS POINT'/'ap' all resolve
-        alike) — still classifies when the role is unset (name/label fallback) and survives
-        unknown role slugs. Returns one of the keys `box`/`glyph` accept.
+        """Resolve a placement to a glyph type. Racks are always ``'rack'``. A placement carrying
+        an explicit ``icon`` (stamped by the Add-device tool from its preset, DEV-8) resolves to
+        that icon outright — the admin chose the glyph, so no keyword rule may second-guess it
+        (an unknown/stale icon id falls through to inference). Everything else is keyed off its
+        NetBox role (slug/name), then its own name, then the marker label, by case-insensitive
+        keyword over a *normalized* haystack (`_normalize` folds camelCase and separators to
+        spaces, so 'AccessPoint'/'access-point'/'ACCESS POINT'/'ap' all resolve alike) — still
+        classifies when the role is unset (name/label fallback) and survives unknown role slugs.
+        Returns one of the keys `box`/`glyph` accept.
 
         `item` mirrors the JS `item`: a mapping exposing ``role_slug``/``role_name``/``name`` for
         the resolved NetBox object, or ``None`` when the object was deleted/forbidden (then only
@@ -169,6 +328,9 @@ class DeviceShapes:
         before."""
         if p.get('kind') == 'rack':
             return 'rack'
+        icon = p.get('icon')
+        if icon and icon in GLYPH_TYPES:
+            return icon
         hay = DeviceShapes._normalize(p, item)
         for t, keywords in custom_rules():
             if any(DeviceShapes._matches(hay, k) for k in keywords):
@@ -207,8 +369,9 @@ class DeviceShapes:
         unracked device is narrower than it. Icon-bearing appliances (server/router/firewall/
         storage/ups) are compact square-ish chips; rack-mount strips (switch/accessswitch/
         patchpanel/pdu) are wide and thin; the wall `outlet` is the smallest slice; `ap` a puck.
-        Used when a placement has no user-set w/h."""
-        return {
+        Library chip types (DEV-8) share one compact square footprint. Used when a placement has
+        no user-set w/h."""
+        explicit = {
             'rack':         {'w': 30, 'h': 40},
             'server':       {'w': 22, 'h': 18},
             'router':       {'w': 20, 'h': 18},
@@ -222,7 +385,20 @@ class DeviceShapes:
             'outlet':       {'w': 12, 'h': 7},
             'ap':           {'w': 16, 'h': 16},
             'generic':      {'w': 22, 'h': 15},
-        }.get(type, {'w': 22, 'h': 15})
+        }.get(type)
+        if explicit:
+            return explicit
+        return {'w': 18, 'h': 18} if DeviceShapes._chip_paths(type) else {'w': 22, 'h': 15}
+
+    @staticmethod
+    def _chip_paths(type):
+        """The stroke paths `glyph` chip-renders for a library type, or ``None`` for the built-in
+        types (whose bespoke schematic/`_LUCIDE` branches must keep winning — their `_LIBRARY`
+        `paths` serve only the frontend settings picker). Mirrors the JS `_chipPaths`."""
+        if type in _BUILTIN_GLYPH_TYPES:
+            return None
+        entry = _LIB_INDEX.get(type)
+        return entry.get('paths') if entry else None
 
     # Vendored Lucide icons (path `d` strings on Lucide's 24×24 viewBox) for the appliance types
     # that map cleanly to one — mirror of the JS `_lucide`, and of the SVGs under `icons/`.
@@ -271,9 +447,10 @@ class DeviceShapes:
         def body():
             return R(-hw, -hh, wpx, hpx)
 
-        # Appliance roles with a clean Lucide match: the body chip + that icon, uniformly scaled
-        # to fit the smaller box dimension and centred (Lucide's 24×24 viewBox centre is 12,12).
-        icon = DeviceShapes._LUCIDE.get(type)
+        # Appliance roles with a clean Lucide match, and the library chip types (DEV-8): the body
+        # chip + the icon, uniformly scaled to fit the smaller box dimension and centred (the
+        # icons share Lucide's 24×24 viewBox, centre 12,12).
+        icon = DeviceShapes._LUCIDE.get(type) or DeviceShapes._chip_paths(type)
         if icon:
             s = min(wpx, hpx) * 0.82 / 24
             off = _num(-12 * s)

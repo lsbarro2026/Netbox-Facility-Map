@@ -23,6 +23,8 @@ UPLOAD = 'plugins:netbox_facilitymap:api-import-upload'
 UPLOAD_ZIP = 'plugins:netbox_facilitymap:api-import-upload-zip'
 PREVIEW = 'plugins:netbox_facilitymap:api-import-preview'
 BUILD = 'plugins:netbox_facilitymap:api-import-build'
+IMPORT_MAP = 'plugins:netbox_facilitymap:api-import-map'
+REBUILD = 'plugins:netbox_facilitymap:api-import-rebuild'
 REGROUP = 'plugins:netbox_facilitymap:api-import-regroup'
 SCAN = 'plugins:netbox_facilitymap:api-import-scan'
 
@@ -562,6 +564,118 @@ def test_restore_409s_while_a_render_holds_the_lock(client, superuser, workdir):
     r = client.post(reverse(RESTORE), {'file': archive})
     assert r.status_code == 409
     assert json.loads((workdir / 'manifest.json').read_text())['buildings'] == ['keep']
+
+
+# ---- rebuild in place: read the live import map, re-render from it (IMPORT-74) ----
+
+LIVE_MAP = {'buildings': {'hq': {'slug': 'hq', 'name': 'HQ', 'abbr': 'h',
+                                 'floors': {'plan-1': '1'}}}}
+
+
+def _save_map(workdir, data=None):
+    workdir.mkdir(parents=True, exist_ok=True)
+    path = workdir / 'import-map.json'
+    path.write_text(json.dumps(LIVE_MAP if data is None else data), encoding='utf-8')
+    return path
+
+
+@pytest.fixture
+def spawned(monkeypatch):
+    """Capture the argv `RenderRunner.run` would spawn, without running a render (the
+    test_render_quality fixture of the same name, kept local so neither file imports the other)."""
+    calls = []
+
+    class _Proc:
+        returncode = 0
+        stdout = ''
+        stderr = ''
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return _Proc()
+
+    monkeypatch.setattr('netbox_facilitymap.render_runner.subprocess.run', fake_run)
+    return calls
+
+
+def test_import_map_returns_the_saved_map(client, editor_user, workdir):
+    _save_map(workdir)
+    client.force_login(editor_user)
+    r = client.get(reverse(IMPORT_MAP))
+    assert r.status_code == 200
+    assert r.json() == {'ok': True, 'map': LIVE_MAP}
+
+
+def test_import_map_reports_absence_without_erroring(client, editor_user, workdir):
+    """A facility imported before the map was retained simply has none — a branch for the caller
+    (which then offers the import editor instead), not an error to surface."""
+    client.force_login(editor_user)
+    r = client.get(reverse(IMPORT_MAP))
+    assert r.status_code == 200 and r.json() == {'ok': False}
+
+
+def test_import_map_reports_an_unreadable_map_the_same_way(client, editor_user, workdir):
+    _save_map(workdir)
+    (workdir / 'import-map.json').write_text('{ not json', encoding='utf-8')
+    client.force_login(editor_user)
+    assert client.get(reverse(IMPORT_MAP)).json() == {'ok': False}
+
+
+def test_rebuild_refuses_when_there_is_no_saved_map(client, editor_user, workdir):
+    client.force_login(editor_user)
+    r = client.post(reverse(REBUILD), data='{}', content_type='application/json')
+    assert r.status_code == 400 and r.json()['reason'] == 'no-map'
+
+
+def test_rebuild_refuses_a_map_that_assigns_no_floors(client, editor_user, workdir):
+    """Rendering a map with nothing in it would replace a working manifest with an empty one, so
+    completeness is checked before the render rather than discovered after it."""
+    _save_map(workdir, {'buildings': {'hq': {'slug': 'hq', 'floors': {}}}})
+    client.force_login(editor_user)
+    r = client.post(reverse(REBUILD), data='{}', content_type='application/json')
+    assert r.status_code == 400 and r.json()['reason'] == 'incomplete'
+
+
+def test_rebuild_enforces_the_same_drawing_cap_as_a_build(client, editor_user, workdir,
+                                                          monkeypatch):
+    _cfg(monkeypatch, 'max_pdfs', 0)
+    _save_map(workdir)
+    client.force_login(editor_user)
+    r = client.post(reverse(REBUILD), data='{}', content_type='application/json')
+    assert r.status_code == 400 and 'too many drawings' in r.json()['error']
+
+
+def test_rebuild_409s_while_a_render_holds_the_lock(client, editor_user, workdir):
+    """It renders, so it takes the same working-dir lock every render does — an in-flight
+    scan/build/reset/restore is reported as busy, not as a failure."""
+    _save_map(workdir)
+    _hold_lock(workdir)
+    client.force_login(editor_user)
+    r = client.post(reverse(REBUILD), data='{}', content_type='application/json')
+    assert r.status_code == 409
+
+
+def test_rebuild_renders_the_saved_map_without_rewriting_it(client, editor_user, workdir, spawned):
+    """The point of this endpoint: it re-renders the live map and writes nothing. Unlike `build` it
+    passes no `prepare`, so the map on disk is byte-identical afterwards — in particular it is NOT
+    re-stamped with the facility's current `orgMode`, which would let a rebuild fired to change
+    render quality silently adopt an organization-mode change that was never rebuilt for."""
+    path = _save_map(workdir)
+    before = path.read_text(encoding='utf-8')
+    client.force_login(editor_user)
+    r = client.post(reverse(REBUILD), data='{}', content_type='application/json')
+    assert r.status_code == 200 and r.json()['ok'] is True
+    assert len(spawned) == 1 and 'build' in spawned[0]
+    assert path.read_text(encoding='utf-8') == before
+    assert 'orgMode' not in json.loads(before)
+
+
+def test_rebuild_denied_without_import_permission(client, plain_user, workdir):
+    _save_map(workdir)
+    client.force_login(plain_user)
+    assert client.post(reverse(REBUILD), data='{}',
+                       content_type='application/json').status_code == 403
+    assert client.get(reverse(IMPORT_MAP)).status_code == 403
 
 
 # ---- manifest / media caching ----

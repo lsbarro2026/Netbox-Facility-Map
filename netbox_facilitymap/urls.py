@@ -78,18 +78,20 @@ urlpatterns = [
     # nearby Locations (ancestors + Site) so the panel can point the user at where to reassign it.
     path('api/netbox/placement-nearby', frontend_api.NbPlacementNearbyView.as_view(),
          name='api-nb-placement-nearby'),
-    # Backs the Settings page's access-point role picker (DEV-3); object-permission scoped like the
-    # reads above, and facility-agnostic (device roles are global in NetBox).
+    # Backs the preset editor's role picker and the View filter's role rows (DEV-3);
+    # object-permission scoped like the reads above, and facility-agnostic (device roles are
+    # global in NetBox).
     path('api/netbox/device-roles', frontend_api.NbDeviceRolesView.as_view(),
          name='api-nb-device-roles'),
-    # Backs the AP tool's model picker (DEV-5); an ordinary object-scoped, facility-agnostic read
-    # like device-roles above.
+    # Backs the Add-device dialog's model picker (DEV-5); an ordinary object-scoped,
+    # facility-agnostic read like device-roles above.
     path('api/netbox/device-types', frontend_api.NbDeviceTypesView.as_view(),
          name='api-nb-device-types'),
-    # The plugin's second write into dcim core (DEV-5) and the name it suggests: create an unracked
-    # access-point Device in a room. Both gated in the view on the AP tool + write mode + the
-    # `dcim.add_device` permission (`_ap_write_gate`) — suggest-name included, since a name is only
-    # useful to a caller who could create the device.
+    # The plugin's second write into dcim core (DEV-5, per-preset since DEV-8) and the name it
+    # suggests: create an unracked Device in a room through a device-type preset. Both gated in
+    # the view on the device tool + write mode + the `dcim.add_device` permission
+    # (`_device_write_gate`) — suggest-name included, since a name is only useful to a caller who
+    # could create the device.
     path('api/netbox/devices/suggest-name', frontend_api.NbDeviceSuggestNameView.as_view(),
          name='api-nb-device-suggest-name'),
     path('api/netbox/devices/create', frontend_api.NbDeviceCreateView.as_view(),
@@ -140,15 +142,13 @@ urlpatterns = [
     # sits with the settings family, not behind write mode.
     path('api/settings/todos', frontend_api.TodosSettingView.as_view(),
          name='api-settings-todos'),
-    # Access-point tool configuration (DEV-3). Three endpoints rather than one because they are
-    # three Settings rows; the naming template and its counter scope share one because they are one
-    # row (a template is only meaningful alongside the counter that suffixes it).
-    path('api/settings/ap-tool', frontend_api.ApToolSettingView.as_view(),
-         name='api-settings-ap-tool'),
-    path('api/settings/ap-device-role', frontend_api.ApDeviceRoleSettingView.as_view(),
-         name='api-settings-ap-device-role'),
-    path('api/settings/ap-naming', frontend_api.ApNamingSettingView.as_view(),
-         name='api-settings-ap-naming'),
+    # Device-placement tool configuration (DEV-3, generalized by DEV-8): the feature switch, and
+    # the device-type presets as ONE list endpoint — create/edit/delete/reorder are all "send the
+    # new list", so the stored order is the toolbar order and there is exactly one write path.
+    path('api/settings/device-tool', frontend_api.DeviceToolSettingView.as_view(),
+         name='api-settings-device-tool'),
+    path('api/settings/device-presets', frontend_api.DevicePresetsSettingView.as_view(),
+         name='api-settings-device-presets'),
 
     # PDF import (permission-gated) + authenticated serving of the rendered result.
     path('api/import/upload', uploads.UploadView.as_view(), name='api-import-upload'),
@@ -157,6 +157,10 @@ urlpatterns = [
     path('api/import/preview', imports.PreviewView.as_view(), name='api-import-preview'),
     path('api/import/ocr-read', imports.OcrReadView.as_view(), name='api-import-ocr-read'),
     path('api/import/build', imports.BuildView.as_view(), name='api-import-build'),
+    # The rebuild-in-place pair (IMPORT-74): read the live import map, then re-render from it
+    # without posting one — how the Settings page acts on a render-setting change.
+    path('api/import/map', imports.ImportMapView.as_view(), name='api-import-map'),
+    path('api/import/rebuild', imports.RebuildView.as_view(), name='api-import-rebuild'),
     path('api/import/reset', imports.ResetView.as_view(), name='api-import-reset'),
     path('api/import/regroup', imports.RegroupView.as_view(), name='api-import-regroup'),
     path('api/import/save-draft', imports.SaveDraftView.as_view(), name='api-import-save-draft'),

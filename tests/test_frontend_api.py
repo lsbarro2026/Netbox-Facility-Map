@@ -54,6 +54,57 @@ def test_sync_rooms_round_trips_alias(editor_user):
     assert Room.objects.get(room_id='r2').alias == ''
 
 
+def test_sync_rooms_stores_the_posted_order_as_z_order(editor_user):
+    # The posted array position IS the stacking order (ROOM-4): the frontend paints its `rooms`
+    # array in order and sends no separate `z` key, so `sync_rooms` derives the column from the
+    # list itself. Dense 0..n-1, counting only rooms actually written.
+    sync_rooms({FLOOR: [
+        {'id': 'bottom', 'polygon': [], 'location': None},
+        {'id': None, 'polygon': [], 'location': None},          # id-less: skipped, no z consumed
+        {'id': 'middle', 'polygon': [], 'location': None},
+        {'id': 'top', 'polygon': [], 'location': None},
+    ]}, user=editor_user)
+    assert {r.room_id: r.z_order for r in Room.objects.all()} == {
+        'bottom': 0, 'middle': 1, 'top': 2}
+
+
+def test_annotations_round_trip_preserves_room_stacking_order(rf, editor_user):
+    # The item's headline acceptance criterion: a chosen order survives a save + reload. Labels are
+    # deliberately reverse-alphabetical to the posted order, so a regression to the inherited
+    # `Room.Meta.ordering = ['floor_key', 'label']` — which is what used to re-sort the stack on
+    # every GET — shows up as the rooms coming back in the wrong order rather than passing by luck.
+    from netbox_facilitymap.frontend_api import compose_annotations
+    _floor_location()   # compose scopes rooms to the facility's Sites, so the Site must exist
+    order = ['zulu', 'mike', 'alpha']
+    sync_rooms({FLOOR: [{'id': rid, 'label': rid, 'polygon': [], 'location': None}
+                        for rid in order]}, user=editor_user)
+
+    req = rf.get('/')
+    req.user = editor_user
+    doc = compose_annotations({FLOOR: {}}, editor_user, req)
+    assert [r['id'] for r in doc[FLOOR]['rooms']] == order
+
+    # And a reorder round-trips just as faithfully — send-to-back on the last room.
+    reordered = ['alpha', 'zulu', 'mike']
+    sync_rooms({FLOOR: [{'id': rid, 'label': rid, 'polygon': [], 'location': None}
+                        for rid in reordered]}, user=editor_user)
+    doc = compose_annotations({FLOOR: {}}, editor_user, req)
+    assert [r['id'] for r in doc[FLOOR]['rooms']] == reordered
+
+
+def test_compose_orders_rest_created_rooms_deterministically(rf, editor_user):
+    # A row created out-of-band through REST keeps the `0` default until the next editor save
+    # re-indexes the floor, so ties are real and must not be arbitrary — `room_id` breaks them.
+    from netbox_facilitymap.frontend_api import compose_annotations
+    _floor_location()   # compose scopes rooms to the facility's Sites, so the Site must exist
+    for rid in ('r-c', 'r-a', 'r-b'):
+        Room.objects.create(floor_key=FLOOR, room_id=rid, label=rid)
+    req = rf.get('/')
+    req.user = editor_user
+    doc = compose_annotations({FLOOR: {}}, editor_user, req)
+    assert [r['id'] for r in doc[FLOOR]['rooms']] == ['r-a', 'r-b', 'r-c']
+
+
 def test_serialize_room_includes_alias(rf, editor_user):
     # `_serialize_room` shapes a Room back into the frontend record; `alias` must ride along so the
     # composed annotations GET round-trips it into `Store.searchTargets` for the placed-search tier.
@@ -2012,3 +2063,87 @@ def test_nb_building_locations_scoped_to_the_location_facility_subtree(client, s
 
     body = client.get(reverse(BUILDING_LOCATIONS) + '?facility=bldg-a').json()
     assert {l['slug'] for l in body['locations']} == {'bldg-a'}
+
+
+# ---- NbDevicesView: the marker's role colour rides the device list (DEV-10) ----
+
+DEVICES = 'plugins:netbox_facilitymap:api-nb-devices'
+
+
+def _room_with_device(role_color='f44336'):
+    """A room Location holding one unracked Device whose role carries `role_color` (`''` = a role
+    with no colour set). Returns the room Location.
+
+    No roleless-Device case: `Device.role` is NOT NULL in NetBox, so `_trim_device`'s `if role`
+    guard is unreachable defence rather than a state a test can build."""
+    from dcim.models import Device, DeviceRole, DeviceType, Location, Manufacturer
+
+    site, floor = _floor_location()
+    room = Location.objects.create(name='Room 101', slug='room-101', site=site, parent=floor)
+    mfr = Manufacturer.objects.create(name='M', slug='m-dev')
+    dtype = DeviceType.objects.create(manufacturer=mfr, model='DT', slug='dt-dev')
+    role = DeviceRole.objects.create(name='Role', slug='role-dev', color=role_color)
+    Device.objects.create(name='DV', device_type=dtype, role=role, site=site, location=room,
+                          status='active')
+    return room
+
+
+def test_nb_devices_carries_the_role_colour_and_its_contrast_ink(client, superuser):
+    # The browser sets these straight onto the marker as CSS custom properties, so `color` must
+    # arrive '#'-prefixed and `ink` already resolved — the frontend never recomputes contrast.
+    room = _room_with_device('f44336')
+    client.force_login(superuser)
+
+    role = client.get(reverse(DEVICES) + f'?location={room.pk}').json()['devices'][0]['role']
+    assert role['color'] == '#f44336'
+    assert role['ink'] == '#fff'
+    assert role['slug'] == 'role-dev'          # the glyph keywords still ride the same dict
+
+
+def test_nb_devices_flips_the_ink_for_a_pale_role(client, superuser):
+    room = _room_with_device('ffeb3b')
+    client.force_login(superuser)
+
+    role = client.get(reverse(DEVICES) + f'?location={room.pk}').json()['devices'][0]['role']
+    assert role['color'] == '#ffeb3b' and role['ink'] == '#1a1a1a'
+
+
+def test_nb_devices_sends_a_null_colour_for_a_colourless_role(client, superuser):
+    # Nothing to paint with, so both keys go out null and the frontend leaves the marker on its
+    # stylesheet grey — the role dict still carries the slug the glyph keywords need.
+    room = _room_with_device('')
+    client.force_login(superuser)
+
+    role = client.get(reverse(DEVICES) + f'?location={room.pk}').json()['devices'][0]['role']
+    assert role['color'] is None and role['ink'] is None
+    assert role['slug'] == 'role-dev'
+
+
+def test_nb_devices_does_not_query_per_device_for_role_and_type(client, superuser):
+    # `_trim_device` reads role + device_type off every row, so without `select_related` the list
+    # cost grows by 2 queries per device. Counted relatively (a second room with an extra device
+    # against the first) so the request's own auth/session queries don't have to be enumerated.
+    from dcim.models import Device, DeviceRole, DeviceType, Location, Manufacturer
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    one_room = _room_with_device('f44336')
+    site = one_room.site
+    two_room = Location.objects.create(name='Room 102', slug='room-102', site=site,
+                                       parent=one_room.parent)
+    mfr = Manufacturer.objects.get(slug='m-dev')
+    role2 = DeviceRole.objects.create(name='Role 2', slug='role-dev-2', color='2196f3')
+    for n in (1, 2):
+        dtype = DeviceType.objects.create(manufacturer=mfr, model=f'DT{n}', slug=f'dt{n}-dev')
+        Device.objects.create(name=f'DV{n}', device_type=dtype, role=role2, site=site,
+                              location=two_room, status='active')
+    client.force_login(superuser)
+
+    def cost(room):
+        with CaptureQueriesContext(connection) as ctx:
+            body = client.get(reverse(DEVICES) + f'?location={room.pk}').json()
+        return len(body['devices']), len(ctx)
+
+    (n_one, q_one), (n_two, q_two) = cost(one_room), cost(two_room)
+    assert (n_one, n_two) == (1, 2)
+    assert q_two == q_one

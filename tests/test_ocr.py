@@ -128,6 +128,54 @@ def _caption_crop(width, height, rule, lines):
     return im
 
 
+# The reported title block's own geometry, written once against a 560x170 block and scaled from
+# there, so the same layout can be rendered at any size. Every case below that needs to know where
+# a row physically landed reads it from here rather than repeating a pixel count.
+TITLE_BLOCK_BASE = (560, 170)
+TITLE_BLOCK_ROWS = {'name': 25, 'sub': 57, 'floor': 100, 'dept': 145}
+
+
+def _title_block_crop(scale=1.0, rule=2):
+    """The **reported** crop (OCR-1), as a code region on a real facility's sheet holds it: a logo
+    mark beside the building-name row, a second name row under it, a floor row with the print date
+    off in the corner, and a solid department bar at the foot.
+
+    Nothing about it is decorative. The logo is a single ink blob spanning both name rows, which is
+    what fused them; the date is a digit-bearing distractor on the floor row's own line, which is
+    what outscored the code; and the department bar is a filled band that must survive, since
+    erasing every large mark wholesale is the obvious wrong fix. `_caption_crop`'s two tidy lines
+    are the case this pipeline already handled — a busy block is the one it did not."""
+    from PIL import Image, ImageDraw, ImageFont
+    w, h = round(TITLE_BLOCK_BASE[0] * scale), round(TITLE_BLOCK_BASE[1] * scale)
+    im = Image.new('RGB', (w, h), 'white')
+    d = ImageDraw.Draw(im)
+    d.rectangle([0, 0, w - 1, h - 1], outline='black', width=rule)
+
+    def at(*xs):
+        return [round(v * scale) for v in xs]
+
+    def font(px):
+        return ImageFont.truetype(FONT_PATH, max(8, round(px * scale)))
+
+    d.ellipse(at(12, 12, 62, 62), fill='black')          # the logo mark...
+    d.rectangle(at(20, 66, 56, 74), fill='black')        # ...and its wordmark rule, one blob
+    d.text(at(74, 12), 'CAL POLY', fill='black', font=font(26))
+    d.text(at(74, 46), 'Cotchett Education Building', fill='black', font=font(22))
+    d.text(at(16, 88), 'Floor 3', fill='black', font=font(26))
+    d.text(at(430, 92), 'MAY 2025', fill='black', font=font(18))
+    d.rectangle([rule, round(132 * scale), w - rule - 1, h - rule - 1], fill=(30, 120, 60))
+    d.text(at(16, 138), 'FACILITIES MANAGEMENT', fill='white', font=font(18))
+    return im
+
+
+def _band_at(bands, y):
+    """The band covering row `y`, or None — how a case asserts *which* row a band is."""
+    for b in bands:
+        if b[1] <= y < b[3]:
+            return b
+    return None
+
+
 # ---- binarization: seeing the ink at all ----
 
 @needs_numpy
@@ -207,6 +255,112 @@ def test_suppress_rules_sees_a_rule_on_a_tightly_drawn_crop():
     clean = ocr._suppress_rules(ocr._binarize(gray))
     assert not clean[0].any() and not clean[:, 0].any()
     assert len(ocr._row_bands(clean)) == 1
+
+
+# ---- graphic suppression: the fix for OCR-1 ----
+#
+# Asserted on the **mask**, like every other segmentation case here: hand the recognizer two fused
+# rows and it answers confidently, so the model cannot be the witness for whether they were split.
+
+
+@needs_numpy
+def test_components_treats_a_diagonal_stroke_as_one_mark():
+    """8-connectivity, which is why it is used: an antialiased stroke steps sideways a pixel at a
+    time, and under 4-connectivity it shatters into one component per row — every fragment then
+    short enough to look like a glyph, and the tall mark this must find disappears."""
+    import numpy as np
+    ink = np.zeros((40, 40), dtype=bool)
+    for i in range(30):
+        ink[5 + i, 5 + i] = True
+    runs, labels = ocr._components(ink)
+    assert len(runs) == 30
+    assert len(set(labels.tolist())) == 1, 'the stroke was split into pieces'
+    assert all(r[0] >= 0 and r[2] > r[1] for r in runs.tolist())
+
+
+@needs_numpy
+def test_suppress_graphics_clears_a_logo_that_fuses_two_text_rows():
+    """**The reported bug** (OCR-1). A title block prints its logo beside the building name, and
+    that mark is one ink blob tall enough to span the name row *and* the row beneath it. The row
+    projection cannot see a blank row between two lines whose gap the logo inks, so both land in
+    one band — and the single-line recognizer answers with a confident vertical blend of them
+    (`CALPoCothet Eaucatnuid`) rather than an error.
+
+    `_suppress_rules` cannot catch it: a logo is neither thin nor inked end to end, which is
+    exactly what that guard exists to spare."""
+    gray = _blank(430, 100)
+    _text_row(gray, 20, 40, 90, 400)
+    _text_row(gray, 60, 80, 90, 300)
+    gray[18:82, 20:60] = 0                    # the logo, bridging both rows
+    ink = ocr._binarize(gray)
+    assert len(ocr._row_bands(ink)) == 1, 'expected the mark to fuse the two rows'
+
+    clean = ocr._suppress_graphics(ink)
+    assert len(ocr._row_bands(clean)) == 2, 'the rows are still fused'
+    assert clean[30, 100] and clean[70, 100], 'the text was erased along with the mark'
+    assert not clean[50, 30], 'the mark survived'
+
+
+@needs_numpy
+def test_suppress_graphics_keeps_a_floor_code_set_in_big_type():
+    """The guard that makes the rule safe, and the reason it is a *split* test rather than a test
+    of what a mark looks like. A floor code printed large is tall by exactly the same measure a
+    logo is — and measured across the fonts a drawing uses, ink-to-box ratio separates them no
+    better: a solid logo (0.78) sits inside the range bold capitals already occupy (0.76).
+
+    What it cannot do is bridge two lines. Removing it leaves *fewer* bands across its own rows,
+    never more, so the removal is undone and the code stays a candidate."""
+    gray = _blank(430, 160)
+    _text_row(gray, 10, 26, 20, 400)
+    _text_row(gray, 34, 50, 20, 300)
+    gray[70:150, 20:70] = 0                   # the code, as tall as a logo, on a line of its own
+    ink = ocr._binarize(gray)
+    assert (ocr._suppress_graphics(ink) == ink).all(), 'a big floor code was deleted'
+
+
+@needs_numpy
+def test_suppress_graphics_leaves_a_solid_filled_band_alone():
+    """The department bar a title block prints at its foot, and the same claim
+    `test_suppress_rules_leaves_a_solid_filled_band_alone` makes about the other suppressor: a
+    filled swatch is content, and erasing it takes the white type inside it too."""
+    gray = _blank(300, 140)
+    _text_row(gray, 10, 30, 20, 280)
+    gray[60:130, :] = 0
+    ink = ocr._binarize(gray)
+    assert (ocr._suppress_graphics(ink) == ink).all()
+
+
+@needs_numpy
+def test_suppress_graphics_is_scale_free():
+    """The same layout, rendered four times larger, must be cut the same way. Everything here is
+    measured against the crop's *own* typical glyph — a median component height — so nothing in it
+    is a pixel count that a render width can walk across."""
+    import numpy as np
+    gray = _blank(430, 100)
+    _text_row(gray, 20, 40, 90, 400)
+    _text_row(gray, 60, 80, 90, 300)
+    gray[18:82, 20:60] = 0
+    big = np.repeat(np.repeat(gray, 4, axis=0), 4, axis=1)
+    assert len(ocr._row_bands(ocr._suppress_graphics(ocr._binarize(gray)))) == 2
+    assert len(ocr._row_bands(ocr._suppress_graphics(ocr._binarize(big)))) == 2
+
+
+@needs_numpy
+@needs_font
+@pytest.mark.parametrize('scale', [1.0, 1.5, 2.0, 4.0])
+def test_a_busy_title_block_gives_the_floor_row_a_band_of_its_own(scale):
+    """The regression, end to end over the segmenter, on the reported layout rather than on a
+    tidy two-line caption: logo + two name rows + a floor row + a corner date + a filled footer
+    bar. Every row has to come out as its own band — above all the floor row, which is the one the
+    client's parser needs and the one the logo used to swallow.
+
+    Needs no model: which rows became bands is the whole claim."""
+    crop = _title_block_crop(scale)
+    bands = ocr.FloorCodeReader('/nonexistent')._split_lines(crop)
+    rows = {name: _band_at(bands, round(y * scale)) for name, y in TITLE_BLOCK_ROWS.items()}
+    assert all(rows.values()), (rows, bands)
+    assert rows['floor'] is not rows['name'] and rows['floor'] is not rows['sub'], bands
+    assert rows['name'] is not rows['sub'], 'the logo still fuses the two name rows'
 
 
 # ---- the row projection ----
@@ -343,7 +497,8 @@ def test_plausible_screens_each_rejection_case_on_its_own(text, conf, ok):
 def test_the_winner_prefers_a_digit_but_knows_nothing_about_floors():
     """The server's winner rule is vocabulary-free by decision: the wizard's `floorFromText` is
     the one parser both the filename axis and the OCR axis share, and a copy here would drift from
-    it. So this may prefer a digit — a floor code almost always has one — and no more than that."""
+    it. So this may prefer a digit — a floor code almost always has one — and how *long* a run of
+    them a candidate carries (the case below), and no more than that."""
     def c(text, conf):
         return {'text': text, 'confidence': conf, 'min_p': conf, 'y': 0.5}
 
@@ -352,6 +507,34 @@ def test_the_winner_prefers_a_digit_but_knows_nothing_about_floors():
     # No digit anywhere: the most confident wins outright, floor-ness notwithstanding.
     assert ocr._pick_winner([c('FLOOR', 0.6), c('DEVELOPMENT', 0.9)])['text'] == 'DEVELOPMENT'
     assert ocr._pick_winner([]) is None
+
+
+@pytest.mark.parametrize('text, longest', [
+    ('Floor 3', 1), ('LEVEL 12', 2), ('B3', 1), ('MAY 2025', 4), ('MAY2025', 4),
+    ('Floor 3MAY2025', 4), ('GROUND FLOOR', 0), ('A1-2026-07', 4),
+])
+def test_digit_run_measures_the_longest_run_not_the_count(text, longest):
+    assert ocr._digit_run(text) == longest
+
+
+def test_the_winner_prefers_a_short_digit_run_over_a_date():
+    """**The reported bug's scoring half** (OCR-1). A title block's `MAY 2025` reads at 0.999
+    against a `Floor 3` at 0.998 — a date set alone in a clean corner is easier pixels than a code
+    printed beside other type — so "prefer a digit, then the most confident" hands the read to the
+    date every time, on every drawing in the facility at once.
+
+    A storey's number is one or two digits where a year's is four, and that is a claim about the
+    *shape* of a string: still no word list, still nothing here that could drift from
+    `ImportBulk.floorFromText`."""
+    def c(text, conf):
+        return {'text': text, 'confidence': conf, 'min_p': conf, 'y': 0.5}
+
+    assert ocr._pick_winner([c('MAY 2025', 0.999), c('Floor 3', 0.998)])['text'] == 'Floor 3'
+    assert ocr._pick_winner([c('Floor 3MAY2025', 0.99), c('Floor 3', 0.9)])['text'] == 'Floor 3'
+    # Every tier is a preference and never a filter: a crop holding nothing but long numbers still
+    # answers with its most confident line rather than with nothing.
+    assert ocr._pick_winner([c('MAY 2025', 0.9), c('SHEET 1024', 0.95)])['text'] == 'SHEET 1024'
+    assert ocr._pick_winner([c('2025', 0.99), c('LOBBY', 0.5)])['text'] == '2025'
 
 
 # ---- reading real pixels, end to end ----
@@ -404,6 +587,40 @@ def test_a_floor_code_above_an_unrelated_row_is_read_as_its_own_line():
     assert any('MAY' in f for f in flat), 'the date row went missing entirely: %s' % (flat,)
     assert (text or '') != '', 'a legible caption must not come back as unreadable'
     assert conf > 0.5
+
+
+@needs_engine
+@needs_font
+def test_a_busy_title_block_reads_the_floor_row_and_not_the_date():
+    """**The reported bug** (OCR-1), read off real pixels. The same crop was answering with the
+    building name (`CAL POLY Administration`, 0.86), with a vertical blend of the two name rows
+    (`CALPoCothet Eaucatnuid`, 0.72), or with the print date (`MAY2025`, 0.99) — three symptoms of
+    two causes: the logo fused the name rows, and a four-digit year outscored the code.
+
+    Both halves are asserted. The floor code has to survive as a candidate **of its own** rather
+    than smeared into the corner date, the name rows have to come back as real text rather than a
+    blend, and the winner has to be the floor row — which is what the card shows when the client's
+    parser finds nothing to parse."""
+    import tempfile
+    from PIL import Image
+    work = tempfile.mkdtemp()
+    crop = _title_block_crop(1.5)
+    sheet = Image.new('RGB', (1600, 1100), 'white')
+    sheet.paste(crop, (300, 500))
+    sheet.save(os.path.join(work, 'sheet.png'))
+    region = {'x': 300 / 1600, 'y': 500 / 1100,
+              'w': crop.width / 1600, 'h': crop.height / 1100}
+
+    text, conf, cands = ocr.FloorCodeReader(work).read_region('sheet.png', region)
+    flat = [c['text'].upper().replace(' ', '') for c in cands]
+    assert 'FLOOR3' in text.upper().replace(' ', ''), (text, flat)
+    assert conf > 0.5
+    # ...and as a line of its own, with the corner date not smeared into it
+    assert any(f == 'FLOOR3' for f in flat), flat
+    assert any('MAY' in f for f in flat), 'the date row went missing entirely: %s' % (flat,)
+    # The name rows are two readable lines, not one confident blend of both.
+    assert any('CALPOLY' in f for f in flat), flat
+    assert any('BUILDING' in f for f in flat), flat
 
 
 @needs_engine

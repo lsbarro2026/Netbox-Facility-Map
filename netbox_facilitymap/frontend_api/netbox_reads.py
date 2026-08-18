@@ -170,7 +170,7 @@ class NbLocationCreateView(LoginRequiredMixin, View):
       * the **inline room creation** add-on must be on — this feature's own switch, split out of write
         mode by SET-5 so an operator can allow the AP tool's writes while keeping Location creation in
         NetBox's hands (or the reverse), read via `previews.inline_room_creation_enabled` — else 403.
-        The same two-switch shape the AP write answers to (`_ap_write_gate`): one master gate, one
+        The same two-switch shape the device write answers to (`_device_write_gate`): one master gate, one
         per-feature switch;
       * the user must hold the `dcim.add_location` object permission (the NetBox auth backend, not a
         login check) — the model-level `has_perm` gives a fast 403, and a post-save

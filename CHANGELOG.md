@@ -10,6 +10,63 @@ Each entry opens with its release tier — _Major_ (breaking), _Minor_ (new
 features/enhancements) or _Patch_ (bug fixes) — followed by the narrative, a
 **Breaking Changes** section when applicable, and the issues it resolves.
 
+## 2.2.0 — Explicit room stacking, custom device presets, and a category-based view filter
+_Minor release — new features and enhancements._
+
+Where `2.1.0` was about getting a big facility onto the map, this release is about controlling
+what you see once it's there and drawing rooms the way a real floor plan actually nests them —
+one room carved out of another, a hallway cutting through an open space, a rack room and an
+access point sharing a floor without stepping on each other.
+
+**Rooms and building areas get an explicit stacking order.** Overlapping polygons used to draw
+and hit-test in whatever order the map happened to load them, re-sorted alphabetically on every
+reload. Every shape panel now carries CAD/Illustrator-style **Back / Down / Up / Front** controls
+over a "Layer N of M" readout scoped to just the shapes it actually overlaps, so the buttons and
+the count mean something. Drawing a container room around rooms you've already placed no longer
+buries them: the new room is automatically sent behind whatever it fully contains, with a toast
+and a one-click **Keep on top** to undo it. A run of edge cases that made the punch-out (the hole
+a container cuts around a room sitting inside it) disappear are fixed too — a shared wall, a room
+hidden by the View filter, a NetBox Location traced as two polygons, a device placed in one half
+of a two-polygon room — so a room reads and behaves as one room no matter how it was drawn.
+
+**The floor toolbar's "Add access point" button is now a general device tool**, driven by
+admin-defined presets: pick an icon from a roughly 45-glyph library, a NetBox device role, a name
+template and numbering scope, and which fields the placement dialog should ask for. The toolbar
+shows every enabled preset in one **Add device** menu, and existing access-point installs keep
+working with no manual step. Device markers are now filled with their NetBox device role's own
+color instead of one flat gray, so a floor full of markers reads at a glance instead of by label,
+with contrasting glyph detail on pale roles so they don't wash out. (The speaker icon was also
+redrawn — it now reads as a PA horn rather than a music speaker.)
+
+**The floor's view-mode highlight control is now a multi-select View filter.** Instead of one
+all-or-nothing dropdown, check any combination of Racks, Access points, and NetBox device roles
+and the map shows only the rooms and markers matching what's checked — and the selection now
+survives a page reload instead of resetting to "All" every time.
+
+**Dragging is more forgiving.** Moving a whole room or a wall now snaps against neighbouring
+rooms, not just the grid, matching how single-vertex drags already worked — so two rooms whose
+shared wall was hand-snapped together can actually be rejoined by dragging one of them. The map
+now pans from anywhere (previously only empty background could be grabbed), Space is a dedicated
+hand tool, and the rectangle tool can now start a box on top of an existing room. The import
+wizard's "split this drawing into floors" screen was also rebuilt on the same drawing engine the
+room and building editors use — freeform polygon regions, snapping, undo, and pan/zoom, instead
+of a separate box-only gesture.
+
+**Import wizard refinements.** A building with exactly one drawing and exactly one NetBox floor
+now matches them automatically even when their captions disagree (a `Floor 1` drawing against a
+`Floor 0` Location, say). Toggling "High quality floor plans" in Settings now offers to rebuild
+the map on the spot instead of leaving you to find the rebuild button yourself. The floor-code
+reader is more accurate against busy title blocks — it no longer blends a facility's logo into
+the text above a floor code, or reads a nearby print date instead of the actual floor number. And
+the import overview's progress panel no longer reports a facility as finished before it has
+actually been reviewed.
+
+**Documentation.** The public README gained the sections the certification checklist expects — a
+dependency table, a support/feedback route, the certification attribution — and a general
+editorial pass.
+
+_Resolved issues: none tracked (pre-public-repo)._
+
 ## 2.1.0 — Importing a whole campus, floor codes read off the drawings, and a map that works on a phone
 _Minor release — new features and enhancements._
 

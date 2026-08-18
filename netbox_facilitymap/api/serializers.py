@@ -4,7 +4,10 @@ This is the *NetBox REST API* surface (mounted under `/api/plugins/facilitymap/`
 to be confused with the page-mount `frontend_api` views that feed the map frontend. It shapes
 the same `Room` rows the editor writes through `sync_rooms`, so a room is now reachable
 both ways. `polygon` is exposed read/write but is editor-owned geometry (see the roadmap
-"last-writer-wins" note); the high-value writable fields here are `label`, `alias` (the NAV-18
+"last-writer-wins" note), and `z_order` (the room's stacking order within its floor, ROOM-4) sits on
+that same editor-owned side: the editor rewrites every room's `z_order` from its own array order on
+each Save, so a value set here lasts only until the floor is next saved on the canvas. The
+high-value writable fields here are `label`, `alias` (the NAV-18
 printed-name search synonyms), `location`, and the `NetBoxModel` extras (`tags`, `custom_fields`).
 `floor_location` (the BIND-1 rename-proof floor binding) is exposed **read-only** because it is
 *derived*, not independent: it is the floor Location a `floor_key` names. A REST client sets a
@@ -78,6 +81,7 @@ class RoomSerializer(NetBoxModelSerializer):
         model = Room
         fields = (
             'id', 'url', 'display', 'floor_key', 'room_id', 'label', 'alias', 'polygon',
-            'location', 'floor_location', 'tags', 'custom_fields', 'created', 'last_updated',
+            'z_order', 'location', 'floor_location', 'tags', 'custom_fields',
+            'created', 'last_updated',
         )
         brief_fields = ('id', 'url', 'display', 'floor_key', 'room_id', 'label')

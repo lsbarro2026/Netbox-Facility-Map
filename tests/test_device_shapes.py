@@ -22,7 +22,9 @@ from pathlib import Path
 import pytest
 from django.conf import settings
 
-from netbox_facilitymap.device_shapes import DeviceShapes, custom_rules
+from netbox_facilitymap.device_shapes import (
+    _BUILTIN_GLYPH_TYPES, _LIB_INDEX, _LIBRARY, GLYPH_TYPES, DeviceShapes, custom_rules,
+)
 
 
 # ---- type_for (stateless, no DB) ----
@@ -284,6 +286,8 @@ def _args_for(case):
     placement = {'kind': case.get('kind', 'device')}
     if 'label' in case:
         placement['label'] = case['label']
+    if 'icon' in case:
+        placement['icon'] = case['icon']   # the explicit preset icon (DEV-8)
     item = {k: case[k] for k in ('role_slug', 'role_name', 'name') if k in case}
     return placement, (item or None)
 
@@ -323,6 +327,55 @@ def test_shared_corpus_is_not_silently_empty():
     assert _CORPUS['normalize']
 
 
+# ---- the device icon library (DEV-8) ----
+
+def test_library_ids_are_glyph_types_and_rack_stays_unpickable():
+    ids = [icon['id'] for group in _LIBRARY for icon in group['icons']]
+    assert len(set(ids)) == len(ids)
+    assert GLYPH_TYPES == set(ids) | {'rack'}
+    assert 'rack' not in ids            # the tool places devices, never racks
+
+
+def test_library_matches_the_js_side():
+    """The library halves of the lockstep pair, checked structurally: every id/paths pair in the
+    Python `_LIBRARY` must appear byte-identically in device-shapes.js's `DEVICE_ICON_LIBRARY`
+    (path data is compared as exact strings — a re-drawn icon on one side must land on both)."""
+    js = (Path(__file__).parent.parent / 'netbox_facilitymap' / 'static'
+          / 'netbox_facilitymap' / 'device-shapes.js').read_text('utf-8')
+    for group in _LIBRARY:
+        for icon in group['icons']:
+            assert "id: '%s'" % icon['id'] in js, icon['id']
+            for d in icon.get('paths', ()):
+                assert "'%s'" % d in js, '%s: path drifted from the JS side: %s' % (icon['id'], d)
+
+
+def test_type_for_explicit_icon_beats_custom_rules(role_glyphs):
+    # The precedence contract: explicit icon > operator role_glyphs > built-in keywords. The
+    # corpus covers icon-vs-built-in; the operator vocabulary needs per-test config, so it lives
+    # here (the corpus README's scope rule).
+    role_glyphs({'switch': ['speaker']})
+    assert DeviceShapes.type_for(
+        {'kind': 'device', 'icon': 'speaker', 'label': 'Speaker'}) == 'speaker'
+
+
+def test_builtin_types_never_chip_render_off_their_picker_paths():
+    # The invariant that keeps every pre-DEV-8 marker byte-identical: `_chip_paths` refuses the
+    # built-in set, so the ap keeps its bespoke puck even though its entry carries picker paths.
+    for t in _BUILTIN_GLYPH_TYPES:
+        assert DeviceShapes._chip_paths(t) is None, t
+    assert DeviceShapes._chip_paths('speaker')
+
+
+def test_glyph_library_type_is_chip_plus_transformed_paths():
+    # A new library type renders exactly like the `_LUCIDE` appliances: body chip + the icon's
+    # stroke paths, scaled+centred by a transform — so embeds draw preset icons too.
+    g = DeviceShapes.glyph('speaker', 18, 18)
+    assert g[0]['tag'] == 'rect' and g[0]['cls'] == 'dev-body'
+    icon = g[1:]
+    assert len(icon) == len(_LIB_INDEX['speaker']['paths'])
+    assert all(p['tag'] == 'path' and 'transform' in p for p in icon)
+
+
 # ---- placement_markers integration (DB) ----
 
 def _floor_scaffold(slug='b1'):
@@ -360,9 +413,11 @@ def test_placement_markers_ap_renders_puck_rack_renders_box(admin_user):
     assert {p['tag'] for p in ap_marker['glyph']} == {'circle'} and len(ap_marker['glyph']) == 4
     assert [p['tag'] for p in rack_marker['glyph']] == ['rect']
 
-    # Body fills differ by kind (rack --accent, device --text2), so an embed matches the live map.
+    # Body fills differ by kind, so an embed matches the live map: a rack is always --accent,
+    # while a device wears its role's colour (DEV-10) — here the `9e9e9e` grey every DeviceRole
+    # is created with, since this role sets none explicitly.
     assert 'fill:#066fd1' in rack_marker['glyph'][0]['style']       # rack cabinet
-    assert 'fill:#3d4654' in ap_marker['glyph'][0]['style']         # device puck body
+    assert 'fill:#9e9e9e' in ap_marker['glyph'][0]['style']         # device puck body
 
     # Links stay permission-scoped (admin can view both).
     assert ap_marker['url'] == ap.get_absolute_url()

@@ -98,7 +98,18 @@
     { "label": "Pare-Feu #2", "want": "generic",
       "note": "A non-English role with no configured vocabulary stays generic on BOTH sides (INTL-1)." },
     { "role_name": "パッチパネル", "want": "generic",
-      "note": "Non-Latin text survives normalization (it is no longer deleted outright) but matches no English rule." }
+      "note": "Non-Latin text survives normalization (it is no longer deleted outright) but matches no English rule." },
+
+    { "icon": "speaker", "role_name": "Server", "want": "speaker",
+      "note": "DEV-8: an explicit placement icon wins outright — no keyword rule may second-guess it." },
+    { "icon": "camera-dome", "want": "camera-dome",
+      "note": "DEV-8: a library icon resolves with nothing else to classify on." },
+    { "icon": "ap", "role_name": "Core Switch", "want": "ap",
+      "note": "DEV-8: an explicit icon naming a built-in type beats the role keywords too." },
+    { "icon": "no-such-icon", "role_name": "Access Point", "want": "ap",
+      "note": "DEV-8: a stale/unknown icon id falls back to keyword inference, never draws nothing." },
+    { "kind": "rack", "icon": "speaker", "want": "rack",
+      "note": "DEV-8: `kind` still wins over an explicit icon — a rack is a rack." }
   ],
 
   "box": [
@@ -115,7 +126,10 @@
     { "type": "outlet", "w": 12, "h": 7 },
     { "type": "ap", "w": 16, "h": 16 },
     { "type": "generic", "w": 22, "h": 15 },
-    { "type": "no-such-type", "w": 22, "h": 15, "note": "Unknown types fall back to the generic footprint." }
+    { "type": "no-such-type", "w": 22, "h": 15, "note": "Unknown types fall back to the generic footprint." },
+    { "type": "speaker", "w": 18, "h": 18, "note": "DEV-8: library chip types share one compact square footprint." },
+    { "type": "camera-dome", "w": 18, "h": 18 },
+    { "type": "electric-panel", "w": 18, "h": 18 }
   ],
 
   "normalize": [

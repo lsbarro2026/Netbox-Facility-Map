@@ -36,9 +36,10 @@ class FloorEditor extends Editor {
     // deselect/handleKey/onPanelClosed/_snapshotState all read it.
     this.arrange = new FloorArrange(this);
     this.todoAdd = new FloorTodoAdd(this);
-    this.apTool = new FloorApTool(this);
+    this.deviceTool = new FloorDeviceTool(this);
     this.annotations = new FloorAnnotations(this);
     this.placements = new FloorPlacements(this);
+    this.viewFilter = new FloorViewFilter(this);
   }
 
   /** Accept a focus target from App.showFloor (before show()) — a wayfinding-search jump or a
@@ -50,6 +51,9 @@ class FloorEditor extends Editor {
   // ---- Editor hooks ----
   data() { return this.store.floorData(this.building.dir, this.floor.id); }
   polys() { return this.data().rooms; }
+  // The live array the layering actions splice (ROOM-4). Same array `polys()` hands back here, but
+  // through the seam that promises it is the STORED one — see `Editor._shapeList`.
+  _shapeList() { return this.data().rooms; }
   editing() { return this.app.mode === 'edit'; }
   // gridActive() is inherited from Editor (= editing()): rack placement is a sub-mode of
   // edit, so the grid is already live there and markers snap like room nodes.
@@ -410,27 +414,28 @@ class FloorEditor extends Editor {
       // stale marker's dashed outline (`.rack-marker.stale`) — floor-only, since neither state
       // exists on the siteplan.
       { title: 'Room & marker states', rows: [
-        ['Hatched red fill', 'Room with no NetBox Location bound (draw-only — fine unless it needs racks, APs or to-dos)'],
+        ['Hatched red fill', 'Room with no NetBox Location bound (draw-only — fine unless it needs racks, devices or to-dos)'],
         ['Dashed grey outline', 'Rack/device marker not in the latest inventory sync (stale)'],
       ] },
     ]);
   }
-  // Device-placement tools: Add access point (when gated) and the Place-racks sub-mode
-  // toggle, grouped into their own section between the align row and the trailing extras.
+  // Device-placement tools: the Add-device preset dropdown (when gated) and the Place-racks
+  // sub-mode toggle, grouped into their own section between the align row and the trailing extras.
   _deviceTools() {
     const tools = [];
-    // The access-point tool is floor-only by nature — it drops a Device in a *room*, and rooms
+    // The Add-device tool is floor-only by nature — it drops a Device in a *room*, and rooms
     // only exist on floors — so it lives in FloorEditor's own `_deviceTools` hook rather than the
     // shared base. SiteplanEditor has no device tools (the base's empty default applies), so this
     // is not the §10 edit-menu lockstep drift it might otherwise look like.
     // Offered only when every gate the create answers to is already satisfied (the `show:`
-    // convention the settings rows follow) — a button that could only ever 403 is never shown.
-    // Write mode being off is not a silent dead end: it is the master gate on every NetBox-core
-    // write, and the Settings page disables the whole Write add-ons section behind it (SET-5), so
-    // an operator sees why the tool is unavailable rather than wondering where it went.
-    if (this.app.apTool && this.app.writeMode && this.app.canCreateDevice && this.app.apDeviceRole) {
-      tools.push(Dom.el('button', { class: 'tb-labeled', title: 'Add a WiFi access point to a room',
-        onclick: () => this.apTool.begin(), html: Icons.wifi + '<span>Add access point</span>' }));
+    // convention the settings rows follow) — a button that could only ever 403 is never shown —
+    // and at least one enabled preset resolved a visible role (DEV-8). Write mode being off is
+    // not a silent dead end: it is the master gate on every NetBox-core write, and the Settings
+    // page disables the whole Write add-ons section behind it (SET-5), so an operator sees why
+    // the tool is unavailable rather than wondering where it went.
+    const presets = this.deviceTool.presets();
+    if (this.app.deviceTool && this.app.writeMode && this.app.canCreateDevice && presets.length) {
+      tools.push(this._addDeviceMenu(presets));
     }
     // Place-racks is a sub-mode of edit: an in-place toggle, not a separate mode/toolbar.
     const racksBtn = Dom.el('button', { class: 'icononly' + (this.placingRacks ? ' active' : ''),
@@ -438,6 +443,27 @@ class FloorEditor extends Editor {
     racksBtn.onclick = () => this._toggleRacks();
     tools.push(racksBtn);
     return tools;
+  }
+
+  /** The "Add device ▾" button + its preset dropdown, wrapped in a `.view-menu-wrap` div so the
+   *  pair rides the toolbar as one node — the FloorViewFilter popover precedent exactly (the
+   *  shared `Popover`, closed by `App._detachCurrent` on route change; `App._fitToolbar`'s
+   *  overflow fold moves only `button, select`, so the wrap stays in the bar). One row per
+   *  enabled preset, its library icon + label; picking one arms the placement tool for it.
+   *  Preset labels are operator-typed text, so they ride a text node — only the icon SVG (our
+   *  own library markup) goes through `html:`. */
+  _addDeviceMenu(presets) {
+    const btn = Dom.el('button', { class: 'tb-labeled', title: 'Add a device to a room',
+      html: Icons.plus + '<span>Add device</span>' });
+    const pop = Dom.el('div', { class: 'view-menu device-preset-menu' });
+    const popover = new Popover({ trigger: btn, panel: pop });
+    for (const preset of presets) {
+      const row = Dom.el('button', { class: 'view-row device-preset-row', type: 'button',
+        html: DeviceShapes.iconSvg(preset.icon) }, [Dom.el('span', {}, preset.label)]);
+      row.onclick = () => { popover.close(); this.deviceTool.begin(preset); };
+      pop.append(row);
+    }
+    return Dom.el('div', { class: 'view-menu-wrap' }, [btn, pop]);
   }
   // Trailing edit-only tools: Arrange sheets (multi-sheet floors), Copy to floor, and the
   // read-only data overlay (when the floor has one).
@@ -451,15 +477,8 @@ class FloorEditor extends Editor {
     if (overlayBtn) extra.push(overlayBtn);
     return extra;
   }
-  // View-mode tools: highlight select, the data-overlay toggle (when present), and Export.
+  // View-mode tools: the View category filter, the data-overlay toggle (when present), and Export.
   _viewButtons() {
-    const hlSel = Dom.el('select', { title: 'Highlight in view mode' });
-    [['Highlight: all rooms', 'all'], ['Highlight: rooms with devices', 'placements'], ['Highlight: none', 'none']].forEach(([l, v]) => {
-      const o = Dom.el('option', { value: v }, l);
-      if (v === this.app.highlight) o.selected = true;
-      hlSel.append(o);
-    });
-    hlSel.onchange = () => { this.app.highlight = hlSel.value; this.render(); };
     // Copy-link sub-tool: an in-place toggle (mirrors Place-racks) that turns the cursor into a copy
     // tool — clicking a room/rack/device copies its shareable deep-link instead of opening NetBox.
     const copyBtn = Dom.el('button', { class: 'icononly' + (this.copyingLink ? ' active' : ''),
@@ -467,7 +486,7 @@ class FloorEditor extends Editor {
     copyBtn.onclick = () => this._toggleCopyLink();
     const exportBtn = Dom.el('button', { class: 'tb-labeled', title: 'Download or print this floor',
       onclick: () => this.openExportPanel(), html: Icons.download + '<span>Export</span>' });
-    const view = [hlSel, copyBtn];
+    const view = [this.viewFilter.button(), copyBtn];
     const overlayBtn = this._overlayButton();
     if (overlayBtn) view.push(overlayBtn);
     view.push(exportBtn);
@@ -614,10 +633,14 @@ class FloorEditor extends Editor {
     if (arranging) { this.arrange.draw(s, W, H); return; }
     this.arrange.drawCaptions(s, W, H);
 
-    // Rooms holding rack/device markers (a placement needs a bound Location to draw),
-    // used to highlight them in view mode.
-    const placedRooms = new Set(
-      this.store.placementData(this.building.dir, this.floor.id).placements.map(p => p.room));
+    // Rooms holding rack/device markers (a placement needs a bound Location to draw), used to
+    // highlight them in view mode. In view the set is narrowed to rooms holding a marker the View
+    // filter actually *draws* (VIEW-2), so a room highlights exactly when something inside it is
+    // visible — the same predicate FloorPlacements gates each marker on. Edit and the racks
+    // sub-mode ignore the filter (every marker is shown there, so every placed room counts).
+    const placedRooms = editing
+      ? new Set(this.store.placementData(this.building.dir, this.floor.id).placements.map(p => p.room))
+      : this.viewFilter.visibleRoomIds();
     // View-mode room outlines are collected into one reduced-opacity group so a shared wall
     // draws a single uniform-weight line instead of two translucent strokes compounding
     // darker (VIEW-1). Only view mode adds the `.view` outline, so the group is view-only.
@@ -627,7 +650,23 @@ class FloorEditor extends Editor {
     // render-time containment subtraction the NetBox embeds use (ROOM-1/ROOM-2). Computed once per
     // full render over the whole floor (O(n²)); both draw layers read it, and per-frame drags reuse
     // the last value (renderActive doesn't recompute — a drop fires a full render to correct it).
-    this._containedRings = Geom.containedMap(this.data().rooms);
+    // The rooms array is in stacking order (below), which `containedMap` reads: only a contained
+    // room drawn ABOVE its container is punched out of it, so "send to back" actually wins (ROOM-4).
+    //
+    // It reads only the rooms that actually PAINT: in view mode the filter drops an unmatched room
+    // to an invisible `.clickzone`, and punching one out of a container that *is* shown would leave
+    // a room-shaped blank gap in the highlight — the geometry of a room the user asked not to see.
+    // Filtering the input rather than the result keeps `containedMap` untouched (it stays the
+    // parity pair of `previews.contained_map`, whose embed has no filter to honour) and keeps the
+    // direct-children pruning honest: with a middle room hidden, its child IS drawn directly inside
+    // the container and belongs punched out at that level. Edit and racks draw every room, so the
+    // list is the whole array there and the map is unchanged. Hit-testing is untouched either way —
+    // a hidden child is still a `clickzone` drawn ABOVE its container, so it still takes the click.
+    this._containedRings = Geom.containedMap(this.data().rooms.filter(
+      room => this._showsShape(room, placedRooms, editing, racks)));
+    // Array order IS the z-order (ROOM-4, index 0 = bottom): appending each room in turn makes the
+    // later ones paint over the earlier ones, and SVG painting order is hit order too — so this one
+    // loop settles both what the user sees on top and what a click at that point reaches.
     for (const room of this.data().rooms) {
       // In plain edit the selected room is promoted to the active layer (its editable
       // vertices must never be occluded). While placing racks the room has no vertices,
@@ -776,6 +815,19 @@ class FloorEditor extends Editor {
     return defs;
   }
 
+  /** Whether `room` draws as a visible shape rather than view mode's invisible `.clickzone` — this
+   *  editor's live half of `FloorViewFilter.showsRoom` (VIEW-2), which owns the decision itself.
+   *  Asked twice per render and the two answers must agree: `_drawRoom` picks the room's class from
+   *  it, and `_renderStatic` picks which rooms may punch a hole in a container's fill (ROOM-2). */
+  _showsShape(room, placedRooms, editing, racks) {
+    return FloorViewFilter.showsRoom(this.app.viewCategories, {
+      editing,
+      racks,
+      focused: room.id === this._focusRoomId,
+      placed: placedRooms.has(room.id) && !!room.location,
+    });
+  }
+
   /** Draw one room polygon into `s`, styled per mode (invisible click-zone in view
    *  unless highlighted; room/selected/placed/unbound in edit/racks). Shared by the
    *  static loop and the active-layer draw of the selected room — the `.selected` class
@@ -790,12 +842,12 @@ class FloorEditor extends Editor {
     // the per-contour view outline (the doubled slit seam vanishes) below.
     const contours = Geom.splitBridges(room.polygon);
     const holed = contours.length > 1;
-    // Racks mode draws every room as a clickable target. View mode keeps rooms as
-    // invisible click-zones, except those highlighted: 'all' draws every room,
-    // 'placements' draws only rooms holding markers. A focus target is always
-    // drawn (and pulsed) so the jump lands on a visible room in any highlight mode.
-    const showShape = editing || racks || focused || this.app.highlight === 'all'
-      || (placed && this.app.highlight === 'placements');
+    // Racks mode draws every room as a clickable target. View mode keeps rooms as invisible
+    // click-zones, except those the View filter highlights: with `all` checked every room draws,
+    // otherwise only rooms holding a marker the filter still draws (`placedRooms` is already the
+    // filtered set here), and with nothing checked none do. A focus target is always drawn (and
+    // pulsed) so the jump lands on a visible room whatever is filtered out (VIEW-2).
+    const showShape = this._showsShape(room, placedRooms, editing, racks);
     let cls;
     let viewOutline = false;
     if (!showShape) cls = 'clickzone';
@@ -866,57 +918,28 @@ class FloorEditor extends Editor {
   }
 
 
-  /** Whole-room translate (CAD-style): press inside the selected room and drag to move
-   *  every vertex by the same delta; drop commits. Rides the shared `Editor.dragItem`
-   *  channel (like the label/rack-marker whole-shape drags) rather than a bespoke slot, so
-   *  it inherits the 4px drag threshold (a plain select-click moves nothing and stays
-   *  clean), the pre-drag undo snapshot pushed on `pointerup` only when it moved, and
-   *  `_suppressClick` on drop — none of which needs a change to the base pointer cascade.
-   *  The translation *delta* is snapped to a grid multiple (offset 0 — quantizing a
-   *  displacement, not a position), so an on-grid room stays on-grid: every vertex shifts
-   *  by the same whole-cell offset and the shape moves without distortion (each vertex is
-   *  not snapped independently);
-   *  Alt frees the drag, and it is a no-op when the grid toggle is off. The delta is then
-   *  clamped so the polygon's bounding box stays within [0,1] — clamping each vertex
-   *  independently would distort the shape once one vertex hit an edge. `base` holds the
-   *  pre-drag vertices so every frame translates from the original press, never drifts. */
+  /** Whole-room translate: the base `Editor._startShapeDrag` engine (shared drag threshold,
+   *  grid-multiple delta snap, [0,1] bbox clamp, undo-on-pointerup), plus the one floor-specific
+   *  concern — rack/device markers live in the same normalized space but are stored independently
+   *  of the room polygon, so they don't follow it on their own. Translate them by the same clamped
+   *  delta via `onDelta`, each from a clone of its pre-drag centre so every frame shifts from the
+   *  original press (no per-frame rounding drift), mirroring the polygon's own rule. The delta is
+   *  already clamped to keep the room inside [0,1] and the markers are clamped inside the room, so
+   *  the shared delta keeps them in-bounds too. */
   _startRoomDrag(e, room) {
     if (e.button !== 0 || this.draft) return;
-    e.stopPropagation();
-    const [gx, gy] = this.evtNorm(e);
-    const base = room.polygon.map(p => [p[0], p[1]]);
-    const b = Geom.bounds(base);
-    // Rack/device markers live in the same normalized space but are stored independently of
-    // the room polygon, so they don't follow it on their own — translate them by the same
-    // delta. Clone each pre-drag centre so every frame shifts from the original press (no
-    // per-frame rounding drift), mirroring the polygon's own "translate from a clone" rule.
-    // The delta is already clamped to keep the room inside [0,1] and the markers are clamped
-    // inside the room, so the shared delta keeps them in-bounds too.
     const placements = this.store.placementData(this.building.dir, this.floor.id).placements
       .filter(p => p.room === room.id);
     const pbase = placements.map(p => [p.x, p.y]);
-    this.dragItem = { move: (nx, ny, ev) => {
-      let dx = nx - gx, dy = ny - gy;   // raw displacement from the press point
-      if (this.grid.on && !(ev && ev.altKey)) {
-        // Quantize the *delta* to a grid multiple (offset 0 — this snaps a
-        // displacement, not a position), so an on-grid room stays on-grid: the
-        // whole shape shifts by a whole number of cells.
-        const [iw, ih] = this.dims;
-        dx = this.grid.snap(dx * iw, 0) / iw;
-        dy = this.grid.snap(dy * ih, 0) / ih;
-      }
-      dx = Math.max(-b.minX, Math.min(1 - b.maxX, dx));   // clamp after snap (safety net at a [0,1] edge)
-      dy = Math.max(-b.minY, Math.min(1 - b.maxY, dy));
-      room.polygon = base.map(([x, y]) => [+(x + dx).toFixed(5), +(y + dy).toFixed(5)]);
+    this._startShapeDrag(e, room.polygon, () => {
+      this.markDirty();
+      if (placements.length) this.markPlacementsDirty();
+    }, (dx, dy) => {
       placements.forEach((p, i) => {
         p.x = +(pbase[i][0] + dx).toFixed(5);
         p.y = +(pbase[i][1] + dy).toFixed(5);
       });
-      this.markDirty();
-      if (placements.length) this.markPlacementsDirty();
-      this.renderActive();
-    } };
-    this.svg.setPointerCapture(e.pointerId);
+    });
   }
 
   /** A press on the selected room's body (not on a node — the vertex/midpoint circles
@@ -927,48 +950,10 @@ class FloorEditor extends Editor {
   _onRoomBodyPress(e, room) {
     if (e.button !== 0 || this.draft) return;
     const i = this.pointer.edgeHit(e, room.polygon);
-    if (i >= 0) this._startEdgeDrag(e, room, i);
+    if (i >= 0) this._startEdgeDrag(e, room.polygon, i, () => this.markDirty());
     else this._startRoomDrag(e, room);
   }
 
-  /** Edge drag (CAD-style "move a wall"): grab a polygon side and drag to translate BOTH its
-   *  endpoints by one delta, resizing the room while the adjacent edges follow. Rides the
-   *  shared `Editor.dragEdge` channel (parallel to dragVertex/dragItem) so it inherits the 4px
-   *  drag threshold (a plain select-click moves nothing and stays clean), the pre-drag undo
-   *  snapshot pushed on `pointerup` only when it moved, and `_suppressClick` on drop — none of
-   *  which needs a change to the base pointer cascade. Like `_startRoomDrag` the *delta* is
-   *  snapped to a grid multiple (offset 0 — a displacement, not a position) and applied to
-   *  both endpoints (each vertex is NOT snapped independently, which would distort the edge),
-   *  so a near-axis drag rounds the perpendicular delta to 0 and the edge stays grid-aligned;
-   *  the delta is clamped so both moved endpoints stay within [0,1]. Alt frees the
-   *  grid snap, and it is a no-op when the grid toggle is off. `a0`/`b0` hold the pre-drag
-   *  endpoints so every frame translates from the original press and never drifts. */
-  _startEdgeDrag(e, room, i) {
-    if (e.button !== 0 || this.draft) return;
-    e.stopPropagation();
-    const n = room.polygon.length, j = (i + 1) % n;
-    const [gx, gy] = this.evtNorm(e);
-    const a0 = room.polygon[i].slice(), b0 = room.polygon[j].slice();
-    const minX = Math.min(a0[0], b0[0]), maxX = Math.max(a0[0], b0[0]);
-    const minY = Math.min(a0[1], b0[1]), maxY = Math.max(a0[1], b0[1]);
-    this.dragEdge = { move: (nx, ny, ev) => {
-      let dx = nx - gx, dy = ny - gy;   // raw displacement from the press point
-      if (this.grid.on && !(ev && ev.altKey)) {
-        // Quantize the *delta* to a grid multiple (offset 0 — this snaps a
-        // displacement, not a position), so on-grid endpoints stay on-grid and a
-        // near-axis drag rounds the perpendicular delta to 0 (no shear).
-        const [iw, ih] = this.dims;
-        dx = this.grid.snap(dx * iw, 0) / iw;
-        dy = this.grid.snap(dy * ih, 0) / ih;
-      }
-      dx = Math.max(-minX, Math.min(1 - maxX, dx));   // clamp after snap (safety net at a [0,1] edge)
-      dy = Math.max(-minY, Math.min(1 - maxY, dy));
-      room.polygon[i] = [+(a0[0] + dx).toFixed(5), +(a0[1] + dy).toFixed(5)];
-      room.polygon[j] = [+(b0[0] + dx).toFixed(5), +(b0[1] + dy).toFixed(5)];
-      this.markDirty(); this.renderActive();
-    } };
-    this.svg.setPointerCapture(e.pointerId);
-  }
 
 
 
@@ -988,7 +973,7 @@ class FloorEditor extends Editor {
     }
     if (this.draft.kind === 'arrow') return this.annotations.finishArrow();
     if (this.draft.kind === 'note') return this.annotations.finishNote();
-    if (this.draft.kind === 'ap') return this.apTool.finish();
+    if (this.draft.kind === 'device') return this.deviceTool.finish();
     super.finish();
   }
 
@@ -1138,6 +1123,12 @@ class FloorEditor extends Editor {
     ]));
 
     body.append(this.toolbar.duplicateButton(room));
+    // Stacking order (ROOM-4): which room paints — and takes the click — where two overlap. Sits
+    // beside Duplicate because both act on the polygon itself rather than its NetBox binding.
+    // `layerButtons` returns null for an editor that hasn't opted into layering (`_shapeList`), and
+    // `Node.append(null)` would render the string "null" — so guard rather than appending blind.
+    const layers = this.toolbar.layerButtons(room);
+    if (layers) body.append(layers);
 
     // The room's name (DOC-12). Binding prefills this from the Location's name, but it is a plain
     // editable field either way — a **draw-only** room (one this install never modelled as a

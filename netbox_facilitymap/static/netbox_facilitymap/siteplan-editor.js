@@ -28,6 +28,12 @@ class SiteplanEditor extends Editor {
    *  edit never leaves a stray user hotspot behind (or dirties siteplan.json). */
   _onModeSwitch(mode) { this._discardCleanPromotion(); }
   polys() { return this.store.siteHotspots.map(h => ({ id: h.id, polygon: h.poly })); }
+  /** The stored array itself (SITE-1) — unlike `polys()` above, which is the *snapping* accessor
+   *  and deliberately returns a fresh projection. `store.siteHotspots`' order already IS the
+   *  paint order for user hotspots (`effectiveHotspots()` maps it in place, PDF ones always
+   *  painted first/beneath), so no new persisted field is needed — the array itself round-trips
+   *  through the `siteplan` blob. */
+  _shapeList() { return this.store.siteHotspots; }
   markDirty() {
     // The first real edit commits a promoted hotspot, so it is no longer discarded.
     if (this.selected && this.selected === this._promoted) this._promoted = null;
@@ -881,6 +887,12 @@ class SiteplanEditor extends Editor {
     // Build off this area's outline — the duplicate lands unbound, so an adjacent building
     // starts from a matching footprint instead of being retraced.
     body.append(this.toolbar.duplicateButton(hs));
+    // Stacking order (ROOM-4/SITE-1): which building area paints — and takes the click —
+    // where two overlap. `layerButtons` returns null for an editor that hasn't opted into
+    // layering (`_shapeList`), and `Node.append(null)` would render the string "null" — so
+    // guard rather than appending blind, matching FloorEditor.openRoomPanel.
+    const layers = this.toolbar.layerButtons(hs);
+    if (layers) body.append(layers);
     body.append(Dom.el('button', { class: 'danger wide', onclick: () => {
       this.snapshot();
       const i = this.store.siteHotspots.indexOf(hs);

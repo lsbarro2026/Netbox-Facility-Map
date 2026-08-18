@@ -17,6 +17,8 @@ Nothing here queries or writes — pure shaping over an already-fetched row, so 
 in charge of scoping (`.restrict(user, …)`) and prefetching.
 """
 
+from ..previews import role_paint
+
 
 def abs_url(obj, request):
     """The object's NetBox detail page, absolute against the current host.
@@ -133,14 +135,24 @@ def _trim_rack(rack, request):
 def _trim_device(device, request):
     """Shape a Device for the frontend (mirrors `NetBoxProxy._trim_device`). The
     marker glyph is keyed off `role.slug`/`name` (device-name fallback), so keep role
-    populated; a device without a role degrades gracefully to the name heuristic."""
+    populated; a device without a role degrades gracefully to the name heuristic.
+
+    The same role also carries the marker's *paint* (DEV-10): `color` is the NetBox
+    `DeviceRole.color` normalized to a `#`-prefixed hex the browser can drop straight into a CSS
+    custom property, and `ink` the contrast colour its glyph detail flips to over that fill. Both
+    come from `previews.role_paint` and are `None` when the role's colour is unusable — the
+    frontend then leaves the marker on its stylesheet default grey. Resolving `ink` here rather
+    than in the browser is what keeps the live map and the server-rendered embeds (which call the
+    same helper) from drifting apart on the contrast rule."""
     role = device.role
     dtype = device.device_type
+    role_color, role_ink = role_paint(role.color) if role else (None, None)
     return {
         'id': device.pk,
         'name': display_name(device),
         'url': abs_url(device, request),
-        'role': {'slug': role.slug, 'name': role.name} if role else None,
+        'role': ({'slug': role.slug, 'name': role.name, 'color': role_color, 'ink': role_ink}
+                 if role else None),
         'device_type': {'model': dtype.model, 'u_height': dtype.u_height} if dtype else None,
     }
 

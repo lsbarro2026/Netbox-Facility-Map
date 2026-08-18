@@ -13,5 +13,5 @@ already-rendered drawing PNGs for the import wizard's automatic floor assignment
   `[N, T, 6625]` softmax over the CTC label set.
 
 This model handles Latin letters, digits, and punctuation, which is all a floor code needs. It is
-**not** OpenCV-based — `ocr.py` does all image preprocessing with `numpy`/`Pillow`, so the plugin
-has no X11/system-library dependency.
+**not** OpenCV-based: `ocr.py` does all image preprocessing with `numpy`/`Pillow`, so the plugin has
+no X11/system-library dependency.

@@ -19,13 +19,25 @@
    text, the filter — lives on the instance rather than in the DOM it builds, so the state survives
    the map step's frequent full re-renders (every carousel move calls `_stepMap()`), exactly as
    `ImportBulk.all` does for the bulk scope. None of it is persisted: it is a way of looking at the
-   import, not part of it. */
+   import, not part of it.
+
+   **A building the wizard hasn't looked at yet is "not checked yet", never "done" (BUG-3).** The
+   per-building counts this panel reads are only meaningful once `_loadFloors` has normalized that
+   building against its floor Locations — and that is lazy, per building, on the carousel showing
+   it. Before then a building's drawings sit at their blind `Level 1..N` default, which is a real
+   `type`, so every count reads zero and the panel used to call a facility nobody had opened
+   `82 of 82 done`. `ImportFlow._buildingSettled` is the guard: an unsettled building is bucketed
+   apart rather than counted as finished, and it settles by itself as the background floor-code
+   sweep loads and reads each building. Which is also why the panel repaints in place
+   (`refresh()`) — the numbers move while nobody is touching the carousel. */
 
 class ImportOverview {
   /** The filters, `[value, label, predicate]`. Each predicate reads the flow's existing per-building
    *  counts, so the overview can never disagree with the carousel label or the build gate about
    *  what a building still needs — they are the same numbers, asked once per building here instead
-   *  of once for the one on screen. */
+   *  of once for the one on screen. The one thing asked on top of them is
+   *  `_buildingSettled` — whether those numbers mean anything for this building yet (BUG-3), which
+   *  is a question about the *wizard's* knowledge rather than a fourth count. */
   static FILTERS = [
     ['all', 'All buildings', () => true],
     ['attention', 'Anything still to do', (w, b) => w._attentionCount(b) > 0 || w._autoAcceptedCount(b) > 0],
@@ -36,7 +48,11 @@ class ImportOverview {
       const s = w.ocr.coverage(b).state;
       return s === 'pending' || s === 'reading' || s === 'no-region';
     }],
-    ['done', 'Nothing left to do', (w, b) => w._attentionCount(b) === 0 && w._autoAcceptedCount(b) === 0],
+    // Every other state here is actionable by clicking a row, and so is this one: the jump loads
+    // the building's floor Locations, which is exactly what settles it.
+    ['unchecked', 'Not checked yet', (w, b) => !w._buildingSettled(b)],
+    ['done', 'Nothing left to do', (w, b) => w._buildingSettled(b)
+      && w._attentionCount(b) === 0 && w._autoAcceptedCount(b) === 0],
   ];
 
   constructor(wizard) {
@@ -45,6 +61,11 @@ class ImportOverview {
     this.query = '';      // the name search
     this.filter = 'all';
     this._listEl = null;  // the row container, repainted in place so the search keeps focus
+    // The other three parts `refresh()` updates in place. Deliberately not the `<details>` itself
+    // and not the search field: rebuilding either would close the panel or drop the caret.
+    this._summaryEl = null;
+    this._barEl = null;
+    this._undoEl = null;  // the stable slot the facility-wide undo button is painted into
   }
 
   /** The panel, or null when the carousel holds too few buildings for any of it to be worth the
@@ -52,8 +73,9 @@ class ImportOverview {
   section() {
     const buildings = this.w._mappableBuildings();
     if (buildings.length < 4) return null;
+    this._summaryEl = Dom.el('summary', {}, this._summaryText(buildings));
     const details = Dom.el('details', { class: 'imp-overview' }, [
-      Dom.el('summary', {}, this._summaryText(buildings)),
+      this._summaryEl,
       this._progressBar(buildings),
       this._tools(buildings),
       this._list(buildings),
@@ -65,12 +87,31 @@ class ImportOverview {
     return details;
   }
 
+  /** Split the facility three ways — `{done, unchecked, total}` — the one count the summary line and
+   *  the bar are both drawn from (BUG-3).
+   *
+   *  A building only counts as **done** when it needs nothing *and* the wizard is in a position to
+   *  know that (`_buildingSettled`). One it hasn't looked at is neither done nor outstanding, and
+   *  saying so is the whole fix: its zero counts are an absence of information, not an absence of
+   *  work. A building that already needs something is outstanding either way — it can only be
+   *  confirmed by settling, never cleared. */
+  _tally(buildings) {
+    const w = this.w;
+    let done = 0, unchecked = 0;
+    for (const b of buildings) {
+      if (w._attentionCount(b) > 0) continue;
+      if (w._buildingSettled(b)) done++; else unchecked++;
+    }
+    return { done, unchecked, total: buildings.length };
+  }
+
   /** The one line the collapsed panel shows: enough to answer "how much is left" without opening
    *  anything, which is the question a hundred-and-fifty-building walk asks constantly. */
   _summaryText(buildings) {
     const w = this.w;
-    const done = buildings.filter(b => w._attentionCount(b) === 0).length;
-    const bits = [done + ' of ' + buildings.length + ' done'];
+    const t = this._tally(buildings);
+    const bits = [t.done + ' of ' + t.total + ' done'];
+    if (t.unchecked) bits.push(t.unchecked + ' not checked yet');
     const needFloor = buildings.reduce((n, b) => n + w._unassignedCount(b), 0);
     if (needFloor) bits.push(needFloor + (needFloor === 1 ? ' drawing needs' : ' drawings need')
       + ' a floor');
@@ -78,19 +119,32 @@ class ImportOverview {
     if (low) bits.push(low + ' read with low confidence');
     const auto = buildings.reduce((n, b) => n + w._autoAcceptedCount(b), 0);
     if (auto) bits.push(auto + ' set automatically');
-    return 'All ' + buildings.length + ' buildings — ' + bits.join(' · ');
+    return 'All ' + t.total + ' buildings — ' + bits.join(' · ');
   }
 
-  /** How far through the facility the operator is, as a bar — the same done-count as the summary,
-   *  drawn. A width percentage rather than a `<progress>` so it can be styled with the rest of the
-   *  wizard's chrome in both themes. */
+  /** How far through the facility the operator is, as a bar — the same three-way split as the
+   *  summary, drawn. Width percentages rather than a `<progress>` so it can be styled with the rest
+   *  of the wizard's chrome in both themes, and so the not-checked-yet share can sit between the
+   *  finished part and the outstanding remainder rather than being folded into either. */
   _progressBar(buildings) {
-    const done = buildings.filter(b => this.w._attentionCount(b) === 0).length;
-    const pct = buildings.length ? Math.round(done * 100 / buildings.length) : 0;
+    this._barEl = Dom.el('div', { class: 'imp-overview-bar' });
+    this._paintBar(buildings);
+    return this._barEl;
+  }
+
+  /** Paint the bar from the current tally, in place — shared by the first render and `refresh()`. */
+  _paintBar(buildings) {
+    const t = this._tally(buildings);
+    const pct = (n) => (t.total ? Math.round(n * 100 / t.total) : 0) + '%';
     const fill = Dom.el('span', { class: 'imp-overview-fill' });
-    fill.style.width = pct + '%';
-    return Dom.el('div', { class: 'imp-overview-bar', title: done + ' of ' + buildings.length
-      + ' buildings need nothing further.' }, [fill]);
+    fill.style.width = pct(t.done);
+    const unknown = Dom.el('span', { class: 'imp-overview-fill-unknown' });
+    unknown.style.width = pct(t.unchecked);
+    this._barEl.textContent = '';
+    this._barEl.append(fill, unknown);
+    this._barEl.title = t.done + ' of ' + t.total + ' buildings need nothing further.'
+      + (t.unchecked ? ' ' + t.unchecked + ' have not been checked yet — their floors load as you '
+        + 'open them, and as the floor-code sweep reaches them.' : '');
   }
 
   /** Search + filter + the facility-wide undo, each labelled in words rather than by a placeholder
@@ -108,22 +162,53 @@ class ImportOverview {
     sel.value = this.filter;
     sel.addEventListener('change', () => { this.filter = sel.value; this._repaint(); });
 
+    // An empty slot rather than a conditionally-appended button, so `refresh()` can restate the
+    // count the sweep keeps moving without rebuilding the search field beside it.
+    this._undoEl = Dom.el('span', { class: 'imp-overview-undo' });
+    this._paintUndo();
     const row = [
       Dom.el('label', { class: 'imp-field' },
         [Dom.el('span', {}, 'Find a building by name'), search]),
       Dom.el('label', { class: 'imp-field' }, [Dom.el('span', {}, 'Show'), sel]),
+      this._undoEl,
     ];
-    const auto = this.w._autoAcceptedTotal();
-    if (auto)
-      row.push(Dom.el('button', {
-        title: 'Turn every automatically-set floor back into a suggestion to confirm. The floors '
-          + 'themselves are kept.',
-        onclick: () => this.w._undoAutoAccepted() },
-      'Undo ' + auto + (auto === 1 ? ' automatic floor' : ' automatic floors')));
     return Dom.el('div', { class: 'imp-overview-tools' }, [
       Dom.el('div', { class: 'imp-overview-fields' }, row),
       Dom.el('span', { class: 'hint' }, 'Click any building below to open its drawings.'),
     ]);
+  }
+
+  /** The facility-wide undo, painted into its slot — nothing at all when the sweep has accepted
+   *  nothing. Its count moves as batches land, so it is repainted rather than built once. */
+  _paintUndo() {
+    if (!this._undoEl) return;
+    this._undoEl.textContent = '';
+    const auto = this.w._autoAcceptedTotal();
+    if (!auto) return;
+    this._undoEl.append(Dom.el('button', {
+      title: 'Turn every automatically-set floor back into a suggestion to confirm. The floors '
+        + 'themselves are kept.',
+      onclick: () => this.w._undoAutoAccepted() },
+    'Undo ' + auto + (auto === 1 ? ' automatic floor' : ' automatic floors')));
+  }
+
+  /** Restate the whole panel from the current model, in place (BUG-3). The facility's numbers move
+   *  without anyone touching the carousel — the background floor-code sweep loads a building's
+   *  floors, reads its drawings and lands suggestions — and the panel used to learn about none of
+   *  it until the next full `_stepMap()`, i.e. until the operator happened to click Next. Every
+   *  in-place map-step refresh routes through `ImportFlow._refreshBuildActions`, which calls this.
+   *
+   *  Deliberately cheap and non-disruptive, in the spirit of `ImportOcrSweep._repaint`: the
+   *  `<details>` and the search field are left alone (so the panel neither closes itself nor drops
+   *  the caret mid-word), and only the four things that carry a count are restated. A no-op once
+   *  the panel has left the DOM — a step change while a sweep is still landing results. */
+  refresh() {
+    if (!this._summaryEl || !this._summaryEl.isConnected) return;
+    const buildings = this.w._mappableBuildings();
+    this._summaryEl.textContent = this._summaryText(buildings);
+    this._paintBar(buildings);
+    this._paintUndo();
+    this._repaint();
   }
 
   /** The row list, remembered so a keystroke repaints only it — rebuilding the whole panel would
@@ -178,7 +263,11 @@ class ImportOverview {
 
   /** One building's status, as the short phrase its row shows: what it still wants, then where the
    *  floor-code sweep has got with it. "✓ done" only when there is genuinely nothing left — an
-   *  automatic floor nobody has confirmed is *not* done, even though it passes the build gate. */
+   *  automatic floor nobody has confirmed is *not* done, even though it passes the build gate, and
+   *  neither is a building the wizard hasn't looked at (BUG-3), whose empty counts say only that
+   *  nothing has been loaded or read for it yet. With the sweep running that already reads as
+   *  "floor codes not read yet" via `COVERAGE_TEXT`; the closing branch covers the rest — an
+   *  install that can't read codes, or one with nothing marked to read them through. */
   stateText(b) {
     const w = this.w;
     const bits = [];
@@ -191,7 +280,8 @@ class ImportOverview {
     const cov = w.ocr.coverage(b);
     const codes = ImportOverview.COVERAGE_TEXT[cov.state];
     if (codes) bits.push(codes);
-    return bits.length ? bits.join(' · ') : '✓ done';
+    if (bits.length) return bits.join(' · ');
+    return w._buildingSettled(b) ? '✓ done' : 'not checked yet';
   }
 
   /** What each `ImportOcrSweep.coverage` state says on a row. `off` and `done` say nothing: an

@@ -160,6 +160,42 @@ def test_create_restore_roundtrip(workdir, backupdir):
 
 
 @pytest.mark.django_db
+def test_create_restore_roundtrip_covers_every_blob_kind(workdir, backupdir):
+    """`_dump_db()` dumps `FacilityMapBlob.objects.all()` with no `kind` filter, so every kind
+    should already round-trip; `test_create_restore_roundtrip` above only ever exercised a
+    single `siteplan` blob. This is the regression test that actually proves the rest (BAK-3)."""
+    from netbox_facilitymap.models import FacilityMapBlob
+
+    payloads = {
+        'annotations': {'image': 'floor.png', 'w': 1000, 'h': 800,
+                        'arrows': [{'x1': 0.1, 'y1': 0.2, 'x2': 0.3, 'y2': 0.4, 'color': '#066fd1'}]},
+        'siteplan': {'hotspots': [{'x': 0.5, 'y': 0.5, 'building': 'b1'}]},
+        'placements': {'placements': [{'id': 'p1', 'kind': 'device', 'x': 0.2, 'y': 0.3, 'role': 'ap'}]},
+        'layouts': {'sheets': [{'w': 1000, 'h': 800, 'cols': 2, 'rows': 1}]},
+        'settings': {'device_presets': [{
+            'key': 'access-point', 'label': 'Access point', 'device_role': 5, 'icon': 'ap',
+            'name_template': '{room}-{role_short}-{asset_tag}', 'count_scope': 'floor',
+            'enabled': True, 'fields': ['asset_tag'],
+        }]},
+        'facility_map': {'site-a': 'campus-x', 'site-b': 'campus-y'},
+    }
+    # Keeps this test honest if a kind is ever added to KIND_CHOICES without updating it here.
+    assert set(payloads) == {kind for kind, _ in FacilityMapBlob.KIND_CHOICES}
+
+    for kind, data in payloads.items():
+        FacilityMapBlob.objects.create(kind=kind, data=data)
+
+    path, _ = create_backup(stamp='20200101-000030')
+    FacilityMapBlob.objects.all().delete()
+
+    result = restore_backup(path)
+
+    assert result['blobs'] == len(payloads)
+    for kind, data in payloads.items():
+        assert FacilityMapBlob.objects.get(kind=kind).data == data
+
+
+@pytest.mark.django_db
 def test_restore_swaps_the_working_dir_after_the_transaction(workdir, backupdir, monkeypatch):
     """The swap deletes the previous working dir irreversibly, so it must run **outside**
     `restore_backup`'s transaction (QUAL-5): inside it, a rollback would restore the rows while the

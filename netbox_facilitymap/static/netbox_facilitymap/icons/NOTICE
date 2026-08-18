@@ -58,3 +58,36 @@ marker glyphs; other device types are bespoke schematics, not vendored icons):
   firewall            brick-wall-shield.svg
   storage             hard-drive.svg
   ups                 battery-charging.svg
+
+Keep this map in sync with the device icon library `DEVICE_ICON_LIBRARY` / `_LIBRARY`
+(device-shapes.js + device_shapes.py, DEV-8 — the icons a device-type preset picks
+from; library ids without a row here are bespoke drawings, not vendored icons):
+
+  Library id          Lucide source file
+  -----------------   ------------------
+  ap                  wifi.svg
+  jack                ethernet-port.svg
+  antenna             antenna.svg
+  beacon              bluetooth.svg
+  speaker             volume-2.svg        (PA/paging horn — reads as a horn+waves, not a music speaker)
+  mic                 mic.svg
+  projector           projector.svg
+  display             tv.svg
+  signage             presentation.svg
+  deskphone           phone.svg
+  camera-bullet       cctv.svg
+  door-strike         door-closed.svg
+  motion-sensor       radar.svg
+  smoke-detector      alarm-smoke.svg
+  fire-strobe         siren.svg
+  emergency-phone     phone-call.svg
+  aed                 heart-pulse.svg
+  leak-sensor         droplet.svg
+  clock               clock.svg
+  time-clock          alarm-clock.svg
+  thermostat          thermometer.svg
+  hvac                fan.svg
+  light               lightbulb.svg
+  light-control       sun-dim.svg
+  env-sensor          gauge.svg
+  printer             printer.svg

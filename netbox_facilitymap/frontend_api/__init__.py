@@ -39,8 +39,8 @@ Six families:
     install-wide setting plus the matching `dcim.add_location`/`dcim.add_device` object
     permission, on top of the ordinary login gate the reads use.
   * Settings — `FloorLabelFieldSettingView`, `DefaultFacilitySettingView`,
-    `WriteModeSettingView`, `ApToolSettingView`, `ApDeviceRoleSettingView`,
-    `ApNamingSettingView`, plus `NbFacilitiesView`'s POST half: install-wide
+    `WriteModeSettingView`, `DeviceToolSettingView`, `DevicePresetsSettingView`,
+    plus `NbFacilitiesView`'s POST half: install-wide
     configuration posted from the map's own `#/settings` page, merged into the single
     install-wide `settings` blob. Login-gated, and additionally requires
     `IMPORT_PERM` — admin-tier configuration, stricter than a login-only NetBox read.
@@ -60,7 +60,7 @@ One module per family, so no file holds two unrelated concerns:
   | `facility_admin.py`| facilities, assignments, grouping preview + re-key           |
   | `topology_views.py`| the DCIM topology probe + its object search                  |
   | `settings_views.py`| `_SettingView` + its subclasses + per-facility org mode      |
-  | `devices.py`       | racks/devices/roles/types + the AP tool's write path         |
+  | `devices.py`       | racks/devices/roles/types + the Add-device tool's write path |
   | `inventory.py`     | the finder's facility-wide inventory search                  |
 
 This module is the **facade**: the names below are the package's public surface, so
@@ -86,8 +86,8 @@ from .common import (
 )
 from .devices import (
     NbDeviceCreateView, NbDeviceRolesView, NbDevicesView, NbDeviceSuggestNameView,
-    NbDeviceTypesView, NbPlacementNearbyView, NbRacksView, _ap_count_qs, _ap_write_gate,
-    _role_short,
+    NbDeviceTypesView, NbPlacementNearbyView, NbRacksView, _device_count_qs, _device_write_gate,
+    _resolve_preset, _role_short,
 )
 from .facility_admin import (
     NbFacilitiesView, NbFacilityAssignmentsView, NbFacilityGroupingPreviewView,
@@ -102,7 +102,7 @@ from .serializers import (
     _trim_device, _trim_rack, abs_url, display_name, floor_ref, serialize_user,
 )
 from .settings_views import (
-    ApDeviceRoleSettingView, ApNamingSettingView, ApToolSettingView, DefaultFacilitySettingView,
+    DefaultFacilitySettingView, DevicePresetsSettingView, DeviceToolSettingView,
     FloorLabelFieldSettingView, InlineRoomCreationSettingView, OrgModeSettingView,
     RenderHqSettingView, TodosSettingView, WriteModeSettingView, _SettingView,
 )
@@ -124,7 +124,7 @@ __all__ = [
     'TodosView', 'FacilityTodosView', 'TodoView', 'TodoDeleteView', 'UsersView',
     'FloorLabelFieldSettingView', 'DefaultFacilitySettingView', 'WriteModeSettingView',
     'OrgModeSettingView', 'InlineRoomCreationSettingView', 'RenderHqSettingView',
-    'TodosSettingView', 'ApToolSettingView', 'ApDeviceRoleSettingView', 'ApNamingSettingView',
+    'TodosSettingView', 'DeviceToolSettingView', 'DevicePresetsSettingView',
     # The library surface other backend modules call.
     'VERSION_HEADER', 'merge_settings', 'serialize_user', 'sync_rooms', 'resolve_floor_location',
     'touch_floor_version', 'compose_annotations',

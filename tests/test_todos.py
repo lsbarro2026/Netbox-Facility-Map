@@ -237,7 +237,7 @@ def test_all_scopes_to_rooms_the_user_may_view(client, login_only_user):
     """A to-do is addressable only through a room the requester may view — the rollup must keep
     that scope, not widen it because it queries across floors."""
     from netbox_facilitymap.models import FacilityMapBlob
-    from tests.conftest import grant
+    from conftest import grant
     key, room = _facility_floor('site-a')
     RoomTodo.objects.create(room=room, text='hidden')
     # Map-read access, but an object permission that matches no room.
@@ -277,7 +277,7 @@ def test_all_shows_todos_of_rooms_the_user_may_view(client, viewer_user):
     """The other half of the scope: a viewer whose object permission *does* match the room sees its
     to-dos. Without this, `test_all_scopes_to_rooms_the_user_may_view` would also pass on an
     endpoint that returned nothing to anyone."""
-    from tests.conftest import grant
+    from conftest import grant
     key, room = _facility_floor('site-a')
     RoomTodo.objects.create(room=room, text='visible')
     grant(viewer_user, Room, ['view'])
@@ -554,7 +554,7 @@ def test_endpoints_reachable_again_when_switched_on(client, editor_user):
     assert client.get(reverse(TODOS), {'floor_key': FLOOR}).status_code == 200
 
 
-# ---- ADDON-4: the settings endpoint that flips the switch (admin-tier, like its ap_tool sibling) --
+# ---- ADDON-4: the settings endpoint that flips the switch (admin-tier, like its device_tool sibling) --
 
 def test_todos_setting_persists_to_settings_blob(client, editor_user):
     client.force_login(editor_user)

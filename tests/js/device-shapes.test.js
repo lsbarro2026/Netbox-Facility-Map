@@ -16,7 +16,8 @@ const assert = require('node:assert');
 const { loadClasses, stubWindow } = require('./load.js');
 const cases = require('./fixtures/device-glyph-cases.json');
 
-const { DeviceShapes } = loadClasses(['device-shapes.js'], ['DeviceShapes']);
+const { DeviceShapes, DEVICE_ICON_LIBRARY, BUILTIN_GLYPH_TYPES } = loadClasses(
+  ['device-shapes.js'], ['DeviceShapes', 'DEVICE_ICON_LIBRARY', 'BUILTIN_GLYPH_TYPES']);
 
 // `_customRules` reads `window.MAP.roleGlyphs`. The shared corpus covers the BUILT-IN English
 // rules, so the vocabulary stays empty here — which is also the shipped default.
@@ -28,6 +29,7 @@ stubWindow({ roleGlyphs: [] });
 function argsFor(c) {
   const placement = { kind: c.kind || 'device' };
   if (c.label !== undefined) placement.label = c.label;
+  if (c.icon !== undefined) placement.icon = c.icon;   // the explicit preset icon (DEV-8)
 
   const role = {};
   if (c.role_slug !== undefined) role.slug = c.role_slug;
@@ -134,4 +136,33 @@ test('_matches treats a normalized keyword as a whole word or phrase', () => {
   assert.ok(DeviceShapes._matches('ap 1', 'ap'));
   assert.ok(!DeviceShapes._matches('kneecap', 'ap'));
   assert.ok(!DeviceShapes._matches('punto final', 'punto de acceso'));
+});
+
+// ---- the device icon library (DEV-8) ----
+
+test('every library id is a known glyph type, and rack is known but never pickable', () => {
+  for (const g of DEVICE_ICON_LIBRARY)
+    for (const i of g.icons) assert.ok(DeviceShapes.isType(i.id), i.id);
+  assert.ok(DeviceShapes.isType('rack'));
+  const ids = DEVICE_ICON_LIBRARY.flatMap(g => g.icons.map(i => i.id));
+  assert.ok(!ids.includes('rack'), 'the library must not offer the rack as a device icon');
+  assert.strictEqual(new Set(ids).size, ids.length, 'library ids must be unique');
+});
+
+test('library entries carry paths except the _lucide chip types, which fall back', () => {
+  for (const g of DEVICE_ICON_LIBRARY)
+    for (const i of g.icons) {
+      assert.ok(i.paths || DeviceShapes._lucide(i.id),
+        `${i.id} has neither library paths nor a _lucide entry — the picker would draw nothing`);
+      assert.ok(DeviceShapes.iconSvg(i.id).startsWith('<svg '), i.id);
+    }
+  assert.strictEqual(DeviceShapes.iconSvg('no-such-icon'), '');
+});
+
+test('built-in types never chip-render off their picker paths', () => {
+  // The invariant that keeps every pre-DEV-8 marker byte-identical: `_chipPaths` refuses the
+  // built-in set, so e.g. the ap keeps its bespoke puck even though its entry carries picker paths.
+  for (const t of BUILTIN_GLYPH_TYPES)
+    assert.strictEqual(DeviceShapes._chipPaths(t), undefined, t);
+  assert.ok(DeviceShapes._chipPaths('speaker'), 'a new library type does chip-render');
 });

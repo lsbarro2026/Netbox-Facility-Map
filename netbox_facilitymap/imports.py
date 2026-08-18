@@ -130,6 +130,94 @@ class BuildView(ImportView):
         return RenderRunner(facility).run_locked('build', prepare=write_map)
 
 
+def _read_import_map(facility):
+    """The facility's on-disk `import-map.json` as a dict, or None when it is absent or unreadable.
+
+    Absence is a **normal** state, not a failure: a facility imported before the map started being
+    retained simply has none (`signals.py` treats a missing map as a no-op for the same reason), and
+    a fresh install has none yet. Callers therefore branch on None rather than raising."""
+    try:
+        data = json.loads(
+            (work_dir(facility) / 'import-map.json').read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+class ImportMapView(ImportView):
+    """Return the facility's on-disk `import-map.json` — the map the live facility was built from.
+
+    The read half of the rebuild-in-place pair below. Its one consumer is the Settings page's
+    rebuild offer (IMPORT-74), which needs the live map client-side to prove the rebuild it is about
+    to fire changes no floor id (`ImportDiff.rerenderOnly`) before it fires it.
+
+    A missing/unreadable map answers `{"ok": false}` at **200**, the `LoadDraftView` idiom: an
+    install that imported before the map was retained has none, which is a branch for the caller,
+    not an error to surface."""
+
+    def get(self, request):
+        try:
+            facility = request_facility(request)
+        except ValueError:
+            return HttpResponseBadRequest('invalid facility')
+        data = _read_import_map(facility)
+        if data is None:
+            return JsonResponse({'ok': False})
+        return JsonResponse({'ok': True, 'map': data})
+
+
+class RebuildView(ImportView):
+    """Re-render the facility from the `import-map.json` **already on disk** — a rebuild that posts
+    no map and writes none (IMPORT-74).
+
+    Exists so the Settings page can act on a render-setting change (`render_hq`, READ-1) without
+    walking the operator back through the import editor. It is deliberately *narrower* than
+    `BuildView` in two ways:
+
+      * **Nothing is written.** No `prepare` — the map on disk is rendered verbatim, so this path
+        can never adopt a new mapping. `BuildView` stays the one endpoint that takes a map.
+      * **No `orgMode` re-stamp.** `BuildView` stamps the facility's declared organization mode into
+        the map it persists (MODEL-6), because it is adopting a map the wizard just assembled. Doing
+        that here would let a rebuild fired to sharpen pixels silently adopt an org-mode change the
+        operator never rebuilt for, so the stored map keeps whatever mode its own build declared.
+
+    That is what makes the rebuild safe to offer outside the wizard: re-rendering the live map
+    changes only pixel scale, and coordinates are normalized 0..1 — no floor id moves, so no drawn
+    room is orphaned, reprojected or desynced. The client still proves that before calling
+    (`ImportDiff.rerenderOnly` against the live manifest) and sends the operator to the editor's
+    reviewed Rebuild when it can't.
+
+    The map is validated as non-empty/complete *before* the render so an install with nothing (or
+    nothing usable) to rebuild gets a clear 400 instead of an opaque render failure. Rendering itself
+    is `run_locked('build')` exactly like `BuildView`: same isolated subprocess, same working-dir
+    lock, same 409 when a scan/build/reset/restore is already in flight."""
+
+    def post(self, request):
+        try:
+            facility = request_facility(request)
+        except ValueError:
+            return HttpResponseBadRequest('invalid facility')
+        data = _read_import_map(facility)
+        if data is None:
+            return JsonResponse(
+                {'ok': False, 'reason': 'no-map',
+                 'error': 'this facility has no saved import map to rebuild from'}, status=400)
+        buildings = data.get('buildings')
+        # "Complete" is the weakest thing a build needs to produce a facility: at least one building
+        # that resolves at least one floor. A map that satisfies neither would render an empty
+        # manifest over a working one.
+        if not isinstance(buildings, dict) or not any(
+                isinstance(b, dict) and b.get('floors') for b in buildings.values()):
+            return JsonResponse(
+                {'ok': False, 'reason': 'incomplete',
+                 'error': 'the saved import map assigns no floors'}, status=400)
+        max_pdfs = cfg('max_pdfs')
+        if _count_rendered_drawings(data) > max_pdfs:
+            return JsonResponse(
+                {'ok': False, 'error': 'too many drawings (limit %d)' % max_pdfs}, status=400)
+        return RenderRunner(facility).run_locked('build')
+
+
 class ResetView(ImportView):
     """Clear an import so the user can start over (uploads/images/manifest/map/lock).
 

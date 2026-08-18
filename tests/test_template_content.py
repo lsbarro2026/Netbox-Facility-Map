@@ -121,14 +121,16 @@ import json  # noqa: E402
 import re  # noqa: E402
 
 
-def _write_floor_manifest(workdir, building_dir, floor_id):
+def _write_floor_manifest(workdir, building_dir, floor_id, size=100):
     """A one-floor manifest at `<workdir>/manifest.json` (default facility), keyed by the frozen
-    `<building_dir>/<floor_id>` slugs — mirrors `test_health`/`test_previews`."""
+    `<building_dir>/<floor_id>` slugs — mirrors `test_health`/`test_previews`. `size` is the plan's
+    pixel extent (the canvas normalized coords scale by); the default keeps a 1:1 percent↔pixel
+    mapping, so a test asserting on scaled ring coordinates reads them straight off the ring."""
     (workdir / 'manifest.json').write_text(json.dumps({
         'siteplan': None,
         'buildings': [{'code': 'B', 'dir': building_dir, 'name': 'B', 'siteSlug': building_dir,
                        'floors': [{'id': floor_id, 'label': 'F', 'floorSlug': floor_id,
-                                   'image': 'x.png', 'w': 100, 'h': 100, 'pages': []}]}],
+                                   'image': 'x.png', 'w': size, 'h': size, 'pages': []}]}],
     }))
 
 
@@ -333,10 +335,13 @@ def test_whole_floor_highlight_punches_contained_room(editor_user, workdir):
     _write_floor_manifest(workdir, 'bldg-a', 'floor-1')
     site = Site.objects.create(name='Bldg A', slug='bldg-a')
     floor = Location.objects.create(name='Floor 1', slug='floor-1', site=site)
+    # Explicit stacking (ROOM-4): the small room sits ABOVE the big one, which is what makes the
+    # big one punch it out. Stated rather than left to the `z_order` tiebreak, so the test asserts
+    # the intended arrangement instead of passing on an alphabetical accident.
     Room.objects.create(floor_key='bldg-a/floor-1', room_id='big',
-                        floor_location=floor, polygon=_BIG_RING)
+                        floor_location=floor, polygon=_BIG_RING, z_order=0)
     Room.objects.create(floor_key='bldg-a/floor-1', room_id='small',
-                        floor_location=floor, polygon=_SMALL_RING)
+                        floor_location=floor, polygon=_SMALL_RING, z_order=1)
 
     html = _floor_rooms_html(floor, editor_user)
     paths = re.findall(r'<path d="([^"]+)"\s+fill="#2fa84f22"', html)
@@ -347,6 +352,31 @@ def test_whole_floor_highlight_punches_contained_room(editor_user, workdir):
     assert len(holed) == 1 and len(plain) == 1
     # The inner contour is the small room's scaled ring (manifest is 100×100).
     assert '40.0,40.0' in holed[0]
+
+
+@pytest.mark.django_db
+def test_whole_floor_highlight_respects_stacking_order(editor_user, workdir):
+    # ROOM-4: the embed mirrors the editor's paint order. With the small room sent BEHIND the big
+    # one, the big room no longer punches it out (it paints over it instead), and the rooms are
+    # emitted bottom→top so the browser composites them in the order the user chose.
+    from dcim.models import Location, Site
+    from netbox_facilitymap.models import Room
+
+    _write_floor_manifest(workdir, 'bldg-a', 'floor-1')
+    site = Site.objects.create(name='Bldg A', slug='bldg-a')
+    floor = Location.objects.create(name='Floor 1', slug='floor-1', site=site)
+    Room.objects.create(floor_key='bldg-a/floor-1', room_id='small',
+                        floor_location=floor, polygon=_SMALL_RING, z_order=0)
+    Room.objects.create(floor_key='bldg-a/floor-1', room_id='big',
+                        floor_location=floor, polygon=_BIG_RING, z_order=1)
+
+    html = _floor_rooms_html(floor, editor_user)
+    paths = re.findall(r'<path d="([^"]+)"\s+fill="#2fa84f22"', html)
+    assert len(paths) == 2
+    # No punch-out anywhere: every shape is a single contour.
+    assert all(p.count('M') == 1 for p in paths)
+    # Painted bottom→top — the small room first, the big one over it.
+    assert '40.0,40.0' in paths[0] and '100.0,100.0' in paths[1]
 
 
 @pytest.mark.django_db
@@ -361,9 +391,9 @@ def test_single_room_embed_spotlight_punches_contained_room(editor_user, workdir
     floor = Location.objects.create(name='Floor 1', slug='floor-1', site=site)
     bigloc = Location.objects.create(name='Big', slug='big', site=site, parent=floor)
     Room.objects.create(floor_key='bldg-a/floor-1', room_id='big', floor_location=floor,
-                        location=bigloc, polygon=_BIG_RING)
+                        location=bigloc, polygon=_BIG_RING, z_order=0)
     Room.objects.create(floor_key='bldg-a/floor-1', room_id='small',
-                        floor_location=floor, polygon=_SMALL_RING)
+                        floor_location=floor, polygon=_SMALL_RING, z_order=1)
 
     # Render the big room's own Location page → cropped single-room embed with a spotlight.
     html = _floor_rooms_html(bigloc, editor_user)
@@ -372,6 +402,225 @@ def test_single_room_embed_spotlight_punches_contained_room(editor_user, workdir
     # Two contours: the room outline plus the contained small room punched out of the lit hole.
     assert spot.group(1).count('M') == 2
     assert '40.0,40.0' in spot.group(1)
+
+
+# A corridor slicing the big room in half. Contained only because its ends stop ON the big room's
+# side walls — containment is boundary-inclusive (ROOM-6). `_THROUGH_RING` is the same corridor
+# drawn as one room running past the big room, which is partial overlap and never punched (ROOM-7).
+_SLICE_RING = [[0.0, 0.45], [1.0, 0.45], [1.0, 0.55], [0.0, 0.55]]
+_THROUGH_RING = [[-0.01, 0.45], [1.01, 0.45], [1.01, 0.55], [-0.01, 0.55]]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('hall_ring, contours', [(_SLICE_RING, 2), (_THROUGH_RING, 1)])
+def test_whole_floor_highlight_punches_a_hallway_only_when_it_stops_at_the_walls(
+        editor_user, workdir, hall_ring, contours):
+    # ROOM-7, end to end through the embed: a hallway cutting an open-plan room in half punches out
+    # of it when its ends are flush with that room's walls, and does NOT when the hallway is drawn
+    # running past them. The second is partial overlap — deliberately composited rather than clipped
+    # (§10 *Partial overlap composites; it is not clipped*) — and is the shape a real floor plan
+    # produces when one corridor room spans the whole building.
+    from dcim.models import Location, Site
+    from netbox_facilitymap.models import Room
+
+    _write_floor_manifest(workdir, 'bldg-a', 'floor-1')
+    site = Site.objects.create(name='Bldg A', slug='bldg-a')
+    floor = Location.objects.create(name='Floor 1', slug='floor-1', site=site)
+    Room.objects.create(floor_key='bldg-a/floor-1', room_id='big',
+                        floor_location=floor, polygon=_BIG_RING, z_order=0)
+    Room.objects.create(floor_key='bldg-a/floor-1', room_id='hall',
+                        floor_location=floor, polygon=hall_ring, z_order=1)
+
+    html = _floor_rooms_html(floor, editor_user)
+    paths = re.findall(r'<path d="([^"]+)"\s+fill="#2fa84f22"', html)
+    assert len(paths) == 2
+    big = next(p for p in paths if '100.0,0.0' in p)
+    assert big.count('M') == contours
+
+
+# --- A Location modelled as SEVERAL rooms (ROOM-9). One physical room traced as two polygons, both
+# bound to the same `dcim.Location`, is a supported state — and binding copies the Location name into
+# every row's label, so `Room.Meta.ordering` can't even tell the rows apart. The embed must therefore
+# render them ALL: every polygon highlighted, the crop over their union, the spotlight over all of
+# them, and the markers/arrows of every `room_id`.
+
+_LEFT_RING = [[0.1, 0.1], [0.3, 0.1], [0.3, 0.3], [0.1, 0.3]]
+_RIGHT_RING = [[0.7, 0.7], [0.9, 0.7], [0.9, 0.9], [0.7, 0.9]]
+
+
+def _bind_room(floor, room_loc, room_id, ring):
+    from netbox_facilitymap.models import Room
+    return Room.objects.create(floor_key='bldg-a/floor-1', room_id=room_id, floor_location=floor,
+                               location=room_loc, label='Hall', polygon=ring)
+
+
+def _two_polygon_location(workdir, size=100):
+    """A floor whose 'Hall' Location is bound to TWO rooms — the left and right polygons — as the
+    two halves of one physical room. Returns `(site, floor, room_loc)`."""
+    from dcim.models import Location, Site
+
+    _write_floor_manifest(workdir, 'bldg-a', 'floor-1', size=size)
+    site = Site.objects.create(name='Bldg A', slug='bldg-a')
+    floor = Location.objects.create(name='Floor 1', slug='floor-1', site=site)
+    room_loc = Location.objects.create(name='Hall', slug='hall', site=site, parent=floor)
+    _bind_room(floor, room_loc, 'left', _LEFT_RING)
+    _bind_room(floor, room_loc, 'right', _RIGHT_RING)
+    return site, floor, room_loc
+
+
+def _highlights(html):
+    return re.findall(r'<path d="([^"]+)"\s+fill="#2fa84f22"', html)
+
+
+def _spotlight_holes(html):
+    return re.findall(r'<path d="([^"]+)" fill="#000" fill-rule="evenodd"/>', html)
+
+
+def _viewbox(html):
+    return [float(v) for v in re.search(r'<svg viewBox="([^"]+)"', html).group(1).split()]
+
+
+@pytest.mark.django_db
+def test_room_embed_draws_every_room_bound_to_the_location(editor_user, workdir):
+    # Both halves are highlighted — before ROOM-9 only one arbitrary row was resolved and drawn.
+    _, _, room_loc = _two_polygon_location(workdir)
+
+    paths = _highlights(_floor_rooms_html(room_loc, editor_user))
+    assert len(paths) == 2
+    # The manifest floor is 100×100, so the rings scale straight to their percentages.
+    assert any('10.0,10.0' in p for p in paths) and any('70.0,70.0' in p for p in paths)
+
+
+@pytest.mark.django_db
+def test_room_embed_spotlight_lights_every_bound_room(editor_user, workdir):
+    # One lit hole per bound room (the mask unions them), not one arbitrary half lit and the rest
+    # of the room dimmed as if it were somebody else's floor.
+    _, _, room_loc = _two_polygon_location(workdir)
+
+    holes = _spotlight_holes(_floor_rooms_html(room_loc, editor_user))
+    assert len(holes) == 2
+    assert any('10.0,10.0' in d for d in holes) and any('70.0,70.0' in d for d in holes)
+
+
+@pytest.mark.django_db
+def test_room_embed_crop_frames_the_union_of_its_rooms(editor_user, workdir):
+    # The crop has to reach both halves. Compared against the same floor with only the left half
+    # bound, whose crop stops well short of the right one. On a plan big enough that the zoomed
+    # crop isn't simply clamped to the whole page — which is what a 100px plan would give either
+    # way, hiding the difference this pins.
+    from netbox_facilitymap.models import Room
+
+    _, _, room_loc = _two_polygon_location(workdir, size=1000)
+    _, union_y, _, union_h = _viewbox(_floor_rooms_html(room_loc, editor_user))
+    assert union_y + union_h >= 900                    # reaches the right half (rings end at 900)
+
+    Room.objects.filter(room_id='right').delete()
+    _, left_y, _, left_h = _viewbox(_floor_rooms_html(room_loc, editor_user))
+    assert left_y + left_h < 900                       # the left half alone stops short of it
+
+
+@pytest.mark.django_db
+def test_room_embed_draws_markers_and_arrows_for_every_bound_room(editor_user, workdir):
+    # Markers and wayfinding arrows are selected by `room_id`, so both halves' must appear — a
+    # rack in the far half is exactly what someone opens this panel to find.
+    from dcim.models import Manufacturer, Rack, RackType
+    from netbox_facilitymap.models import FacilityMapBlob
+
+    site, _, room_loc = _two_polygon_location(workdir)
+    mfr = Manufacturer.objects.create(name='M', slug='m')
+    rtype = RackType.objects.create(manufacturer=mfr, model='RT', slug='rt')
+    racks = [Rack.objects.create(name=f'R{i}', site=site, rack_type=rtype) for i in (1, 2)]
+    FacilityMapBlob.objects.create(kind='placements', facility='', key='bldg-a/floor-1', data={
+        'placements': [
+            {'id': racks[0].pk, 'kind': 'rack', 'room': 'left', 'label': 'RACK-L',
+             'x': 0.2, 'y': 0.2},
+            {'id': racks[1].pk, 'kind': 'rack', 'room': 'right', 'label': 'RACK-R',
+             'x': 0.8, 'y': 0.8},
+        ],
+    })
+    FacilityMapBlob.objects.create(kind='annotations', facility='', key='bldg-a/floor-1', data={
+        'arrows': [{'points': [[0.5, 0.0], [0.2, 0.2]], 'room': 'left', 'color': '#ff0000'},
+                   {'points': [[0.5, 1.0], [0.8, 0.8]], 'room': 'right', 'color': '#00ff00'}],
+    })
+
+    html = _floor_rooms_html(room_loc, editor_user)
+    assert 'RACK-L' in html and 'RACK-R' in html
+    assert html.count('<polyline points=') == 2
+
+
+@pytest.mark.django_db
+def test_room_embed_stays_on_the_primary_floor(editor_user, workdir):
+    # A Location bound to rooms on two different floors can't render both in one panel (one panel
+    # draws one plan), so it keeps the primary floor — the same one the pre-ROOM-9 `.first()` chose.
+    from dcim.models import Location, Site
+    from netbox_facilitymap.models import Room
+
+    (workdir / 'manifest.json').write_text(json.dumps({
+        'siteplan': None,
+        'buildings': [{'code': 'B', 'dir': 'bldg-a', 'name': 'B', 'siteSlug': 'bldg-a', 'floors': [
+            {'id': 'floor-1', 'label': 'F1', 'floorSlug': 'floor-1',
+             'image': 'one.png', 'w': 100, 'h': 100, 'pages': []},
+            {'id': 'floor-2', 'label': 'F2', 'floorSlug': 'floor-2',
+             'image': 'two.png', 'w': 100, 'h': 100, 'pages': []},
+        ]}],
+    }))
+    site = Site.objects.create(name='Bldg A', slug='bldg-a')
+    floor1 = Location.objects.create(name='Floor 1', slug='floor-1', site=site)
+    floor2 = Location.objects.create(name='Floor 2', slug='floor-2', site=site)
+    room_loc = Location.objects.create(name='Hall', slug='hall', site=site, parent=floor1)
+    _bind_room(floor1, room_loc, 'left', _LEFT_RING)
+    Room.objects.create(floor_key='bldg-a/floor-2', room_id='upstairs', floor_location=floor2,
+                        location=room_loc, label='Hall', polygon=_RIGHT_RING)
+
+    html = _floor_rooms_html(room_loc, editor_user)
+    assert 'one.png' in html and 'two.png' not in html
+    assert len(_highlights(html)) == 1
+
+
+@pytest.mark.django_db
+def test_single_room_embed_is_unchanged_by_the_plural_path(editor_user, workdir):
+    # The one-room case must render exactly as before: one highlight, one spotlight hole whose `d`
+    # is the room's own scaled ring, and the crop of that ring alone.
+    from dcim.models import Location, Site
+
+    _write_floor_manifest(workdir, 'bldg-a', 'floor-1')
+    site = Site.objects.create(name='Bldg A', slug='bldg-a')
+    floor = Location.objects.create(name='Floor 1', slug='floor-1', site=site)
+    room_loc = Location.objects.create(name='Hall', slug='hall', site=site, parent=floor)
+    _bind_room(floor, room_loc, 'left', _LEFT_RING)
+
+    html = _floor_rooms_html(room_loc, editor_user)
+    assert len(_highlights(html)) == 1
+    assert _spotlight_holes(html) == ['M10.0,10.0 L30.0,10.0 30.0,30.0 10.0,30.0 Z']
+
+
+@pytest.mark.django_db
+def test_object_placement_embed_frames_only_the_polygon_holding_the_object(editor_user, workdir):
+    # The device/rack embed must NOT widen to the Location's other polygons: it frames the object,
+    # so it stays on the half the object actually sits in (SHOW-3), cropped tight around it.
+    from dcim.models import Device, DeviceRole, DeviceType, Manufacturer
+    from netbox_facilitymap.models import FacilityMapBlob
+    from netbox_facilitymap.template_content import ObjectPlacement
+
+    site, _, _ = _two_polygon_location(workdir)
+    mfr = Manufacturer.objects.create(name='M', slug='m')
+    dtype = DeviceType.objects.create(manufacturer=mfr, model='DT', slug='dt')
+    role = DeviceRole.objects.create(name='Role', slug='role', color='f44336')
+    device = Device.objects.create(name='D1', device_type=dtype, role=role, site=site,
+                                   status='active')
+    FacilityMapBlob.objects.create(kind='placements', facility='', key='bldg-a/floor-1', data={
+        'placements': [{'id': device.pk, 'kind': 'device', 'room': 'right', 'label': 'D1',
+                        'x': 0.8, 'y': 0.8}],
+    })
+
+    from django.test import RequestFactory
+    request = RequestFactory().get('/')
+    request.user = editor_user
+    html = ObjectPlacement(context={'object': device, 'request': request}).right_page()
+
+    assert len(_highlights(html)) == 1                 # only the polygon holding the device
+    bx, by, _, _ = _viewbox(html)
+    assert bx > 30 and by > 30                         # never frames across into the left half
 
 
 # --- BuildingFloors: the Location-anchored floor picker (MODEL-5). Under Site = campus the building

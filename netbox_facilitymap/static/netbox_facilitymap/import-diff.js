@@ -14,11 +14,16 @@
 
    Every read here is a *comparison of the map the build will produce against the live manifest*,
    so the floor-key construction (`<dir>/(abbr+token)`, `dir` per `dirOf`) mirrors
-   `preprocess.build` and must stay in step with it. The three read methods are async only to
+   `preprocess.build` and must stay in step with it. That expansion lives once, in the
+   `floorEntries`/`floorKeys` statics the three reads share. The three read methods are async only to
    fetch fresh room counts (never a stale cache) and to measure the new siteplan's aspect.
 
-   Holds a wizard back-ref (`this.w`), the ImportUploader shape — it reads the flow's building
-   model, its replaced-drawing tracker, and the app store. */
+   The three *reads* hold a wizard back-ref (`this.w`), the ImportUploader shape — they read the
+   flow's building model, its replaced-drawing tracker, and the app store. The *statics* deliberately
+   do not, because they have a second caller outside the wizard: `SettingsPage`'s rebuild offer
+   (IMPORT-74) drives `rerenderOnly` over the on-disk import map, with no flow to hold. Keeping the
+   key convention here rather than copying it there is the whole point — one mirror of
+   `preprocess.build`, not two. */
 
 class ImportDiff {
   constructor(wizard) {
@@ -33,6 +38,94 @@ class ImportDiff {
    *  Location-anchored floor matches its manifest entry instead of being falsely orphaned. */
   static dirOf(mb) {
     return mb.buildingSlug ? mb.slug + '/' + mb.buildingSlug : mb.slug;
+  }
+
+  /** Every floor a build map yields, as `{key, folder, stem, angle}` — the one expansion of the
+   *  polymorphic floor-table value the reads below share. A scalar token is one whole-page floor; a
+   *  region-split value (FLOOR-4) is a `[{token, region}]` list, each entry its own floor, and each
+   *  taking the page's single straightening angle (a page is rotated once, then cropped). `key` is
+   *  the manifest floor key `<dir>/(abbr+token)` (`dir` per `dirOf`), mirroring `preprocess.build`;
+   *  `folder`/`stem` identify the drawing it came from, which is what lets a caller ask the flow's
+   *  replaced-drawing tracker about it. */
+  static floorEntries(map) {
+    const out = [];
+    for (const folder in (map.buildings || {})) {
+      const mb = map.buildings[folder];
+      const dir = ImportDiff.dirOf(mb);
+      const am = mb.angles || {};
+      for (const stem in (mb.floors || {})) {
+        const v = mb.floors[stem];
+        // A falsy token is an *unmapped* drawing (the stub map seeds every stem with ''), which
+        // `preprocess._page_entries` skips — so it yields no floor here either.
+        const toks = (Array.isArray(v) ? v.map(e => e.token) : [v]).filter(Boolean);
+        for (const t of toks)
+          out.push({ key: dir + '/' + (mb.abbr + t), folder, stem, angle: am[stem] || 0 });
+      }
+    }
+    return out;
+  }
+
+  /** The set of manifest floor keys a build map will produce. */
+  static floorKeys(map) {
+    return new Set(ImportDiff.floorEntries(map).map(e => e.key));
+  }
+
+  /** key → its sorted sheet-angle signature, for one side of a comparison. Sorted so a multi-sheet
+   *  floor matches order-independently and a single-sheet floor matches exactly — the same signature
+   *  `desyncedFloors` compares. */
+  static _angleSig(pairs) {
+    const sig = new Map();
+    for (const [key, angle] of pairs) {
+      if (!sig.has(key)) sig.set(key, []);
+      sig.get(key).push(angle);
+    }
+    for (const [key, arr] of sig) sig.set(key, JSON.stringify(arr.sort((x, y) => x - y)));
+    return sig;
+  }
+
+  /** Whether building `map` would **re-render the live manifest and change nothing else** — same
+   *  floors, same orientations, same site plan. The gate for a rebuild fired from outside the wizard
+   *  (`SettingsPage`, IMPORT-74), where there is no review dialog and no `_afterBuild` to reconcile
+   *  rooms with: if this is true the rebuild cannot orphan a room (no id moves), cannot need a
+   *  region reprojection (no split appears) and cannot desync one (no rotation, no site-plan swap),
+   *  so the only thing that changes is the rendered pixel scale — and geometry is normalized 0..1.
+   *
+   *  Stricter than the three reads below by design. They answer "what would this rebuild cost you?"
+   *  so the user can consent; this answers "is there anything to consent to at all?", and a caller
+   *  with no way to apply the consequences must refuse rather than ask. Every finding that costs a
+   *  **room** trips it.
+   *
+   *  Purely structural, and one hotspot-only case is out of its reach because of that: the manifest
+   *  records no site-plan *source*, so swapping the site drawing for a different one at the same
+   *  angle and slug is invisible here, where `desyncedFloors` would still catch a shape change by
+   *  measuring a preview render. It needs a *previously failed* build to arise at all (only a build
+   *  writes the map, and a successful one also writes the manifest), and it is the mildest finding
+   *  class — hotspots are kept, just worth re-checking — so this stays synchronous rather than
+   *  putting a full-scale render in front of every rebuild offer. */
+  static rerenderOnly(map, manifest) {
+    if (!map || !manifest) return false;
+    const next = ImportDiff._angleSig(ImportDiff.floorEntries(map).map(e => [e.key, e.angle]));
+    // The manifest's own side of the same signature: one entry per rendered sheet. A floor always
+    // renders at least one page (`preprocess` drops a pageless floor), so a missing/empty `pages`
+    // reads as the single unrotated sheet a scalar map value would produce.
+    const livePairs = [];
+    for (const b of (manifest.buildings || [])) {
+      for (const f of (b.floors || [])) {
+        const angles = (f.pages || []).map(pg => pg.angle || 0);
+        for (const a of (angles.length ? angles : [0])) livePairs.push([b.dir + '/' + f.id, a]);
+      }
+    }
+    const live = ImportDiff._angleSig(livePairs);
+    if (next.size !== live.size) return false;
+    for (const [key, s] of next) if (live.get(key) !== s) return false;
+    // The site plan keeps a fixed id, so it never shows up as a floor key — but its hotspots are
+    // drawn against its orientation and shape, so a rebuild that adds, drops or rotates it is not a
+    // re-render either.
+    const sp = manifest.siteplan;
+    if (!sp !== !map.siteplan) return false;
+    if (!sp) return true;
+    return (sp.angle || 0) === (map.siteplan.angle || 0)
+      && sp.siteSlug === (map.siteplan.slug || '00-site');
   }
 
   /** Room geometry as the DB currently holds it, fetched fresh so counts never reflect a stale
@@ -51,21 +144,12 @@ class ImportDiff {
   async orphanedFloors(map) {
     const store = this.w.app.store;
     if (!store || !store.manifest) return [];
-    const newKeys = new Set();
-    for (const folder in map.buildings) {
-      const mb = map.buildings[folder];
-      // A region-split floor value is a `[{token, region}]` list (FLOOR-4), not a scalar token —
-      // expand it so each region floor's real key is compared, not a stringified array (which would
-      // falsely orphan every real floor when rebuilding a region-split facility). A whole→region
-      // split that would strand rooms is caught earlier by `resplitReprojections` (FLOOR-5) and
-      // reprojected, not discarded; `_build` excludes those keys before warning here.
-      const dir = ImportDiff.dirOf(mb);
-      for (const stem in mb.floors) {
-        const v = mb.floors[stem];
-        const toks = Array.isArray(v) ? v.map(e => e.token) : [v];
-        for (const t of toks) newKeys.add(dir + '/' + (mb.abbr + t));
-      }
-    }
+    // A region-split floor value is a `[{token, region}]` list (FLOOR-4), not a scalar token, so
+    // each region floor's real key is compared, not a stringified array (which would falsely orphan
+    // every real floor when rebuilding a region-split facility) — `floorKeys` owns that expansion.
+    // A whole→region split that would strand rooms is caught earlier by `resplitReprojections`
+    // (FLOOR-5) and reprojected, not discarded; `_build` excludes those keys before warning here.
+    const newKeys = ImportDiff.floorKeys(map);
     const anns = await this._freshAnnotations();
     const out = [];
     for (const b of store.manifest.buildings) {
@@ -98,27 +182,16 @@ class ImportDiff {
     // `dirOf`). Compared as
     // a sorted signature so a single-sheet floor matches exactly and a multi-sheet floor matches
     // order-independently. `replacedKeys` collects the surviving keys whose drawing was replaced
-    // this session (REPL-1), an unconditional desync trigger alongside the angle diff.
+    // this session (REPL-1), an unconditional desync trigger alongside the angle diff. `floorEntries`
+    // carries each floor's page angle and originating drawing, so both fall out of one walk — a
+    // page's straightening angle is page-keyed and shared across every region floor split from it
+    // (FLOOR-4), and likewise a replaced page desyncs every region floor split from it.
     const newAngles = new Map();
     const replacedKeys = new Set();
-    for (const folder in map.buildings) {
-      const mb = map.buildings[folder];
-      const am = mb.angles || {};
-      const dir = ImportDiff.dirOf(mb);
-      for (const stem in mb.floors) {
-        const v = mb.floors[stem];
-        const toks = Array.isArray(v) ? v.map(e => e.token) : [v];
-        const wasReplaced = this.w._replaced.has(folder + '/' + stem);
-        // A page's straightening angle is page-keyed and shared across every region floor split
-        // from it (FLOOR-4), so each expanded key takes the same `am[stem]`; likewise a replaced
-        // page desyncs every region floor split from it.
-        for (const t of toks) {
-          const key = dir + '/' + (mb.abbr + t);
-          if (!newAngles.has(key)) newAngles.set(key, []);
-          newAngles.get(key).push(am[stem] || 0);
-          if (wasReplaced) replacedKeys.add(key);
-        }
-      }
+    for (const e of ImportDiff.floorEntries(map)) {
+      if (!newAngles.has(e.key)) newAngles.set(e.key, []);
+      newAngles.get(e.key).push(e.angle);
+      if (this.w._replaced.has(e.folder + '/' + e.stem)) replacedKeys.add(e.key);
     }
     const sig = (arr) => JSON.stringify(arr.slice().sort((x, y) => x - y));
     const anns = await this._freshAnnotations();

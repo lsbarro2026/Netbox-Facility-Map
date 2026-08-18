@@ -352,10 +352,16 @@ class ImportCards {
    *  its floors as an ordered set rather than one by one. Both are sound inferences and both are
    *  the kind an operator should sanity-check before confirming — which is the entire point of
    *  these landing as suggestions. Read only while `suggested` is set, exactly like
-   *  `suggestedFrom`, so it needs no clearing when the operator answers. */
+   *  `suggestedFrom`, so it needs no clearing when the operator answers.
+   *
+   *  "the building's only floor" (IMPORT-72) is the third, and says the least about the drawing:
+   *  this building has one drawing and one floor Location, so they were paired on that alone and
+   *  the floor code itself was not what matched. Worth naming for the same reason as the other two
+   *  — an operator who sees the codes disagree should know the pairing never claimed they didn't. */
   static _matchNote(a) {
     if (a.matchedBy === 'aligned') return ' (matched by floor order)';
     if (a.matchedBy === 'ordinal') return ' (matched by floor level)';
+    if (a.matchedBy === 'sole') return ' (the building’s only floor)';
     return '';
   }
 

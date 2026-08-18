@@ -9,8 +9,8 @@ where that object sits on the plan. All read the same runtime render artifacts a
 panel when absent.
 
 `FloorRooms` and `ObjectPlacement` share the `RoomPanelExtension` base's two renderers —
-`_floor_panel` (the whole-floor overlay) and `_room_panel` (the cropped single-room embed); they
-differ only in how they resolve the `(floor_key, room)` to draw.
+`_floor_panel` (the whole-floor overlay) and `_room_panel` (the cropped room embed); they differ
+only in how they resolve the `(floor_key, rooms)` to draw.
 
 `RoomPanelExtension` / `FloorRooms` — floor plan + room polygons on a NetBox Location page.
 
@@ -28,6 +28,7 @@ any rooms are drawn, and `floor_sheets(...) is None` is the gate for "this Locat
 rendered plan" (so we emit nothing rather than an empty SVG).
 """
 
+from operator import attrgetter
 from urllib.parse import quote
 
 from django.db.models import Count
@@ -41,7 +42,7 @@ from .facilities import facility_for_location, facility_for_site, site_facilitie
 from .models import Room
 from .previews import (
     ORIENTATION_ASPECT, PluginSettings, contained_map, evenodd_path, floor_sheets,
-    placement_for_object, placement_markers, room_arrows, room_viewbox, sheet_bounds_for_room,
+    placement_for_object, placement_markers, room_arrows, room_viewbox, sheet_bounds_for_rooms,
 )
 from .storage import media_url, read_manifest
 
@@ -51,8 +52,8 @@ class RoomPanelExtension(PluginTemplateExtension):
 
     Not registered itself — `models` lives on the concrete subclasses. Holds the two renderers
     they delegate to once they've resolved what to draw: `_floor_panel` (the whole-floor room
-    overlay, from `FloorRooms`' floor branch) and `_room_panel` (the cropped single-room embed,
-    from `FloorRooms`' room branch and `ObjectPlacement`). These are genuinely different
+    overlay, from `FloorRooms`' floor branch) and `_room_panel` (the cropped room embed, from
+    `FloorRooms`' room branch and `ObjectPlacement`). These are genuinely different
     renderings of the same template — markers, spotlight, crop, arrows and image export all belong
     to the embed alone — so each reads end to end rather than branching a mode flag through one
     body. What they *do* share is factored out: `_shared_context` (floor geometry + room shapes)
@@ -63,21 +64,36 @@ class RoomPanelExtension(PluginTemplateExtension):
         `floor_key` has no rendered plan (each renderer turns that into '', so a Location with no
         plan shows nothing).
 
-        `rooms` are the rooms to *draw* — the whole floor, or the single embedded room. `all_rooms`
-        is the candidate pool for the contained-room subtraction below: the floor panel passes the
-        same list, while the single-room embed passes the floor's full set, since it draws only the
-        one room and would not otherwise know about the siblings sitting inside it. `cross_link`
-        links each shape to its own room Location (the floor view); the embed passes False, as a
-        self-link on the room's own page would be noise."""
+        `rooms` are the rooms to *draw* — the whole floor, or the embedded Location's own room(s).
+        `all_rooms` is the candidate pool for the contained-room subtraction below: the floor panel
+        passes the same list, while the room embed passes the floor's full set, since it draws only
+        its own rooms and would not otherwise know about the siblings sitting inside them.
+        `cross_link` links each shape to its own room Location (the floor view); the embed passes
+        False, as a self-link on the room's own page would be noise.
+
+        Both room sequences are (re)sorted into **stacking order** here rather than by each caller's
+        queryset (ROOM-4). The callers arrive ordered by `Room.Meta.ordering` — alphabetical by
+        label — and paint order is a rendering concern, so owning it at the one seam every panel
+        passes through keeps this mirror in step with the editor's `_renderStatic` instead of
+        depending on three call sites each remembering an `.order_by`. The sorted `rooms` come back
+        in the result for the same reason: `_room_panel`'s spotlight walks them again, and it must
+        walk the same order rather than re-deriving it."""
         geom = floor_sheets(floor_key, facility)
         if not geom:
             return None
         w, h = geom['w'], geom['h']
 
+        # Bottom→top, `room_id` breaking ties deterministically (rooms sharing a `z_order` are only
+        # ever REST-created rows still on the `0` default). Matches `compose_annotations`' ordering,
+        # so the embed and the editor agree on which room paints over which.
+        by_z = attrgetter('z_order', 'room_id')
+        all_rooms = sorted(all_rooms, key=by_z)
+        rooms = sorted(rooms, key=by_z)
+
         # When a smaller room sits fully inside a larger one, punch the smaller room's area out of
         # the larger room's highlight (and its spotlight hole) so it doesn't double-paint over it.
-        # A render-time, derived relationship (stacking isn't modelled) — `contained_map` returns
-        # each room's contained siblings' polygons, drawn as inner rings of an evenodd `<path>`.
+        # The subtraction is render-time and derived; `contained_map` reads the stacking order above
+        # to decide it, so only a contained room drawn ABOVE its container is punched out (ROOM-4).
         holes = contained_map(all_rooms)
 
         shapes = []
@@ -93,10 +109,10 @@ class RoomPanelExtension(PluginTemplateExtension):
                 'url': (room.location.get_absolute_url()
                         if cross_link and room.location_id else ''),
             })
-        return {'geom': geom, 'w': w, 'h': h, 'holes': holes, 'shapes': shapes}
+        return {'geom': geom, 'w': w, 'h': h, 'holes': holes, 'shapes': shapes, 'rooms': rooms}
 
     def _render(self, ctx, *, title, map_url, markers=(), viewbox=None, embed_size=None,
-                embed_aspect=None, spotlight='', arrows=(), export_enabled=False, export_name=''):
+                embed_aspect=None, spotlight=(), arrows=(), export_enabled=False, export_name=''):
         """Render `floor_rooms.html` from a `_shared_context` result plus the per-mode extras.
 
         Every keyword default is the *whole-floor* value — no crop, no markers, no spotlight, no
@@ -138,39 +154,54 @@ class RoomPanelExtension(PluginTemplateExtension):
         return self._render(ctx, title='Facility Map — Rooms',
                             map_url=self._deep_link(floor_key, None, facility))
 
-    def _room_panel(self, floor_key, room, all_rooms, user, facility='',
+    def _room_panel(self, floor_key, rooms, all_rooms, user, facility='',
                     title='Facility Map — Rooms', focus=None):
-        """Render the cropped single-room embed: `room` alone over its floor's plan image, with the
-        SVG `viewBox` zoomed to the room's bounding box, the floor outside it dimmed, its
-        rack/device markers and inbound wayfinding arrows drawn, and image export offered.
+        """Render the cropped room embed: `rooms` alone over their floor's plan image, with the SVG
+        `viewBox` zoomed to their bounding box, the floor outside them dimmed, their rack/device
+        markers and inbound wayfinding arrows drawn, and image export offered.
 
-        `all_rooms` is the floor's full (permission-scoped) room set — the embed draws only `room`,
-        so it needs the siblings to find any contained smaller room to punch out of the highlight
+        `rooms` is normally one `Room`, but a Location can be modelled as **several** — one physical
+        room traced as two polygons, both bound to the same `dcim.Location` (ROOM-9) — and they then
+        render as one panel: every polygon highlighted, the crop framing their union, the spotlight
+        lighting all of them, and the markers/arrows of every `room_id`. They must share `floor_key`
+        (one panel draws one floor's plan); the caller filters to that. The device/rack embed passes
+        exactly one room, so its framing is untouched by this.
+
+        `all_rooms` is the floor's full (permission-scoped) room set — the embed draws only `rooms`,
+        so it needs the siblings to find any contained smaller room to punch out of the highlights
         and spotlight. `user` permission-scopes the markers' rack/device detail links; the markers
-        themselves stay bounded by `room`, which arrives `.restrict(...)`-scoped. `facility` (the
+        themselves stay bounded by `rooms`, which arrive `.restrict(...)`-scoped. `facility` (the
         object's facility, resolved by the caller from its site) scopes the manifest/blob reads.
         `title` is the card header (defaults to the Location page's wording; the device/rack embed
         passes a plainer "Facility Map"). `focus` (a normalized `(x, y)`, only from the device/rack
-        embed) reframes the crop on the device's own marker instead of the room centroid, cropped
-        tighter for a legible glyph (SHOW-3); the room-page embed passes `None` and keeps its
-        room-centred, zoomable crop. Returns '' when `floor_key` has no rendered plan."""
-        ctx = self._shared_context(floor_key, [room], all_rooms, facility, cross_link=False)
+        embed, which always passes a single room) reframes the crop on the device's own marker
+        instead of the room centroid, cropped tighter for a legible glyph (SHOW-3); the room-page
+        embed passes `None` and keeps its room-centred, zoomable crop. Returns '' when `floor_key`
+        has no rendered plan."""
+        ctx = self._shared_context(floor_key, rooms, all_rooms, facility, cross_link=False)
         if ctx is None:
             return ''
         w, h = ctx['w'], ctx['h']
+        # Stacking order, owned by `_shared_context` (ROOM-4) — the spotlight below and the
+        # deep-link/export-name pick must read the same order the shapes were built in.
+        rooms = ctx['rooms']
 
         # `inc/placement_markers.html` is a bare loop, so an empty result renders nothing.
-        markers = placement_markers(floor_key, w, h, {room.room_id}, user, facility)
+        markers = placement_markers(floor_key, w, h, {r.room_id for r in rooms}, user, facility)
 
-        # Dim the floor outside the room's own polygon (a spotlight mask, drawn in the template)
-        # so the room reads unambiguously even though the zoomed crop pulls neighbouring rooms
-        # into the raster image. Scaled by the same combined-canvas w×h as the shapes; only set
-        # for a room that has geometry. Any smaller room contained in this one is punched out of
-        # the lit hole (evenodd), so a contained office stays dimmed too — it reads as "not part
+        # Dim the floor outside the embedded room(s) (a spotlight mask, drawn in the template) so
+        # they read unambiguously even though the zoomed crop pulls neighbouring rooms into the
+        # raster image. Scaled by the same combined-canvas w×h as the shapes; only rooms with
+        # geometry contribute. Any smaller room contained in one of them is punched out of that
+        # room's lit hole (evenodd), so a contained office stays dimmed too — it reads as "not part
         # of this room", matching the highlight subtraction in `_shared_context`.
-        spotlight = ''
-        if room.polygon:
-            spotlight = evenodd_path([room.polygon] + ctx['holes'].get(room.room_id, []), w, h)
+        # One path PER room rather than one concatenated evenodd path over all of them: the mask
+        # unions overlapping black paths, whereas evenodd parity would punch the *intersection* of
+        # two polygons back out — a dark hole through the middle of a room traced as two halves that
+        # meet with a slight overlap.
+        spotlight = [d for d in
+                     (evenodd_path([r.polygon] + ctx['holes'].get(r.room_id, []), w, h)
+                      for r in rooms if r.polygon) if d]
 
         # The embed honours the configurable zoom, footprint and orientation. `orientation` picks
         # the box aspect ratio and `room_viewbox` reshapes the crop to match it (fills the box with
@@ -180,33 +211,44 @@ class RoomPanelExtension(PluginTemplateExtension):
         # one per value).
         embed = PluginSettings()
         embed_aspect = ORIENTATION_ASPECT[embed.orientation]
+        polygons = [r.polygon for r in rooms if r.polygon]
         # On a multi-sheet floor, scope the crop to the room's own sheet cell so the embed doesn't
-        # frame against — and reveal — the other page(s). `None` on single-sheet floors leaves the
-        # crop against the whole canvas, unchanged.
-        bounds = sheet_bounds_for_room(room.polygon, ctx['geom']['sheets'], w, h)
-        # `focus` (device/rack embed only) reframes the crop on the device's own marker and crops
-        # tighter for a legible glyph; the room embed passes `focus=None` (room-centred, honouring
-        # `zoom`). Orientation/footprint apply to both — only the crop centre + span diverge.
-        viewbox = room_viewbox(room.polygon, w, h, zoom=embed.zoom, aspect=embed_aspect,
+        # frame against — and reveal — the other page(s). `None` on single-sheet floors — and for
+        # rooms spread across sheets, which have to be framed across both — leaves the crop against
+        # the whole canvas, unchanged.
+        bounds = sheet_bounds_for_rooms(polygons, ctx['geom']['sheets'], w, h)
+        # Frame every embedded polygon: `room_viewbox` reads only the bounding box on the
+        # room-centred path, so their concatenated vertices crop to their union (one polygon is
+        # exactly the single-room crop). `focus` (device/rack embed only, always one room) instead
+        # reframes on the device's own marker and crops tighter for a legible glyph; the room embed
+        # passes `focus=None` (room-centred, honouring `zoom`). Orientation/footprint apply to both
+        # — only the crop centre + span diverge.
+        crop_ring = [point for polygon in polygons for point in polygon]
+        viewbox = room_viewbox(crop_ring, w, h, zoom=embed.zoom, aspect=embed_aspect,
                                bounds=bounds, focus=focus)
 
-        # Draw the wayfinding arrows whose destination is *this* room. The editor's fixed head size
-        # reads magnified under the zoomed crop, so size the head at ~6% of the viewBox width — a
-        # stable on-screen size across zoom levels. (`room.room_id` is already permission-scoped
-        # via the `.restrict(...)` query; a room with no geometry has no viewBox to scale against.)
+        # Draw the wayfinding arrows whose destination is one of *these* rooms. The editor's fixed
+        # head size reads magnified under the zoomed crop, so size the head at ~6% of the viewBox
+        # width — a stable on-screen size across zoom levels. (The `room_id`s are already
+        # permission-scoped via the `.restrict(...)` query; rooms with no geometry have no viewBox
+        # to scale against.)
         arrows = []
         if viewbox:
             head_px = float(viewbox.split()[2]) * 0.06
-            arrows = room_arrows(floor_key, room.room_id, w, h, head_px=head_px, facility=facility)
+            arrows = room_arrows(floor_key, {r.room_id for r in rooms}, w, h, head_px=head_px,
+                                 facility=facility)
 
         # Deep-link the panel title into the SPA's room view (see `_deep_link`). `export_name` is
-        # the client-side download filename stem (sanitized client-side).
+        # the client-side download filename stem (sanitized client-side). Both name the embed's
+        # first room in stacking order: rooms sharing a Location share its slug and label, so the
+        # pick only has to be deterministic, not meaningful.
+        lead = rooms[0]
         return self._render(ctx, title=title,
-                            map_url=self._deep_link(floor_key, room, facility),
+                            map_url=self._deep_link(floor_key, lead, facility),
                             markers=markers, viewbox=viewbox, embed_size=embed.size,
                             embed_aspect=embed_aspect, spotlight=spotlight, arrows=arrows,
                             export_enabled=True,
-                            export_name=room.label or room.room_id or 'room')
+                            export_name=lead.label or lead.room_id or 'room')
 
     @staticmethod
     def _deep_link(floor_key, crop_to, facility=''):
@@ -260,17 +302,27 @@ class FloorRooms(RoomPanelExtension):
         # manifest/blobs are read. A room and its floor share the same subtree and site.
         facility = facility_for_location(loc)
 
-        # This Location *is* a room (bound via Room.location) → show just that room, cropped
-        # to its geometry. This is the per-room view the user lands on from a room's page.
-        room = (Room.objects.restrict(request.user, 'view')
-                .filter(location=loc).select_related('location').first())
-        if room:
+        # This Location *is* a room (bound via Room.location) → show that room, cropped to its
+        # geometry. This is the per-room view the user lands on from a room's page. **Every** row
+        # bound to the Location is drawn, not just the first: one physical room is sometimes traced
+        # as two polygons both bound to the same Location, and binding copies the Location name into
+        # every `room.label`, so `Room.Meta.ordering` couldn't even tell them apart — picking one
+        # rendered an arbitrary half of the room (ROOM-9).
+        rooms = list(Room.objects.restrict(request.user, 'view')
+                     .filter(location=loc).select_related('location'))
+        if rooms:
+            # One panel draws one floor's plan, so rows bound to this Location on *other* floors
+            # can't join it. Keep the primary floor — `Room.Meta.ordering` leads with `floor_key`,
+            # so this is the same floor the single-room embed has always shown.
+            floor_key = rooms[0].floor_key
+            rooms = [room for room in rooms if room.floor_key == floor_key]
             # The floor's other rooms (permission-scoped) are the candidate pool for punching a
-            # contained smaller room out of this room's highlight/spotlight — the embed itself
-            # draws only `room`, so it wouldn't otherwise know about the siblings sitting inside.
+            # contained smaller room out of these rooms' highlights/spotlight — the embed itself
+            # draws only its own rooms, so it wouldn't otherwise know about the siblings sitting
+            # inside them.
             floor_rooms = list(Room.objects.restrict(request.user, 'view')
-                               .filter(floor_key=room.floor_key))
-            return self._room_panel(room.floor_key, room, floor_rooms, request.user,
+                               .filter(floor_key=floor_key))
+            return self._room_panel(floor_key, rooms, floor_rooms, request.user,
                                     facility=facility)
 
         # Otherwise this Location *is a floor* → show every room on the floor, uncropped, each
@@ -369,9 +421,11 @@ class ObjectPlacement(RoomPanelExtension):
         if not room:
             return ''
         # The floor's other rooms (permission-scoped) let `_room_panel` subtract a contained smaller
-        # room from this room's highlight/spotlight; the embed itself draws only `room`.
+        # room from this room's highlight/spotlight; the embed itself draws only `room`. Exactly ONE
+        # room is passed even where its Location is modelled as several (ROOM-9): this embed frames
+        # the object, so it must stay on the polygon actually holding it, not their union.
         floor_rooms = list(Room.objects.restrict(request.user, 'view').filter(floor_key=floor_key))
-        return self._room_panel(floor_key, room, floor_rooms, request.user, facility=facility,
+        return self._room_panel(floor_key, [room], floor_rooms, request.user, facility=facility,
                                 title='Facility Map', focus=focus)
 
 

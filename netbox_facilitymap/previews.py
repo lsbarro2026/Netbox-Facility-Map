@@ -20,10 +20,11 @@ floor's *combined* canvas (the tiled grid of sheets); callers scale them by the 
 
 import math
 import re
+import secrets
 
 from dcim.models import Device, Rack
 
-from .device_shapes import DeviceShapes
+from .device_shapes import GLYPH_TYPES, DeviceShapes
 from .models import FacilityMapBlob
 from .storage import media_url, read_manifest
 
@@ -36,19 +37,68 @@ ARROW_DEFAULT_COLOR = '#066fd1'
 
 # Inline paint for a glyph's semantic primitive classes (the frontend `dev-*` classes live in
 # `style.css`, but the NetBox host page loads no plugin CSS, so the embed must inline them). Kept
-# in step with `style.css`'s `.rack-marker .dev-*` rules and the theme vars they use: `dev-body`
-# fill is `--accent` for a rack, `--text2` for a device; detail lines/ports are white, LEDs
-# `--success`. Stroked primitives get `non-scaling-stroke` (a zoom-constant stroke) exactly like
-# the frontend, so the glyph reads at a stable weight however the embed SVG is scaled.
+# in step with `style.css`'s `.rack-marker .dev-*` rules and the theme vars they use: detail
+# lines/ports take the marker's `ink`, LEDs are a fixed `--success`. Stroked primitives get
+# `non-scaling-stroke` (a zoom-constant stroke) exactly like the frontend, so the glyph reads at
+# a stable weight however the embed SVG is scaled.
+#
+# Templates rather than finished strings since DEV-10: a device body is painted in its NetBox
+# `DeviceRole.color`, so fill/ink vary per marker and there is one definition per primitive class
+# instead of a rack copy and a device copy. `_marker_paint` does the substitution.
 _GLYPH_STYLE = {
-    'dev-line': 'fill:none;stroke:#fff;stroke-width:1;stroke-linecap:round',
-    'dev-port': 'fill:#fff;stroke:none',
+    'dev-line': 'fill:none;stroke:{ink};stroke-width:1;stroke-linecap:round',
+    'dev-port': 'fill:{ink};stroke:none',
     'dev-led': 'fill:#2fa84f;stroke:none',
 }
-_BODY_STYLE = {
-    True:  'fill:#066fd1;stroke:#fff;stroke-width:1.5',   # rack cabinet (--accent)
-    False: 'fill:#3d4654;stroke:#fff;stroke-width:1.5',   # device body (--text2)
-}
+_BODY_STYLE = 'fill:{fill};stroke:{ink};stroke-width:1.5'
+
+# The two body fills that aren't role-derived: a rack cabinet (`--accent`; a rack has no role to
+# colour by) and the fallback for a device whose role is missing or carries no usable colour
+# (`--text2`, the flat grey every device wore before DEV-10).
+RACK_FILL = '#066fd1'
+DEVICE_FILL = '#3d4654'
+
+# Glyph detail ink: the body outline plus the `dev-line`/`dev-port` primitives drawn on top of it.
+# White is the historical look and stays correct on the dark end of NetBox's role palette; a pale
+# role colour (the palette includes white, light grey, yellow and amber) would otherwise render a
+# marker as an invisible white-on-white blob, so `role_paint` flips these to near-black.
+ROLE_INK_LIGHT = '#fff'
+ROLE_INK_DARK = '#1a1a1a'
+
+
+def role_paint(color):
+    """The `(fill, ink)` a device marker is painted with for a NetBox `DeviceRole.color` — a bare
+    6-digit hex, no leading `#` (DEV-10). `(None, None)` when there is no usable colour (a roleless
+    device, or a malformed value), which the caller answers with the flat `DEVICE_FILL` grey.
+
+    Resolved **once, server-side**, and handed to the browser in `_trim_device`'s `role` dict as
+    well as consumed here by `placement_markers`: the live map and the server-rendered embeds then
+    read the same answer by construction, rather than the ink rule becoming another hand-mirrored
+    constant to drift (the `dev-*` paint is already one — see `_GLYPH_STYLE` above).
+
+    The luminance weights and threshold are NetBox's own (`utilities.html.foreground_color`), so a
+    marker's ink agrees with the role badge NetBox draws for the same role. Reimplemented rather
+    than imported because that helper has already moved modules once across the supported NetBox
+    span — the same drift this module sidesteps elsewhere by preferring `get_absolute_url()` to a
+    url name.
+    """
+    hex_rgb = (color or '').strip().lstrip('#')
+    if len(hex_rgb) != 6:
+        return None, None
+    try:
+        r, g, b = (int(hex_rgb[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None, None
+    ink = ROLE_INK_DARK if r * 0.299 + g * 0.587 + b * 0.114 > 150 else ROLE_INK_LIGHT
+    return '#' + hex_rgb, ink
+
+
+def _marker_paint(cls, fill, ink):
+    """Inline paint for one glyph primitive, given the marker's resolved body `fill` + detail
+    `ink`. `dev-led` carries no placeholder (its status green is fixed), which `format` passes
+    through untouched."""
+    template = _BODY_STYLE if cls == 'dev-body' else _GLYPH_STYLE[cls]
+    return template.format(fill=fill, ink=ink)
 
 # Room-embed crop zoom (how much surrounding floor the cropped per-room embed pulls in):
 # 1.0 = tight pad-only crop, higher = wider. Editable in-app via the Settings page; these
@@ -102,31 +152,36 @@ ORIENTATION_DEFAULT = 'vertical'
 FLOOR_LABEL_FIELDS = ('name', 'slug', 'description')
 FLOOR_LABEL_FIELD_DEFAULT = 'name'
 
-# Access-point tool settings (DEV-3), all keys of the single install-wide `settings` blob.
+# Device-placement tool settings (DEV-3, generalized into device-type presets by DEV-8). The
+# feature switch is the `device_tool` key of the single install-wide `settings` blob; the presets
+# themselves are its `device_presets` list (see `clamp_device_presets`). The legacy per-AP keys
+# (`ap_tool`, `ap_device_role`, `ap_name_template`, `ap_count_scope`) are still READ for
+# back-compat — `PluginSettings.device_tool` falls back to `ap_tool`, and an install with no
+# `device_presets` key seeds an "Access point" preset from them — but nothing writes them anymore.
 #
-# `ap_name_template` is expanded into a suggested `dcim.Device` name when an AP is placed. Only
-# these four placeholders are recognised, and the save path rejects any other `{token}` outright
-# (`AP_TEMPLATE_TOKEN_RE`) rather than letting it through as a literal — a template is operator
-# input that must fail loudly, not silently produce `{typo}` in every device name:
+# A preset's `name_template` is expanded into a suggested `dcim.Device` name when a device is
+# placed. Only these four placeholders are recognised, and the save path rejects any other
+# `{token}` outright (`DEVICE_TEMPLATE_TOKEN_RE`) rather than letting it through as a literal — a
+# template is operator input that must fail loudly, not silently produce `{typo}` in every name:
 #   {room}        the room Location's name
 #   {room_slug}   the same room Location's native `slug` (URL-safe, unlike the free-text name)
-#   {role_short}  the configured AP role's slug, uppercased — its hyphen-separated initials
+#   {role_short}  the preset's role slug, uppercased — its hyphen-separated initials
 #                 for a multi-word slug ('access-point' -> 'AP'), the whole word for a
 #                 single-word one ('ap' -> 'AP', never 'A')
-#   {asset_tag}   the asset tag typed into the AP dialog (DEV-6). Unlike the others this is
+#   {asset_tag}   the asset tag typed into the create dialog (DEV-6). Unlike the others this is
 #                 not knowable from the room alone — the user types it *after* the suggestion is
 #                 first fetched — so it arrives as `NbDeviceSuggestNameView`'s optional
 #                 `asset_tag=` param and the browser re-asks as the field changes. The column is
 #                 optional (blank stores NULL), so a blank tag drops the token *and one adjacent
 #                 separator* rather than expanding to '' and leaving `AP--01` (see
-#                 `expand_ap_name_template`).
-# There is deliberately no `{count}` token: an AP is never racked and the counter is scoped, so
-# the count is appended by the naming logic (DEV-5) per `ap_count_scope`, not typed by the user.
-AP_NAME_PLACEHOLDERS = ('room', 'room_slug', 'role_short', 'asset_tag')
-AP_NAME_TEMPLATE_DEFAULT = '{room}-{role_short}'
+#                 `expand_device_name_template`).
+# There is deliberately no `{count}` token: the counter is scoped, so the count is appended by
+# the naming logic (DEV-5) per the preset's `count_scope`, not typed by the user.
+DEVICE_NAME_PLACEHOLDERS = ('room', 'room_slug', 'role_short', 'asset_tag')
+DEVICE_NAME_TEMPLATE_DEFAULT = '{room}-{role_short}'
 # `dcim.Device.name` is 64 chars; a template longer than that can only ever expand to a name
 # `full_clean()` rejects, so refuse it at the source where the message can name the field.
-AP_NAME_TEMPLATE_MAX = 64
+DEVICE_NAME_TEMPLATE_MAX = 64
 
 # How far the suggested name's `-NN` counter is scoped before it resets. The two building-anchor
 # scopes are distinct concepts (MODEL-3, BUILDING-ANCHOR-DESIGN §4.3): 'building' counts within the
@@ -135,8 +190,21 @@ AP_NAME_TEMPLATE_MAX = 64
 # campus for a Site = campus install. Neither is facility-wide (the SiteGroup/Region a siteplan
 # covers). The free-name probe stays Site-wide regardless (that is the domain `dcim.Device`'s
 # uniqueness constraint spans); don't conflate the counter scope with the probe scope.
-AP_COUNT_SCOPES = ('none', 'room', 'floor', 'building', 'site')
-AP_COUNT_SCOPE_DEFAULT = 'none'
+DEVICE_COUNT_SCOPES = ('none', 'room', 'floor', 'building', 'site')
+DEVICE_COUNT_SCOPE_DEFAULT = 'none'
+
+# The `dcim.Device` fields a preset may prompt the placement dialog for (DEV-8) — a FIXED
+# allowlist of fields `NbDeviceCreateView` knows how to write, in the canonical order presets
+# store them. Never an arbitrary field name: the create endpoint reads ONLY fields in a preset's
+# stored list, so this allowlist is part of the write contract, not just UI. NetBox custom fields
+# are deliberately out of scope. `name` and `device_type` are REQUIRED — a create cannot succeed
+# without them — so every clamp/clean below forces them into the stored list.
+DEVICE_PRESET_FIELDS = ('name', 'device_type', 'asset_tag', 'serial', 'description', 'status')
+DEVICE_PRESET_REQUIRED_FIELDS = ('name', 'device_type')
+
+# Hard cap on stored presets — far above any real facility's device vocabulary, small enough
+# that the settings blob and the `window.MAP` stamp stay trivial.
+DEVICE_PRESETS_MAX = 50
 
 
 def clamp_zoom(value):
@@ -188,7 +256,7 @@ def write_mode_enabled(settings=None):
     and nothing more (SET-5): every write path checks it *plus* its own feature switch *plus* the
     matching per-user `dcim.add_*` permission. Inline Location creation answers to
     `inline_room_creation_enabled()` below (`frontend_api.NbLocationCreateView`), the AP tool to
-    `ap_tool_enabled()` (`frontend_api._ap_write_gate`). The browser mirrors this via
+    `device_tool_enabled()` (`frontend_api._device_write_gate`). The browser mirrors this via
     `window.MAP.writeMode`, which is UX only — each endpoint re-checks it here.
 
     Lives beside the other settings-blob resolvers (both `views` and `frontend_api` import
@@ -209,7 +277,7 @@ def inline_room_creation_enabled(settings=None):
     master gate) **and** the per-user `dcim.add_location` permission. The browser mirrors it via
     `window.MAP.inlineRoomCreation`.
 
-    **Defaults to on when the key is absent**, unlike its `write_mode`/`ap_tool` siblings, and that
+    **Defaults to on when the key is absent**, unlike its `write_mode`/`device_tool` siblings, and that
     asymmetry is deliberate. Before SET-5 write mode *was* this switch, so an install upgrading with
     write mode on would silently lose its create tile if a missing key read as off. Defaulting on
     makes the pre-SET-5 behaviour the exact behaviour an upgrader keeps — and it exposes nothing new,
@@ -221,14 +289,14 @@ def inline_room_creation_enabled(settings=None):
     return (settings or PluginSettings()).inline_room_creation
 
 
-def clamp_ap_count_scope(value):
-    """`value` if it's a recognised AP name-counter scope, else `AP_COUNT_SCOPE_DEFAULT`. Enum-safe
+def clamp_device_count_scope(value):
+    """`value` if it's a recognised name-counter scope, else `DEVICE_COUNT_SCOPE_DEFAULT`. Enum-safe
     on both write (the Settings view) and read, mirroring `clamp_floor_label_field`."""
-    return value if value in AP_COUNT_SCOPES else AP_COUNT_SCOPE_DEFAULT
+    return value if value in DEVICE_COUNT_SCOPES else DEVICE_COUNT_SCOPE_DEFAULT
 
 
-def clamp_ap_device_role(value):
-    """The configured AP `dcim.DeviceRole` id as an int, or `None` when unset/unusable. Enum-safe
+def clamp_device_role(value):
+    """A preset's `dcim.DeviceRole` id as an int, or `None` when unset/unusable. Enum-safe
     on read like the sibling clamps: a blob hand-edited (admin/REST) to a non-numeric or negative
     role id reads back as "unconfigured" — which the callers already handle — rather than blowing
     up a page render. It does **not** check that the role still exists: a deleted role is a live
@@ -242,34 +310,35 @@ def clamp_ap_device_role(value):
 
 # Any `{...}` run in a name template. Used to pick out the placeholders an operator actually typed
 # so an unrecognised one can be refused, and (via `.sub`) to spot stray unbalanced braces.
-AP_TEMPLATE_TOKEN_RE = re.compile(r'\{([^{}]*)\}')
+DEVICE_TEMPLATE_TOKEN_RE = re.compile(r'\{([^{}]*)\}')
 
 
-def clean_ap_name_template(value):
-    """Validate an operator-supplied AP name template, returning it stripped (an empty one resets to
-    `AP_NAME_TEMPLATE_DEFAULT`). Raises `ValueError` carrying a user-facing message when the template
-    is too long, names a placeholder outside `AP_NAME_PLACEHOLDERS`, or has unbalanced braces.
+def clean_device_name_template(value):
+    """Validate an operator-supplied device name template, returning it stripped (an empty one
+    resets to `DEVICE_NAME_TEMPLATE_DEFAULT`). Raises `ValueError` carrying a user-facing message
+    when the template is too long, names a placeholder outside `DEVICE_NAME_PLACEHOLDERS`, or has
+    unbalanced braces.
 
     Unlike its sibling `clamp_*` helpers this **raises rather than clamps**, because there is no
     sensible "nearest valid value" for a typo'd template: silently dropping `{rack}` (or clamping to
-    the default) would quietly rename every AP an operator subsequently creates, and the mistake
+    the default) would quietly rename every device an operator subsequently creates, and the mistake
     would only surface as wrong data in NetBox. So the write path 400s with the reason, and the
-    read path (`ap_settings`) falls back to the default only for a *stored* value that somehow got
-    past it (hand-edited blob), where raising would break an unrelated page render."""
+    read path (`clamp_device_preset`) falls back to the default only for a *stored* value that
+    somehow got past it (hand-edited blob), where raising would break an unrelated page render."""
     template = (value or '').strip()
     if not template:
-        return AP_NAME_TEMPLATE_DEFAULT
-    if len(template) > AP_NAME_TEMPLATE_MAX:
+        return DEVICE_NAME_TEMPLATE_DEFAULT
+    if len(template) > DEVICE_NAME_TEMPLATE_MAX:
         raise ValueError('a name template may be at most %d characters (dcim.Device.name’s limit)'
-                         % AP_NAME_TEMPLATE_MAX)
-    unknown = [t for t in AP_TEMPLATE_TOKEN_RE.findall(template)
-               if t not in AP_NAME_PLACEHOLDERS]
+                         % DEVICE_NAME_TEMPLATE_MAX)
+    unknown = [t for t in DEVICE_TEMPLATE_TOKEN_RE.findall(template)
+               if t not in DEVICE_NAME_PLACEHOLDERS]
     if unknown:
         raise ValueError('unknown placeholder%s %s — this template accepts only %s'
                          % ('' if len(unknown) == 1 else 's',
                             ', '.join('{%s}' % t for t in unknown),
-                            ', '.join('{%s}' % p for p in AP_NAME_PLACEHOLDERS)))
-    residue = AP_TEMPLATE_TOKEN_RE.sub('', template)
+                            ', '.join('{%s}' % p for p in DEVICE_NAME_PLACEHOLDERS)))
+    residue = DEVICE_TEMPLATE_TOKEN_RE.sub('', template)
     if '{' in residue or '}' in residue:
         raise ValueError('unbalanced { } in the name template')
     return template
@@ -277,12 +346,12 @@ def clean_ap_name_template(value):
 
 # `{asset_tag}` plus one adjacent separator, preferring the one *before* it and falling back to the
 # one after, so the token closes up cleanly wherever it sits in a template. Only used for a blank
-# tag — see `expand_ap_name_template`.
-_AP_ASSET_TAG_BLANK_RE = re.compile(r'[-_. ]\{asset_tag\}|\{asset_tag\}[-_. ]?')
+# tag — see `expand_device_name_template`.
+_ASSET_TAG_BLANK_RE = re.compile(r'[-_. ]\{asset_tag\}|\{asset_tag\}[-_. ]?')
 
 
-def expand_ap_name_template(template, room_name, room_slug, role_short, asset_tag=''):
-    """Expand a validated AP name template into the suggested `dcim.Device` name's **base** — what
+def expand_device_name_template(template, room_name, room_slug, role_short, asset_tag=''):
+    """Expand a validated name template into the suggested `dcim.Device` name's **base** — what
     `NbDeviceSuggestNameView` then suffixes with its scoped `-NN` counter.
 
     Lives here, beside the placeholder list it expands and the validator that guards it, so the two
@@ -290,40 +359,163 @@ def expand_ap_name_template(template, room_name, room_slug, role_short, asset_ta
 
     A blank `asset_tag` **drops the token together with one adjacent separator** instead of
     expanding to `''`: the column is optional, and an empty expansion would leave a dangling
-    separator (`Room 101-AP--01`) on every AP an operator declines to tag. `{asset_tag}` is
+    separator (`Room 101-AP--01`) on every device an operator declines to tag. `{asset_tag}` is
     substituted **last** so an operator-typed tag value that happens to contain `{room}` is treated
     as the literal text it is, never re-expanded."""
     tag = (asset_tag or '').strip()
     if not tag:
-        template = _AP_ASSET_TAG_BLANK_RE.sub('', template)
+        template = _ASSET_TAG_BLANK_RE.sub('', template)
     return (template.replace('{room}', room_name)
                     .replace('{room_slug}', room_slug)
                     .replace('{role_short}', role_short)
                     .replace('{asset_tag}', tag))
 
 
-def ap_tool_enabled(settings=None):
-    """True when the operator has switched the **access-point tool** on (DEV-3). Read from the single
-    `kind='settings'` blob's `ap_tool` key (default `False` when the row or key is absent), so the
-    Settings-page toggle takes effect without a worker restart.
+def _clamp_preset_fields(value):
+    """A preset's prompted-field list, clamped to the allowlist in canonical order, with the
+    required fields forced in — the one rule every read/write path shares, so a hand-edited blob
+    can never yield a preset whose dialog lacks the name or device type the create requires."""
+    wanted = set(v for v in (value or ()) if v in DEVICE_PRESET_FIELDS)
+    wanted.update(DEVICE_PRESET_REQUIRED_FIELDS)
+    return [f for f in DEVICE_PRESET_FIELDS if f in wanted]
 
-    This is the AP feature's *own* install-wide switch, stored **separately from write mode**: it
+
+def clamp_device_preset(entry):
+    """One stored device-type preset, clamped for the READ path, or `None` for an entry too
+    malformed to keep (not a dict, or no usable key). Mirrors the sibling clamps' posture: a blob
+    hand-edited outside the Settings page still reads back sane — an unknown icon falls to
+    `generic`, a bad template to the default, the field list is re-clamped — rather than blowing
+    up a page render. A preset whose `device_role` reads `None` is kept (the Settings page must
+    show it so an admin can fix it); the toolbar and the create path skip/refuse it."""
+    if not isinstance(entry, dict):
+        return None
+    key = entry.get('key')
+    if not isinstance(key, str) or not key.strip():
+        return None
+    key = key.strip()
+    icon = entry.get('icon')
+    if icon not in GLYPH_TYPES or icon == 'rack':
+        icon = 'generic'
+    try:
+        template = clean_device_name_template(entry.get('name_template'))
+    except ValueError:
+        template = DEVICE_NAME_TEMPLATE_DEFAULT
+    return {
+        'key': key,
+        'label': str(entry.get('label') or '').strip()[:100] or key,
+        'device_role': clamp_device_role(entry.get('device_role')),
+        'icon': icon,
+        'name_template': template,
+        'count_scope': clamp_device_count_scope(entry.get('count_scope')),
+        'enabled': bool(entry.get('enabled', True)),
+        'fields': _clamp_preset_fields(entry.get('fields')),
+    }
+
+
+def clamp_device_presets(value):
+    """The stored `device_presets` list clamped for the READ path: per-entry `clamp_device_preset`,
+    unkeepable entries dropped, duplicate keys dropped (first wins — a placement referencing the
+    key must resolve to ONE preset), capped at `DEVICE_PRESETS_MAX`."""
+    if not isinstance(value, list):
+        return []
+    out, seen = [], set()
+    for entry in value:
+        preset = clamp_device_preset(entry)
+        if preset is not None and preset['key'] not in seen:
+            seen.add(preset['key'])
+            out.append(preset)
+        if len(out) >= DEVICE_PRESETS_MAX:
+            break
+    return out
+
+
+# A client-supplied preset key: short, URL/localStorage-safe. Server-assigned keys (`p-<hex>`)
+# match it too, so a round-tripped list always revalidates.
+_PRESET_KEY_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$')
+
+
+def clean_device_presets(value):
+    """Validate a WRITE-path presets list, returning the canonical list to store. Raises
+    `ValueError` with a user-facing message on anything a Settings save must refuse loudly:
+    a non-list, too many presets, a non-dict entry, a blank label, an unknown icon or prompted
+    field, a bad template (via `clean_device_name_template`), a malformed or duplicate key.
+
+    Entries WITHOUT a key are new: each is assigned a fresh server-side `p-<hex>` key — stable
+    for the preset's life, so placements and per-preset browser state survive renames. The
+    caller (`DevicePresetsSettingView`) still owns the one check that needs the ORM: that each
+    non-null `device_role` resolves to a role the saving operator can see."""
+    if not isinstance(value, list):
+        raise ValueError('device_presets must be a list')
+    if len(value) > DEVICE_PRESETS_MAX:
+        raise ValueError('at most %d device presets are supported' % DEVICE_PRESETS_MAX)
+    out, seen = [], set()
+    for i, entry in enumerate(value, 1):
+        if not isinstance(entry, dict):
+            raise ValueError('preset %d is not an object' % i)
+        label = str(entry.get('label') or '').strip()
+        if not label:
+            raise ValueError('preset %d needs a label' % i)
+        if len(label) > 100:
+            raise ValueError('a preset label may be at most 100 characters')
+        icon = entry.get('icon')
+        if icon not in GLYPH_TYPES or icon == 'rack':
+            raise ValueError('preset “%s” names an unknown icon' % label)
+        fields = entry.get('fields')
+        if fields is not None:
+            if not isinstance(fields, list):
+                raise ValueError('preset “%s”: fields must be a list' % label)
+            unknown = [f for f in fields if f not in DEVICE_PRESET_FIELDS]
+            if unknown:
+                raise ValueError('preset “%s” prompts for unknown field%s %s'
+                                 % (label, '' if len(unknown) == 1 else 's', ', '.join(unknown)))
+        key = entry.get('key')
+        if key is None or key == '':
+            key = 'p-%s' % secrets.token_hex(4)
+        elif not isinstance(key, str) or not _PRESET_KEY_RE.match(key):
+            raise ValueError('preset “%s” carries a malformed key' % label)
+        if key in seen:
+            raise ValueError('duplicate preset key %s' % key)
+        seen.add(key)
+        role = entry.get('device_role')
+        if role is not None and clamp_device_role(role) is None:
+            raise ValueError('preset “%s”: device role must be a numeric id' % label)
+        out.append({
+            'key': key,
+            'label': label,
+            'device_role': clamp_device_role(role),
+            'icon': icon,
+            'name_template': clean_device_name_template(entry.get('name_template')),
+            'count_scope': clamp_device_count_scope(entry.get('count_scope')),
+            'enabled': bool(entry.get('enabled', True)),
+            'fields': _clamp_preset_fields(fields),
+        })
+    return out
+
+
+def device_tool_enabled(settings=None):
+    """True when the operator has switched the **device-placement tool** on (DEV-3, generalized by
+    DEV-8). Read from the single `kind='settings'` blob's `device_tool` key — falling back to the
+    legacy `ap_tool` key when absent, so an install that configured the AP tool before presets
+    existed keeps its switch state with no manual step — so the Settings-page toggle takes effect
+    without a worker restart.
+
+    This is the feature's *own* install-wide switch, stored **separately from write mode**: it
     answers "is this feature in play?", where write mode answers "may this install write to NetBox at
-    all?". Both gates must pass for an AP to be created — the Device-create endpoint (DEV-5) checks
-    this **and** `write_mode_enabled()` **and** the per-user `dcim.add_device` permission — and the
-    browser mirrors this one via `window.MAP.apTool`. Sits beside `write_mode_enabled`/
+    all?". Both gates must pass for a device to be created — the Device-create endpoint (DEV-5)
+    checks this **and** `write_mode_enabled()` **and** the per-user `dcim.add_device` permission —
+    and the browser mirrors this one via `window.MAP.deviceTool`. Sits beside `write_mode_enabled`/
     `inline_room_creation_enabled`, the write add-on switches whose shape it follows (SET-5; the
     Settings page disables all three add-on rows while the master gate is off, so this value only
     ever changes with write mode already on — but it is stored, and re-checked, independently).
 
     Takes an optional `PluginSettings` to reuse, like every wrapper here."""
-    return (settings or PluginSettings()).ap_tool
+    return (settings or PluginSettings()).device_tool
 
 
 def todos_enabled(settings=None):
     """True when the operator has switched the **to-do feature** on (ADDON-4). Read from the single
     `kind='settings'` blob's `todos` key (default `False` when the row or key is absent), so the
-    Settings-page toggle takes effect without a worker restart. Sits beside `ap_tool_enabled`, whose
+    Settings-page toggle takes effect without a worker restart. Sits beside `device_tool_enabled`, whose
     shape it follows.
 
     This is the install-wide master gate on the whole in-app to-do feature — the facility-wide and
@@ -332,7 +524,7 @@ def todos_enabled(settings=None):
     the `write_mode` family). The browser mirrors it via `window.MAP.todos`; every to-do endpoint
     re-checks it server-side (`frontend_api.TodoFeatureGateMixin`), so the client hide is UX only.
 
-    Defaults **off** like `ap_tool`/`write_mode` (not on like `inline_room_creation_enabled`, whose
+    Defaults **off** like `device_tool`/`write_mode` (not on like `inline_room_creation_enabled`, whose
     asymmetry is a deliberate back-compat exception this must not copy) — the core ships without the
     feature and the operator, or a future setup wizard, turns it on. Being a plain install-wide
     boolean in the settings blob is what keeps it wizard-settable the same way the toggle sets it.
@@ -345,7 +537,7 @@ def render_hq_enabled(settings=None):
     """True when the operator has switched **high-quality floor-plan rendering** on (READ-1). Read
     from the single `kind='settings'` blob's `render_hq` key (default `False` when the row or key is
     absent), so the Settings-page toggle takes effect without a worker restart. Sits beside
-    `ap_tool_enabled`, whose shape it follows.
+    `device_tool_enabled`, whose shape it follows.
 
     Unlike the other switches this one changes nothing until the **next import/rebuild**: it is read
     by `imports.RenderRunner` when it spawns a build, and already-rendered floor images keep serving
@@ -356,19 +548,20 @@ def render_hq_enabled(settings=None):
     return (settings or PluginSettings()).render_hq
 
 
-def ap_settings(settings=None):
-    """The access-point tool's configuration from the single `kind='settings'` blob, resolved and
-    clamped in one read: `{'enabled': bool, 'device_role': int|None, 'name_template': str,
-    'count_scope': str}`.
+def device_presets(settings=None):
+    """The stored device-type presets (DEV-8) from the single `kind='settings'` blob, clamped in
+    one read — a list of `{'key', 'label', 'device_role', 'icon', 'name_template', 'count_scope',
+    'enabled', 'fields'}` dicts (see `clamp_device_preset`).
 
-    Every value is clamped on the way out, so a key missing from an older blob (back-compatible
-    exactly like `room_embed_*`/`facility_grouping` were) or hand-edited outside the Settings page
-    still resolves to something usable. Callers: `views.MapView` (stamping `window.MAP`) and
-    `frontend_api._ap_write_gate`, which passes it on to the name-suggestion/Device-create endpoints
-    it guards (DEV-5) so they gate and expand a name off a single settings read.
+    Every value is clamped on the way out, so a blob hand-edited outside the Settings page still
+    resolves to something usable, and an install that configured the AP tool before presets
+    existed reads a seeded "Access point" preset (see `PluginSettings.device_presets`). Callers:
+    `views.MapView` (stamping `window.MAP.devicePresets`) and `frontend_api._device_write_gate`,
+    which passes the settings on to the name-suggestion/Device-create endpoints it guards (DEV-5)
+    so they gate and resolve a preset off a single settings read.
 
     Takes an optional `PluginSettings` to reuse, like every wrapper here."""
-    return (settings or PluginSettings()).ap
+    return (settings or PluginSettings()).device_presets
 
 
 class PluginSettings:
@@ -382,7 +575,7 @@ class PluginSettings:
     row, the key, or a sane value is absent — so a blob written before a setting existed, or edited
     outside the form (admin/REST), still reads sane.
 
-    The convenience wrappers below/above (`write_mode_enabled`, `todos_enabled`, `ap_settings`, …)
+    The convenience wrappers below/above (`write_mode_enabled`, `todos_enabled`, `device_presets`, …)
     each delegate to one property here and document what the setting *means*; this class documents
     only how it is stored and defaulted. Each of them takes an optional instance, so a caller
     holding one threads it through rather than paying a query per wrapper call — the shape
@@ -429,15 +622,19 @@ class PluginSettings:
     def inline_room_creation(self):
         """True when the inline room-creation add-on is on (`inline_room_creation_enabled`).
 
-        Absent reads as **on**, unlike its `write_mode`/`ap_tool` siblings — the deliberate
+        Absent reads as **on**, unlike its `write_mode`/`device_tool` siblings — the deliberate
         pre-SET-5 back-compat exception documented on the wrapper. A stored `False` is never
         mistaken for "not configured", since the endpoint only ever writes the key explicitly."""
         return bool(self._data.get('inline_room_creation', True))
 
     @property
-    def ap_tool(self):
-        """True when the access-point tool's own feature switch is on (`ap_tool_enabled`)."""
-        return bool(self._data.get('ap_tool'))
+    def device_tool(self):
+        """True when the device-placement tool's own feature switch is on (`device_tool_enabled`).
+
+        Reads the `device_tool` key, falling back to the legacy `ap_tool` key when absent — the
+        DEV-8 read-only migration: an upgrading install keeps its switch state, and the first
+        Settings-page save writes `device_tool` explicitly, which then wins."""
+        return bool(self._data.get('device_tool', self._data.get('ap_tool')))
 
     @property
     def todos(self):
@@ -450,20 +647,36 @@ class PluginSettings:
         return bool(self._data.get('render_hq'))
 
     @property
-    def ap(self):
-        """The access-point tool's resolved configuration dict (`ap_settings`)."""
-        try:
-            template = clean_ap_name_template(self._data.get('ap_name_template'))
-        except ValueError:
-            # Only reachable for a value written outside the Settings page (admin/REST/fixture); the
-            # POST path refuses these. Fall back rather than raise — this runs during a page render.
-            template = AP_NAME_TEMPLATE_DEFAULT
-        return {
-            'enabled': self.ap_tool,
-            'device_role': clamp_ap_device_role(self._data.get('ap_device_role')),
-            'name_template': template,
-            'count_scope': clamp_ap_count_scope(self._data.get('ap_count_scope')),
-        }
+    def device_presets(self):
+        """The stored device-type presets, clamped (`device_presets` wrapper / DEV-8).
+
+        When the `device_presets` key is **absent** — an install upgrading from the per-AP
+        settings, or a fresh one — and a legacy `ap_device_role` is configured, a single seeded
+        "Access point" preset is synthesized from the legacy keys (stable key `access-point`,
+        the `ap` icon, today's dialog fields), so an AP-tool install keeps working with no manual
+        step. Read-only migration: the legacy keys are never rewritten, and the first presets
+        save stores a real `device_presets` list, which then wins (an explicitly stored empty
+        list therefore stays empty — it is a choice, not an unset)."""
+        raw = self._data.get('device_presets')
+        if raw is None:
+            role = clamp_device_role(self._data.get('ap_device_role'))
+            if role is None:
+                return []
+            try:
+                template = clean_device_name_template(self._data.get('ap_name_template'))
+            except ValueError:
+                template = DEVICE_NAME_TEMPLATE_DEFAULT
+            return [{
+                'key': 'access-point',
+                'label': 'Access point',
+                'device_role': role,
+                'icon': 'ap',
+                'name_template': template,
+                'count_scope': clamp_device_count_scope(self._data.get('ap_count_scope')),
+                'enabled': True,
+                'fields': _clamp_preset_fields(('asset_tag',)),
+            }]
+        return clamp_device_presets(raw)
 
     @property
     def zoom(self):
@@ -589,8 +802,11 @@ def placement_markers(floor_key, w, h, room_ids, user, facility=''):
     The glyph type is keyed off the referenced object like the live map (`DeviceShapes.type_for`):
     a rack is always the cabinet glyph; a device is classified off its NetBox role (name/label
     fallback), so an access point draws its broadcast puck, a switch its port row, etc. The
-    `DeviceShapes` primitives carry only their semantic class; the per-class inline paint
-    (`_GLYPH_STYLE`/`_BODY_STYLE`) is applied here since the host page loads no plugin CSS.
+    `DeviceShapes` primitives carry only their semantic class; the inline paint
+    (`_marker_paint` over `_GLYPH_STYLE`/`_BODY_STYLE`) is applied here since the host page loads
+    no plugin CSS. The same role that picks the *shape* also picks the *colour* (DEV-10): a
+    device body is filled with its `DeviceRole.color` — two independent signals off one role —
+    while a rack keeps the fixed cabinet blue, having no role to colour by.
 
     The `url` is itself permission-scoped to `user`: each placement stores the NetBox PK
     (`id`) and `kind` of the rack/device it represents, so we bulk-resolve those PKs through
@@ -623,22 +839,28 @@ def placement_markers(floor_key, w, h, room_ids, user, facility=''):
         is_rack = p.get('kind') == 'rack'
         if is_rack:
             item, url = None, rack_urls.get(p.get('id'), '')
+            fill, ink = RACK_FILL, ROLE_INK_LIGHT
         else:
             dev = devices.get(p.get('id'))
             item = ({'role_slug': dev.role.slug if dev.role_id else None,
                      'role_name': dev.role.name if dev.role_id else None,
                      'name': dev.name} if dev else None)
             url = dev.get_absolute_url() if dev else ''
+            # The body wears the role's own colour; a device with no role, an unresolved
+            # (deleted/forbidden) one, or a role whose colour won't parse keeps the flat grey.
+            fill, ink = role_paint(dev.role.color if dev and dev.role_id else '')
+            if fill is None:
+                fill, ink = DEVICE_FILL, ROLE_INK_LIGHT
 
         gtype = DeviceShapes.type_for(p, item)
         box = DeviceShapes.box(gtype)
         wpx = p['w'] * w if p.get('w') is not None else box['w']
         hpx = p['h'] * h if p.get('h') is not None else box['h']
 
-        # Map each primitive's semantic class to inline paint (body fill differs rack vs device).
+        # Map each primitive's semantic class to inline paint, in this marker's fill + ink.
         glyph = []
         for prim in DeviceShapes.glyph(gtype, wpx, hpx):
-            style = _BODY_STYLE[is_rack] if prim['cls'] == 'dev-body' else _GLYPH_STYLE[prim['cls']]
+            style = _marker_paint(prim['cls'], fill, ink)
             glyph.append({k: v for k, v in prim.items() if k != 'cls'} | {'style': style})
 
         markers.append({
@@ -737,6 +959,24 @@ def sheet_bounds_for_room(polygon, sheets, w, h):
     return None
 
 
+def sheet_bounds_for_rooms(polygons, sheets, w, h):
+    """The cell rect shared by every polygon in `polygons`, or `None` for the whole canvas.
+
+    The plural form of `sheet_bounds_for_room`, for the embed that frames several polygons at once
+    (a Location modelled as more than one `Room`, ROOM-9). Each polygon resolves through the
+    singular helper; the shared cell is returned only when they **all** land in the same one.
+
+    Polygons spread across different sheets fall back to `None` — the whole canvas — because the
+    crop then has to span both pages to show the room at all. SHOW-1's scoping exists to stop a
+    multi-sheet floor framing against a page the room isn't on, not to make a room genuinely drawn
+    across two pages uncroppable. A single polygon is exactly the singular result, so the one-room
+    embed is unchanged."""
+    cells = {sheet_bounds_for_room(polygon, sheets, w, h) for polygon in polygons}
+    if len(cells) != 1:
+        return None
+    return cells.pop()
+
+
 def room_viewbox(polygon, w, h, pad=0.08, zoom=ZOOM_DEFAULT, aspect=None, bounds=None, focus=None):
     """SVG `viewBox` string cropping a single room's polygon, or None if it has no points.
 
@@ -747,6 +987,12 @@ def room_viewbox(polygon, w, h, pad=0.08, zoom=ZOOM_DEFAULT, aspect=None, bounds
     zoom-scaled box is a *proportion* of the room, so it's floored to `ROOM_MIN_CROP_FRAC` of
     the crop region on each axis: a tiny room's crop would otherwise stay absolutely small and
     show only blank floor, never a neighbouring room.
+
+    On this (`focus=None`) path only the polygon's **bounding box** is read, so a caller framing
+    several polygons at once may pass their vertices concatenated into one list and get the crop
+    of their union — which is how the Location-page embed frames a room modelled as more than one
+    `Room` (ROOM-9). The `focus` path below reads that same bbox as its clamp, so it stays
+    single-polygon by contract (only the device/rack embed passes `focus`, always for one room).
 
     When `focus` (a normalized `(x, y)`, e.g. a device's own marker centre) is given the crop
     switches to the **device-centred** framing the device/rack embed wants (SHOW-3): it centres on
@@ -831,8 +1077,10 @@ def _point_in_ring(pt, ring):
     """Ray-casting (even-odd) point-in-polygon test for a normalized 0..1 `ring`.
 
     Returns True when `pt` (an [x, y]) lies inside the implicitly-closed polygon. Boundary points
-    are treated as either side (not distinguished) — good enough for the containment test in
-    `contained_map`, which asks whether one room's vertices fall inside another's."""
+    are **not** distinguished, and worse, are answered asymmetrically — a point on a left or bottom
+    wall reads inside, the same point on a right or top wall outside. Containment therefore goes
+    through `_point_ring_dist`, which puts a tolerance around that (see `_is_contained`); this bare
+    test is the sign half of it."""
     x, y = pt
     n = len(ring)
     inside = False
@@ -846,39 +1094,82 @@ def _point_in_ring(pt, ring):
     return inside
 
 
-def _is_contained(inner, outer):
+def _seg_dist(px, py, ax, ay, bx, by):
+    """Distance from (px, py) to the segment a→b — the port of `Geom.projSeg`'s `d`."""
+    dx, dy = bx - ax, by - ay
+    l2 = dx * dx + dy * dy
+    t = (((px - ax) * dx + (py - ay) * dy) / l2) if l2 else 0.0
+    t = max(0.0, min(1.0, t))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _point_ring_dist(pt, ring):
+    """Signed distance from `pt` to `ring`'s boundary — **positive inside**, negative outside.
+
+    The port of `Geom.polyDist`. What containment tests against, rather than a bare `_point_in_ring`:
+    the magnitude is what lets a caller put a tolerance around the boundary, where the ray-cast alone
+    answers arbitrarily (see `_point_in_ring`)."""
+    x, y = pt
+    n = len(ring)
+    best = min(
+        _seg_dist(x, y, ring[i][0], ring[i][1], ring[(i + 1) % n][0], ring[(i + 1) % n][1])
+        for i in range(n)
+    )
+    return best if _point_in_ring(pt, ring) else -best
+
+
+def _is_contained(inner, outer, tol):
     """True when room `inner` sits fully inside room `outer` (both precomputed entry dicts).
 
     Contained = **strictly smaller by area** and **every vertex of `inner` lies inside `outer`**,
     with a bounding-box pre-check to skip the obvious non-overlaps first. Containment only — a
     room straddling `outer`'s boundary fails the all-vertices-inside test (partial overlap is out
-    of scope; it would need true polygon clipping)."""
+    of scope; it would need true polygon clipping).
+
+    "Inside" is **boundary-inclusive** within `tol` (ROOM-6): a vertex lying *on* `outer`'s edge
+    counts. A nested room almost always shares a wall with the space it was carved out of, and the
+    bare ray-cast answers such a vertex asymmetrically (inside on a left/bottom wall, outside on a
+    right/top one), so without the tolerance the punch silently dropped for half of them and the
+    container's highlight painted over the child. The bbox pre-check carries the same slack, since a
+    shared wall puts the two bboxes flush on that side. See `Geom.containedMap` (`lib.js`) for why
+    the epsilon is what it is — the two are a parity pair and **must** use the same value."""
     if inner is outer or inner['area'] >= outer['area']:
         return False
     ominx, ominy, omaxx, omaxy = outer['bbox']
     iminx, iminy, imaxx, imaxy = inner['bbox']
-    if iminx < ominx or iminy < ominy or imaxx > omaxx or imaxy > omaxy:
+    if iminx < ominx - tol or iminy < ominy - tol or imaxx > omaxx + tol or imaxy > omaxy + tol:
         return False
-    return all(_point_in_ring(pt, outer['ring']) for pt in inner['ring'])
+    return all(_point_ring_dist(pt, outer['ring']) >= -tol for pt in inner['ring'])
 
 
-def contained_map(rooms):
+def contained_map(rooms, tol=1e-4):
     """Map each room's `room_id` → the polygons of its **directly** contained smaller rooms.
 
     When a smaller room is drawn fully inside a larger one, the caller punches the smaller room's
     area out of the larger room's highlight via an evenodd `<path>` (`evenodd_path`), so the larger
-    room's fill/spotlight no longer double-paints over it. This is a **render-time, derived**
-    relationship — stacking isn't modelled anywhere (no z-index/overlap field) and stored geometry
-    is untouched; it's recomputed each render from the other rooms' polygons.
+    room's fill/spotlight no longer double-paints over it. The subtraction itself is **render-time
+    and derived** — stored geometry is untouched and it's recomputed each render from the other
+    rooms' polygons.
+
+    **`rooms` must arrive in paint order, bottom→top** (ROOM-4), because a room punches out only the
+    contained children painted **above** it. Send a nested room *behind* its container and the punch
+    drops, so the container paints and hit-tests over it — which is what "send to back" has to mean.
+    The default stacking (largest at the bottom) puts a contained child above its container, so the
+    common case is unchanged from when this was pure geometry.
 
     Only **direct children** are returned — a room contained in `A` but *also* contained in another
     room that is itself inside `A` is punched out at that intermediate level, not by `A`. This keeps
     the evenodd subtraction correct at any nesting depth: were `A` to also list a grandchild ring,
     the extra parity crossing would re-fill the grandchild's area inside `A`. For the common
     single-level case (a room directly inside another) the direct set is just the full contained set.
+    Note the z-order gate is applied to that already-pruned *direct* set and **not** folded into
+    `_is_contained`: the pruning has to see the full geometric descendant tree, or a mixed-z
+    grandparent would list a grandchild it doesn't directly contain and break the parity above.
 
     `rooms` is any iterable of objects exposing `.room_id` and `.polygon` ([[nx,ny],...] 0..1).
-    Containment is **strict** (see `_is_contained`); partial edge-crossing overlap is not handled."""
+    Containment is **strict** on area but **boundary-inclusive** within `tol`, so a child sharing a
+    wall with its container still counts (see `_is_contained`); partial edge-crossing overlap is not
+    handled. `tol` mirrors `Geom.containedMap`'s default and must stay identical to it."""
     # Precompute each room's ring, area and bbox once (O(n·v)); the containment scan is then O(n²).
     entries = []
     for room in rooms:
@@ -897,7 +1188,7 @@ def contained_map(rooms):
     n = len(entries)
     # contains[i] = indices of the rooms strictly inside entries[i] (all descendants, any depth).
     contains = [
-        {j for j in range(n) if _is_contained(entries[j], entries[i])}
+        {j for j in range(n) if _is_contained(entries[j], entries[i], tol)}
         for i in range(n)
     ]
 
@@ -905,9 +1196,11 @@ def contained_map(rooms):
     for i in range(n):
         children = contains[i]
         # Keep only direct children: drop a descendant `j` that another child `k` of `i` also
-        # contains (so `j` is punched out by `k`, one level down, not by `i`).
+        # contains (so `j` is punched out by `k`, one level down, not by `i`). Then keep only those
+        # painted ABOVE `i` (`j > i` — `entries` preserves the caller's bottom→top order), so a
+        # child sent behind its container stops being punched out of it (ROOM-4).
         direct = [j for j in children
-                  if not any(k != j and j in contains[k] for k in children)]
+                  if j > i and not any(k != j and j in contains[k] for k in children)]
         if direct:
             result[entries[i]['id']] = [entries[j]['ring'] for j in direct]
     return result
@@ -932,13 +1225,16 @@ def evenodd_path(rings, w, h):
     return ' '.join(subpaths)
 
 
-def room_arrows(floor_key, room_id, w, h, head_px=ARROW_HEAD_PX, facility=''):
-    """Render-ready geometry for the wayfinding arrows whose destination is `room_id`.
+def room_arrows(floor_key, room_ids, w, h, head_px=ARROW_HEAD_PX, facility=''):
+    """Render-ready geometry for the wayfinding arrows whose destination is in `room_ids`.
 
     Reads the floor's `kind='annotations'` shard row (`key=floor_key`, CONC-1) `['arrows']` and keeps
-    only the arrows the editor auto-bound to this room (`a['room'] == room_id`, the frontend room id
-    persisted verbatim as `Room.room_id`). For the per-room embed only — the caller passes the
-    embedded room's `room_id`, so the result is already permission-scoped to a room the user may view.
+    only the arrows the editor auto-bound to one of these rooms (`a['room'] in room_ids`, the
+    frontend room id persisted verbatim as `Room.room_id`). For the per-room embed only — the caller
+    passes the embedded room(s)' `room_id`s, so the result is already permission-scoped to rooms the
+    user may view. `room_ids` mirrors `placement_markers`' set-shaped argument (a Location can be
+    modelled as more than one `Room`, ROOM-9), and taking them together keeps the embed at one blob
+    read rather than one per room.
 
     Each returned dict — `{'line', 'head', 'color'}` — mirrors `FloorEditor._drawArrows`
     (`static/.../floor-editor.js`) over the combined-canvas `w`×`h` (so it lines up with the
@@ -951,10 +1247,13 @@ def room_arrows(floor_key, room_id, w, h, head_px=ARROW_HEAD_PX, facility=''):
     relative to the crop's viewBox to keep it a stable on-screen size across `room_embed_zoom`.
     Arrows with fewer than 2 points are skipped (matches `_drawArrows`).
     """
+    room_ids = set(room_ids)
+    if not room_ids:
+        return []
     floor = _floor_shard('annotations', facility, floor_key)
     arrows = []
     for a in (floor.get('arrows') or []):
-        if a.get('room') != room_id:
+        if a.get('room') not in room_ids:
             continue
         pts = a.get('points') or []
         if len(pts) < 2:

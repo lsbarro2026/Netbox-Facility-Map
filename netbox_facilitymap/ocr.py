@@ -20,8 +20,10 @@ ships in the wheel, so recognition is fully offline).
 Because the user already draws a tight box around the code, we run **recognition only**
 (no text-detection model — that's the part that needs OpenCV). A small `numpy` segmenter
 handles a box that spans more than one text line: Otsu binarization, ruled-border
-suppression, a row projection thresholded at the lower of a fraction of its own peak and a
-fraction of the crop's width, and a per-band resample to the model's input height.
+suppression, graphic suppression (a logo or emblem is one ink blob tall enough to bridge
+two text rows, which fuses them), a row projection thresholded at the lower of a fraction
+of its own peak and a fraction of the crop's width, and a per-band resample to the model's
+input height.
 **The recognizer must only ever see one text line** — hand it a two-line strip and
 CTC returns a vertical blend of both, confidently and silently (the `Floor 3` over
 `Development  MAY 2025` caption that read back as `Floor DEEODETAAYOOOE`).
@@ -127,9 +129,25 @@ PAD_FRAC = 0.10         # pad each band by this fraction of the median band heig
 MIN_BAND_PX = 16        # a band shorter than this had too little ink to be sure of, whatever
                         # CTC says; its confidence is scaled down in proportion.
 MAX_BAND_UPSCALE = 6    # never enlarge a band more than this (a 3px band is not 48px of signal)
-MAX_BAND_ASPECT = 25    # past this width:height a band is additionally split at wide column
-                        # gaps, each segment contributing its own candidate
-COL_GAP_FRAC = 1.2      # ...at runs of blank columns this many median band heights wide
+COL_GAP_FRAC = 1.2      # a band is additionally split at runs of blank columns this many of its
+                        # own heights wide, each segment contributing its own candidate. Well
+                        # clear of a word space (a fraction of a line height) and well under the
+                        # gap between two *fields* of a title block, which is what it looks for.
+GRAPHIC_HEIGHT_MULT = 2  # an ink component this many times taller than the crop's typical glyph
+                         # is a graphic rather than a letterform — a candidate for suppression,
+                         # confirmed only by the split test in `_suppress_graphics`.
+GRAPHIC_TEST_LIMIT = 8   # ...and only the tallest this many are tested, so a crop of a busy
+                         # *drawing* never pays a caption's segmentation cost. A count of
+                         # components, so it stays scale-free like every threshold here.
+FLOOR_CODE_DIGITS = 2   # a candidate whose longest digit run is at most this long is preferred as
+                        # the winner: a storey's number is one or two digits, where a year or a
+                        # sheet number is four. A statement about a string's shape, not about
+                        # floors — see `_pick_winner`.
+DUST_MARK_PX = 3        # a mark under this tall, or holding fewer inked pixels than this, is
+                        # antialiasing speckle and is left out of the typical-glyph measurement.
+                        # An absolute floor for the same reason `RULE_MIN_THICK_PX` is one: a
+                        # rasterizer's edge artifacts are a pixel or two however large the sheet,
+                        # so they do not scale with it and a fraction cannot describe them.
 
 # Characters a Latin drawing caption may plausibly be made of. The vendored charset includes CJK,
 # so a crop that decodes mostly outside this set decoded noise.
@@ -233,6 +251,81 @@ def _suppress_rules(ink):
     return out
 
 
+def _ink_runs(ink):
+    """Every horizontal run of ink in a mask, as an `(n, 3)` array of `(row, x0, x1)` in row order.
+
+    Extracted for the whole mask in one vectorized pass. `_components` below is the only analysis
+    step whose cost tracks the crop's *content* rather than its line count, so the half of it that
+    numpy can do is done by numpy."""
+    height, width = ink.shape
+    padded = np.zeros((height, width + 2), dtype=bool)
+    padded[:, 1:width + 1] = ink
+    flat = padded.ravel()
+    # Each row is padded blank at both ends, so a run can never straddle two rows and the edges
+    # alternate rise/fall for the whole mask.
+    edges = np.flatnonzero(flat[1:] != flat[:-1]) + 1
+    if not edges.size:
+        return np.empty((0, 3), dtype=np.int64)
+    starts, ends = edges[0::2], edges[1::2]
+    rows = starts // (width + 2)
+    offset = rows * (width + 2) + 1
+    return np.stack([rows, starts - offset, ends - offset], axis=1)
+
+
+def _components(ink):
+    """Label the 8-connected components of an ink mask. Returns `(runs, labels)` — the runs of
+    `_ink_runs` and, per run, the component it belongs to.
+
+    Run-wise union-find rather than a per-pixel label image: a caption crop holds thousands of runs
+    where it holds millions of pixels, and the runs are all a caller ever needs again — to measure a
+    component, and to erase one from the mask. Rows are merged with a two-pointer sweep, so the
+    whole labelling is one pass over the runs rather than one per pair of adjacent rows.
+
+    8-connectivity (a diagonal touch counts) is what keeps an antialiased stroke, whose runs step
+    sideways a pixel at a time, from shattering into one component per row."""
+    runs = _ink_runs(ink)
+    total = len(runs)
+    parent = list(range(total))
+
+    def find(a):
+        root = a
+        while parent[root] != root:
+            root = parent[root]
+        while parent[a] != root:            # path compression, so a tall blob stays cheap
+            parent[a], a = root, parent[a]
+        return root
+
+    # Python lists, not numpy scalars: this loop touches each run a handful of times and element
+    # access is the whole cost.
+    row_of = runs[:, 0].tolist()
+    left = runs[:, 1].tolist()
+    right = runs[:, 2].tolist()
+    prev_start = prev_end = 0
+    start = 0
+    while start < total:
+        end = start
+        while end < total and row_of[end] == row_of[start]:
+            end += 1
+        if prev_end > prev_start and row_of[prev_start] == row_of[start] - 1:
+            i, j = prev_start, start
+            while i < prev_end and j < end:
+                if right[i] < left[j]:      # ends are exclusive, so touching == overlapping here
+                    i += 1
+                elif right[j] < left[i]:
+                    j += 1
+                else:
+                    a, b = find(i), find(j)
+                    if a != b:
+                        parent[max(a, b)] = min(a, b)
+                    if right[i] < right[j]:
+                        i += 1
+                    else:
+                        j += 1
+        prev_start, prev_end = start, end
+        start = end
+    return runs, np.array([find(i) for i in range(total)], dtype=np.int64)
+
+
 def _row_bands(ink):
     """Find the text lines in a rule-suppressed ink mask, as `(x0, y0, x1, y1)` boxes in reading
     order — empty when there is no ink at all.
@@ -280,13 +373,79 @@ def _row_bands(ink):
     return boxes
 
 
+def _spanning_bands(boxes, y0, y1):
+    """How many of `boxes` overlap the rows `[y0, y1)`. Scoped to one component's own rows on
+    purpose: a band count over the *whole* mask also moves when a removal elsewhere shifts the
+    median band height that `_row_bands` derives its merge gap from, and a split won here can then
+    be cancelled by an unrelated merge there."""
+    return sum(1 for b in boxes if b[1] < y1 and b[3] > y0)
+
+
+def _suppress_graphics(ink):
+    """Clear a title block's **graphics** — a logo, an emblem, a thick divider — from an ink mask,
+    but only where one of them is what is holding two text lines together.
+
+    This is the second half of the reported bug (OCR-1). A facility's title block prints its logo
+    beside the building name, and that mark is a single ink blob tall enough to span the name row
+    *and* the row under it. A row projection cannot see a blank row between two lines whose gap the
+    logo inks, so both rows land in one band and the single-line recognizer returns a confident
+    vertical blend of them (`CAL POLY` over `Cotchett Education Building` read back as
+    `CALPoCothet Eaucatnuid`). `_suppress_rules` does not catch it: a logo is neither thin nor
+    inked end to end, which is exactly what that guard is written to spare.
+
+    Nothing here asks what a component *looks* like, because that question has no answer — measured
+    across the fonts a drawing uses, the ink-to-box ratio of a solid logo (0.78) sits inside the
+    range bold capitals already occupy (up to 0.76), and a hollow logo outline (0.14) sits below
+    every glyph. So the test is the **harm**, not the shape: a component far taller than the crop's
+    typical glyph is removed only if removing it leaves *more* bands across its own rows than
+    before. A logo bridging two lines passes that test; a floor code set in big type — the thing
+    this must never delete — cannot, because removing it leaves fewer bands, not more. A filled
+    swatch or a solid title bar is spared for the same reason, which is the guard `_suppress_rules`
+    states in its own terms.
+
+    The typical glyph is measured as the **median** component height, over components past
+    `DUST_MARK_PX`: one logo is one vote among a caption's glyphs, where any ink-weighted measure
+    would let a single large blob describe the crop's text scale."""
+    runs, labels = _components(ink)
+    if not len(runs):
+        return ink
+    index = np.unique(labels, return_inverse=True)[1]
+    # Runs arrive in row order, so a component's first and last run bound it vertically.
+    first = np.unique(index, return_index=True)[1]
+    last = len(index) - 1 - np.unique(index[::-1], return_index=True)[1]
+    heights = runs[last, 0] - runs[first, 0] + 1
+    areas = np.bincount(index, weights=(runs[:, 2] - runs[:, 1]).astype(np.float64))
+    solid = (heights >= DUST_MARK_PX) & (areas >= DUST_MARK_PX)
+    if not solid.any():
+        return ink
+    limit = GRAPHIC_HEIGHT_MULT * float(np.median(heights[solid]))
+    tall = np.flatnonzero(heights > limit)
+    if not len(tall):
+        return ink
+    tall = tall[np.argsort(-heights[tall])][:GRAPHIC_TEST_LIMIT]
+    work = ink.copy()
+    bands = _row_bands(work)
+    for comp in tall:
+        rows = runs[index == comp]
+        top, bottom = int(runs[first[comp], 0]), int(runs[last[comp], 0]) + 1
+        for y, x0, x1 in rows:
+            work[y, x0:x1] = False
+        split = _row_bands(work)
+        if _spanning_bands(split, top, bottom) > _spanning_bands(bands, top, bottom):
+            bands = split
+        else:
+            for y, x0, x1 in rows:          # it was holding nothing apart — it is content
+                work[y, x0:x1] = True
+    return work
+
+
 def _column_segments(ink, min_gap):
     """Split a band at runs of at least `min_gap` blank columns, returning the inked `(x0, x1)`
     segments in the band's own coordinates — or `[]` when there is no such gap to split on.
 
-    Only used behind the `MAX_BAND_ASPECT` guard, and only ever as a candidate *generator*: the
-    whole-band read is always kept too, so a caption like `THIRD FLOOR PLAN` can never be cut in a
-    way that loses the ordinal-to-word adjacency the client's parser depends on."""
+    Only ever a candidate *generator*: the whole-band read is always kept too, so a caption like
+    `THIRD FLOOR PLAN` can never be cut in a way that loses the ordinal-to-word adjacency the
+    client's parser depends on."""
     cols = ink.any(axis=0)
     if not cols.any():
         return []
@@ -333,15 +492,35 @@ def _plausible(text, conf):
     return odd <= 0.4 * len(text)
 
 
+def _digit_run(text):
+    """The longest run of consecutive digits in `text`."""
+    longest = run = 0
+    for ch in text:
+        run = run + 1 if ch in "0123456789" else 0
+        longest = max(longest, run)
+    return longest
+
+
 def _pick_winner(candidates):
     """The best of a crop's plausible candidates, or None. **Vocabulary-free by decision**: prefer
-    a candidate carrying a digit, and take the most confident within that group — a floor code
-    almost always has a number in it, and that is as much as this side may assume. Which candidate
-    names a floor is the client's question, and it answers it over the full `lines` list."""
+    a candidate carrying a *short* run of digits, then any digit at all, and take the most
+    confident within the first group that has anyone in it. Which candidate names a floor is the
+    client's question, and it answers it over the full `lines` list.
+
+    The short-run tier is what stops a print date winning (OCR-1): a title block's `MAY 2025` reads
+    at 0.999 against a `Floor 3` at 0.998, because a date set alone in a clean corner is easier
+    pixels than a code beside other type — so on a digit-and-confidence rule the date wins every
+    time. `FLOOR_CODE_DIGITS` is still a statement about the *shape* of a string and not about
+    floors: no word list, no vocabulary, nothing this module could drift from
+    `ImportBulk.floorFromText` — only that a storey's number is short where a year's is not.
+    Each tier is a preference, never a filter, so a crop holding nothing but long numbers still
+    returns its most confident line rather than nothing."""
     if not candidates:
         return None
-    digits = [c for c in candidates if any(ch in "0123456789" for ch in c["text"])]
-    return max(digits or candidates, key=lambda c: c["confidence"])
+    scored = [(c, _digit_run(c["text"])) for c in candidates]
+    short = [c for c, run in scored if 1 <= run <= FLOOR_CODE_DIGITS]
+    digits = [c for c, run in scored if run]
+    return max(short or digits or candidates, key=lambda c: c["confidence"])
 
 
 class _Debug:
@@ -475,10 +654,10 @@ class FloorCodeReader:
 
     def _split_lines(self, crop):
         """The text lines in `crop`, as `(x0, y0, x1, y1)` boxes into it — binarize, suppress the
-        title block's border rules, project, merge, pad, trim to ink. The model recognizes one
-        line at a time, so a box spanning several must be cut first; a single-line crop yields one
-        band, and a crop with no ink at all falls back to the whole crop rather than reading
-        nothing.
+        title block's border rules, suppress the graphics that bridge its rows, project, merge,
+        pad, trim to ink. The model recognizes one line at a time, so a box spanning several must
+        be cut first; a single-line crop yields one band, and a crop with no ink at all falls back
+        to the whole crop rather than reading nothing.
 
         Runs at the crop's **native** scale, on purpose: with every threshold relative and every
         resample done per band (`_prepare_band`), a layout segments identically however large the
@@ -486,6 +665,11 @@ class FloorCodeReader:
         ink = _suppress_rules(_binarize(np.asarray(crop.convert("L"))))
         if self.debug:
             self.debug.mask("ink", ink)
+        ink = _suppress_graphics(ink)
+        if self.debug:
+            # Dumped as its own mask rather than as a note: what `_suppress_graphics` took out is
+            # the difference between the two PNGs, which is the evidence a fusion bug is read from.
+            self.debug.mask("text", ink)
         return _row_bands(ink) or [(0, 0, crop.width, crop.height)]
 
     def _read_band(self, rec, band, y, raw_h):
@@ -501,11 +685,17 @@ class FloorCodeReader:
                 "min_p": float(min(probs)) if probs else 0.0, "y": y}
 
     def _candidates(self, rec, crop):
-        """One candidate per text band, plus a segment candidate per wide column gap in any band
-        still far too wide after trimming. Splitting only ever *adds* candidates — the whole-band
-        read is always kept, so a caption can never be cut in a way that loses it."""
+        """One candidate per text band, plus a segment candidate per wide column gap within a band.
+        Splitting only ever *adds* candidates — the whole-band read is always kept, so a caption can
+        never be cut in a way that loses it.
+
+        A band is split on the **gap**, not on how wide it happens to be. The width gate this
+        replaces (`> 25:1` before a band was even looked at) is what left the reported
+        `Floor 3` beside a corner `MAY 2025` fused into `Floor3MAY2025`: at 24:1 that band was one
+        pixel of render scale away from being examined, and which side of that it landed on decided
+        whether the drawing read. A gap of `COL_GAP_FRAC` band heights is a title block's gap
+        between two *fields*, measured well clear of the word spaces inside one."""
         boxes = self._split_lines(crop)
-        h_med = max(1, int(np.median([b[3] - b[1] for b in boxes])))
         height = max(1, crop.height)
         cands = []
         for x0, y0, x1, y1 in boxes:
@@ -516,10 +706,10 @@ class FloorCodeReader:
                 self.debug.save("band-%d" % len(cands), band)
                 self.debug.note("band %s text=%r conf=%.3f",
                                 (x0, y0, x1, y1), cands[-1]["text"], cands[-1]["confidence"])
-            if band.height and band.width / float(band.height) <= MAX_BAND_ASPECT:
+            if not band.height or not band.width:
                 continue
             band_ink = _binarize(np.asarray(band.convert("L")))
-            for sx0, sx1 in _column_segments(band_ink, max(1, round(COL_GAP_FRAC * h_med))):
+            for sx0, sx1 in _column_segments(band_ink, max(1, round(COL_GAP_FRAC * band.height))):
                 cands.append(self._read_band(
                     rec, band.crop((sx0, 0, sx1, band.height)), y, y1 - y0))
         return cands
