@@ -10,6 +10,36 @@ Each entry opens with its release tier — _Major_ (breaking), _Minor_ (new
 features/enhancements) or _Patch_ (bug fixes) — followed by the narrative, a
 **Breaking Changes** section when applicable, and the issues it resolves.
 
+## 2.2.1 — An install command that works on a stock NetBox, and packaging metadata that survives setuptools
+_Patch release — bug fixes._
+
+**The documented install command could not work on a default NetBox install.** Every install and
+update command shipped with a `sudo -u netbox` prefix, on the assumption that the plugin should be
+installed as the service user that runs NetBox. But a stock NetBox virtualenv is created by
+`upgrade.sh` as root, so `/opt/netbox/venv` and its `site-packages` are owned by `root`. Running
+pip as `netbox` hit `Defaulting to user installation because normal site-packages is not writeable`
+and either failed outright or silently installed the package into `~netbox/.local/`, which a
+virtualenv never reads — leaving an admin with a plugin that pip reported as installed and NetBox
+could not import. The Install and Update commands now use NetBox's own documented form,
+`sudo /opt/netbox/venv/bin/python3 -m pip install …`, and the surrounding text states the actual
+reason root is needed: the venv itself is root-owned, and the `netbox` service user only ever needs
+write access to `media/`, not to `site-packages`.
+
+**The README now says how to survive a NetBox upgrade.** `upgrade.sh` reinstalls only the plugins
+listed in `/opt/netbox/local_requirements.txt`, so a hand-run `pip install` is silently erased by
+the next NetBox upgrade — a step the install instructions never mentioned. A new *Surviving NetBox
+upgrades* note tells you to add the same install target to that file once.
+
+**Packaging metadata modernized ahead of a setuptools deprecation.** Installing the plugin emitted
+`SetuptoolsDeprecationWarning`s: `pyproject.toml` declared its licence as a TOML table
+(`license = { text = "MIT" }`) and carried the now-redundant `License :: OSI Approved :: MIT
+License` classifier. Both are deprecated by setuptools 77 and later, with a hard cutoff after which
+such builds stop working altogether. The licence is now the plain SPDX expression `"MIT"` and the
+classifier is gone; a clean wheel build is warning-free and still records the `LICENSE` file in the
+built metadata.
+
+_Resolved issues: none tracked (pre-public-repo)._
+
 ## 2.2.0 — Explicit room stacking, custom device presets, and a category-based view filter
 _Minor release — new features and enhancements._
 

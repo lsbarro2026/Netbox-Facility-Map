@@ -10,13 +10,12 @@ dynamic = ["version"]
 description = "Facility map plugin for NetBox — siteplan → building → floor → room, linked to Locations"
 requires-python = ">=3.10"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Liam Sbarro", email = "ljs.social2005@gmail.com" }]
 classifiers = [
     "Framework :: Django",
     "Environment :: Plugins",
     "Environment :: Web Environment",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

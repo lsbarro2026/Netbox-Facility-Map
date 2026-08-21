@@ -13,7 +13,7 @@ images under `MEDIA_ROOT`, served back through authenticated views.
 # `FacilityMapConfig.version` below is set from it — so a release bumps exactly this one line.
 # Keep it a plain string literal: setuptools resolves it via AST without importing this module
 # (which would fail at build time, before NetBox is present).
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 from netbox.plugins import PluginConfig
 

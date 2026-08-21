@@ -50,14 +50,21 @@ the Location for you if you opt into letting it write to NetBox.
 
 ## Install
 
-Install into NetBox's virtualenv as the `netbox` service user so files stay owned by it:
+Install into NetBox's virtualenv as root. A stock install's venv is root-owned (`upgrade.sh`
+creates it that way), so pip needs root to write there — the `netbox` service user only needs
+write access to `media/`, not `site-packages`:
 
 ```bash
-sudo -u netbox /opt/netbox/venv/bin/pip install "git+https://github.com/lsbarro2026/Netbox-Facility-Map.git"
+sudo /opt/netbox/venv/bin/python3 -m pip install "git+https://github.com/lsbarro2026/Netbox-Facility-Map.git"
 ```
 
 This installs the latest release. To pin a specific version, append `@<tag>` (for example
 `...Netbox-Facility-Map.git@vX.Y.Z`).
+
+> **Surviving NetBox upgrades.** `upgrade.sh` reinstalls only the plugins listed in
+> `/opt/netbox/local_requirements.txt`. Add the same install target there once so it isn't dropped
+> on a NetBox upgrade:
+> `echo 'git+https://github.com/lsbarro2026/Netbox-Facility-Map.git' | sudo tee -a /opt/netbox/local_requirements.txt`
 
 Enable the plugin in `/opt/netbox/netbox/netbox/configuration.py`:
 
@@ -81,7 +88,7 @@ import your drawings.
 Re-run the install command with `--upgrade`, then re-apply the database and static changes:
 
 ```bash
-sudo -u netbox /opt/netbox/venv/bin/pip install --upgrade "git+https://github.com/lsbarro2026/Netbox-Facility-Map.git"
+sudo /opt/netbox/venv/bin/python3 -m pip install --upgrade "git+https://github.com/lsbarro2026/Netbox-Facility-Map.git"
 python /opt/netbox/netbox/manage.py migrate
 python /opt/netbox/netbox/manage.py collectstatic --no-input
 sudo systemctl restart netbox netbox-rq
